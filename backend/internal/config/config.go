@@ -20,11 +20,12 @@ type Config struct {
 	SepoliaRPCURL       string
 }
 
+// Load 从环境变量加载并校验应用配置。
 func Load() (Config, error) {
 	timezoneName := envOrDefault("APP_TIMEZONE", defaultTimezone)
 	timezone, err := time.LoadLocation(timezoneName)
 	if err != nil {
-		return Config{}, fmt.Errorf("invalid APP_TIMEZONE: %w", err)
+		return Config{}, fmt.Errorf("APP_TIMEZONE 配置无效：%w", err)
 	}
 
 	cfg := Config{
@@ -43,6 +44,7 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// Validate 校验启动所需的配置是否完整。
 func (c Config) Validate() error {
 	missing := make([]string, 0, 4)
 	if c.DatabaseURL == "" {
@@ -58,14 +60,15 @@ func (c Config) Validate() error {
 		missing = append(missing, "SEPOLIA_RPC_URL")
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required configuration: %s", strings.Join(missing, ", "))
+		return fmt.Errorf("缺少必需配置：%s", strings.Join(missing, ", "))
 	}
 	if c.Timezone == nil {
-		return errors.New("timezone is required")
+		return errors.New("必须配置时区")
 	}
 	return nil
 }
 
+// SafeSummary 返回不会泄露密码和连接凭据的配置摘要。
 func (c Config) SafeSummary() map[string]string {
 	return map[string]string{
 		"app_env":       c.AppEnv,
@@ -77,6 +80,7 @@ func (c Config) SafeSummary() map[string]string {
 	}
 }
 
+// envOrDefault 读取环境变量，空值时返回默认值。
 func envOrDefault(key, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
@@ -84,9 +88,10 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
+// configured 将敏感配置转换为不包含原值的状态文本。
 func configured(value string) string {
 	if value == "" {
-		return "missing"
+		return "缺失"
 	}
-	return "configured"
+	return "已配置"
 }

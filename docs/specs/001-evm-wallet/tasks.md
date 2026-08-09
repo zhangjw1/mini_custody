@@ -50,15 +50,15 @@
 
 ## 5. Phase 2：数据库和最小账本
 
-- [ ] **T016** 创建数据库迁移框架和迁移执行命令。
-- [ ] **T017** 创建 `users` 和 `wallet_addresses` 表，使用 `BIGINT IDENTITY` 自增主键。
-- [ ] **T018** 创建 `asset_balances` 和 `balance_entries` 表及唯一约束。
-- [ ] **T019** 创建 `deposits`、`withdrawals`、`chain_checkpoints` 和 `worker_errors` 表。
-- [ ] **T020** 将所有时间字段定义为 `TIMESTAMPTZ`，数据库 Session 和应用统一为 `Asia/Shanghai`。
-- [ ] **T021** 创建至少两个预置演示用户，并稳定分配派生索引 `1`、`2`。
-- [ ] **T022** 实现用户、地址、余额、流水、充值、提币和扫描点 Repository。
-- [ ] **T023** 实现余额行锁、充值待确认、充值入账、提币占用、释放和费用结算事务。
-- [ ] **T024** 验证所有金额使用 Wei 整数和 `NUMERIC(78,0)`，禁止 `float32/float64` 进入资产计算。
+- [x] **T016** 创建数据库迁移框架和迁移执行命令。
+- [x] **T017** 创建 `users` 和 `wallet_addresses` 表，使用 `BIGINT IDENTITY` 自增主键。
+- [x] **T018** 创建 `asset_balances` 和 `balance_entries` 表及唯一约束。
+- [x] **T019** 创建 `deposits`、`withdrawals`、`chain_checkpoints` 和 `worker_errors` 表。
+- [x] **T020** 将所有时间字段定义为 `TIMESTAMPTZ`，数据库 Session 和应用统一为 `Asia/Shanghai`。
+- [x] **T021** 创建至少两个预置演示用户，并稳定分配派生索引 `1`、`2`。
+- [x] **T022** 实现用户、地址、余额、流水、充值、提币和扫描点 Repository。
+- [x] **T023** 实现余额行锁、充值待确认、充值入账、提币占用、释放和费用结算事务。
+- [x] **T024** 验证所有金额使用 Wei 整数和 `NUMERIC(78,0)`，禁止 `float32/float64` 进入资产计算。
 
 ### Phase 2 验收
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 )
 
+// TestRequestIDRoundTripAndStructuredLog 验证请求标识可以写入上下文和结构化日志。
 func TestRequestIDRoundTripAndStructuredLog(t *testing.T) {
 	requestID, err := NewRequestID()
 	if err != nil {
@@ -23,7 +24,7 @@ func TestRequestIDRoundTripAndStructuredLog(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	WithContext(New(&output, slog.LevelInfo), ctx).Info("request received")
+	WithContext(New(&output, slog.LevelInfo), ctx).Info("收到请求")
 	if got := output.String(); !strings.Contains(got, `"request_id":"`+requestID+`"`) {
 		t.Fatalf("structured log does not contain request ID: %s", got)
 	}

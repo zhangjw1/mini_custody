@@ -6,6 +6,7 @@ import (
 	"testing"
 )
 
+// TestConfigSafeSummaryDoesNotExposeSecrets 验证配置摘要不会泄露敏感值。
 func TestConfigSafeSummaryDoesNotExposeSecrets(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://secret-user:secret-pass@localhost/custody")
 	t.Setenv("CUSTODY_KEYSTORE_FILE", "./secrets/custody-root.age")
@@ -25,6 +26,7 @@ func TestConfigSafeSummaryDoesNotExposeSecrets(t *testing.T) {
 	}
 }
 
+// TestConfigUsesAsiaShanghaiByDefault 验证默认业务时区为 Asia/Shanghai。
 func TestConfigUsesAsiaShanghaiByDefault(t *testing.T) {
 	t.Setenv("APP_TIMEZONE", "")
 	t.Setenv("DATABASE_URL", "postgres://configured")

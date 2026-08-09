@@ -116,7 +116,7 @@ mini-custody/
 │   │   ├── scanner/
 │   │   ├── deposit/
 │   │   ├── withdrawal/
-│   │   ├── ledger/
+│   │   ├── balance/             # 余额和资金事务
 │   │   └── store/postgres/
 │   ├── migrations/
 │   ├── go.mod

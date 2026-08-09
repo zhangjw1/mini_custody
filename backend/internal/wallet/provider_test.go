@@ -14,6 +14,7 @@ import (
 
 const testMnemonic = "tag volcano eight thank tide danger coast health above argue embrace heavy"
 
+// TestMnemonicKeyProviderDerivesPublishedVector 验证公开 BIP-44 测试向量。
 func TestMnemonicKeyProviderDerivesPublishedVector(t *testing.T) {
 	provider, err := NewMnemonicKeyProvider(testMnemonic)
 	if err != nil {
@@ -39,6 +40,7 @@ func TestMnemonicKeyProviderDerivesPublishedVector(t *testing.T) {
 	}
 }
 
+// TestMnemonicKeyProviderSignsDynamicFeeTransaction 验证 EIP-1559 交易签名和发送方恢复。
 func TestMnemonicKeyProviderSignsDynamicFeeTransaction(t *testing.T) {
 	provider, err := NewMnemonicKeyProvider(testMnemonic)
 	if err != nil {
@@ -76,6 +78,7 @@ func TestMnemonicKeyProviderSignsDynamicFeeTransaction(t *testing.T) {
 	}
 }
 
+// TestEncryptedRootRoundTripAndFilePermissions 验证加密根密钥读写和文件权限。
 func TestEncryptedRootRoundTripAndFilePermissions(t *testing.T) {
 	const password = "correct horse battery staple"
 	encrypted, err := EncryptMnemonic(testMnemonic, password)
@@ -106,6 +109,7 @@ func TestEncryptedRootRoundTripAndFilePermissions(t *testing.T) {
 	}
 }
 
+// TestDecryptMnemonicDoesNotLeakSecretsOnFailure 验证解密失败错误不会泄露敏感信息。
 func TestDecryptMnemonicDoesNotLeakSecretsOnFailure(t *testing.T) {
 	const (
 		password      = "right-password"
