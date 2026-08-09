@@ -1,0 +1,11 @@
+.DS_Store
+.idea/
+.env
+.env.*
+!.env.example
+backend/bin/
+backend/coverage.out
+frontend/dist/
+secrets/
+*.age
+
