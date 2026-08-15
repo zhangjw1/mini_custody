@@ -10,19 +10,23 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/xiaoqi/mini-custody/backend/internal/chain/evm"
 	"github.com/xiaoqi/mini-custody/backend/internal/config"
+	"github.com/xiaoqi/mini-custody/backend/internal/deposit"
 	"github.com/xiaoqi/mini-custody/backend/internal/store/postgres"
 	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 	"github.com/xiaoqi/mini-custody/backend/migrations"
 )
 
 type App struct {
-	config config.Config
-	logger *slog.Logger
-	pool   *pgxpool.Pool
-	store  *postgres.Store
-	keys   wallet.KeyProvider
-	server *http.Server
+	config  config.Config
+	logger  *slog.Logger
+	pool    *pgxpool.Pool
+	store   *postgres.Store
+	keys    wallet.KeyProvider
+	chain   *evm.Client
+	scanner *deposit.Scanner
+	server  *http.Server
 }
 
 // New 完成数据库迁移、密钥加载、演示用户初始化和 HTTP 服务装配。
@@ -44,6 +48,16 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	if err := migrations.NewRunner(pool).Up(ctx); err != nil {
 		return nil, fmt.Errorf("执行数据库迁移失败：%w", err)
 	}
+	chainClient, err := evm.NewFromConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 Sepolia RPC 失败：%w", err)
+	}
+	chainFailed := true
+	defer func() {
+		if chainFailed {
+			chainClient.Close()
+		}
+	}()
 	provider, err := wallet.LoadProvider(cfg.CustodyKeyStoreFile, cfg.CustodyPassword)
 	if err != nil {
 		return nil, fmt.Errorf("加载托管密钥提供器失败：%w", err)
@@ -55,13 +69,27 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	if err := store.BootstrapDemoUsers(ctx, provider); err != nil {
 		return nil, fmt.Errorf("初始化演示用户失败：%w", err)
 	}
+	depositScanner, err := deposit.NewScanner(chainClient, store, logger, deposit.Config{
+		StartBlock:    cfg.SepoliaScanStartBlock,
+		Confirmations: cfg.SepoliaConfirmations,
+		BatchSize:     cfg.SepoliaScanBatchSize,
+		Interval:      cfg.SepoliaScanInterval,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("创建 Sepolia 充值扫描器失败：%w", err)
+	}
+	if err := depositScanner.Initialize(ctx); err != nil {
+		return nil, fmt.Errorf("初始化 Sepolia 充值扫描器失败：%w", err)
+	}
 
 	application := &App{
-		config: cfg,
-		logger: logger,
-		pool:   pool,
-		store:  store,
-		keys:   provider,
+		config:  cfg,
+		logger:  logger,
+		pool:    pool,
+		store:   store,
+		keys:    provider,
+		chain:   chainClient,
+		scanner: depositScanner,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", application.health)
@@ -72,13 +100,18 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		IdleTimeout:       time.Minute,
 	}
 	failed = false
+	chainFailed = false
 	return application, nil
 }
 
-// Run 启动 HTTP 服务并在上下文取消时优雅关闭。
+// Run 启动 HTTP 服务和充值扫描器，并在任一关键组件停止时统一关闭。
 func (a *App) Run(ctx context.Context) error {
 	defer a.pool.Close()
+	defer a.chain.Close()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	serveErr := make(chan error, 1)
+	workerErr := make(chan error, 1)
 	go func() {
 		a.logger.Info("Mini Custody Web 服务已启动", "address", a.server.Addr)
 		err := a.server.ListenAndServe()
@@ -87,18 +120,44 @@ func (a *App) Run(ctx context.Context) error {
 		}
 		serveErr <- err
 	}()
+	go func() {
+		a.logger.Info("Sepolia 充值扫描器已启动")
+		workerErr <- a.scanner.Run(runCtx)
+	}()
 
 	select {
 	case err := <-serveErr:
+		cancel()
+		<-workerErr
 		return err
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := a.server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("关闭 Web 服务失败：%w", err)
+	case err := <-workerErr:
+		cancel()
+		if shutdownErr := a.shutdownServer(); shutdownErr != nil {
+			return shutdownErr
 		}
+		<-serveErr
+		if err != nil {
+			return fmt.Errorf("Sepolia 充值扫描器已停止：%w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		cancel()
+		if err := a.shutdownServer(); err != nil {
+			return err
+		}
+		<-workerErr
 		return <-serveErr
 	}
+}
+
+// shutdownServer 在限定时间内优雅关闭 HTTP 服务。
+func (a *App) shutdownServer() error {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := a.server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("关闭 Web 服务失败：%w", err)
+	}
+	return nil
 }
 
 // health 检查数据库连接并返回服务健康状态。
@@ -113,6 +172,15 @@ func (a *App) health(w http.ResponseWriter, _ *http.Request) {
 	if err := a.pool.Ping(ctx); err != nil {
 		status = http.StatusServiceUnavailable
 		response["status"] = "unavailable"
+	}
+	chainHealth := a.chain.Health(ctx)
+	response["chain_status"] = chainHealth.Status
+	response["chain_endpoint"] = chainHealth.Endpoint
+	response["chain_id"] = chainHealth.ChainID
+	response["network_height"] = fmt.Sprintf("%d", chainHealth.NetworkHeight)
+	response["scan_height"] = fmt.Sprintf("%d", chainHealth.ScanHeight)
+	if chainHealth.Status == "DOWN" {
+		status = http.StatusServiceUnavailable
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

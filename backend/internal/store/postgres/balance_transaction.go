@@ -43,31 +43,82 @@ type WithdrawalSettlement struct {
 	Confirmations int64
 }
 
-// RecordDepositAndCheckpoint 在同一事务中记录充值、增加待确认余额并推进扫描点。
+// RecordDepositAndCheckpoint 兼容单笔调用，在同一事务中记录充值并推进扫描点。
 func (s *Store) RecordDepositAndCheckpoint(ctx context.Context, observation DepositObservation) (Deposit, bool, error) {
-	if err := validateDepositObservation(observation); err != nil {
-		return Deposit{}, false, err
-	}
-	observation.TxHash = strings.ToLower(strings.TrimSpace(observation.TxHash))
-	observation.BlockHash = strings.ToLower(strings.TrimSpace(observation.BlockHash))
 	if observation.Checkpoint.Network == "" {
 		observation.Checkpoint.Network = NetworkSepolia
 	}
 	if observation.Checkpoint.LastScannedBlock < observation.BlockNumber {
 		return Deposit{}, false, errors.New("扫描检查点落后于已发现充值的区块")
 	}
+	items, created, err := s.RecordDepositsAndCheckpoint(ctx, []DepositObservation{observation}, observation.Checkpoint)
+	if err != nil {
+		return Deposit{}, false, err
+	}
+	return items[0], created == 1, nil
+}
+
+// RecordDepositsAndCheckpoint 原子记录完整区块内的充值并在最后推进扫描检查点。
+func (s *Store) RecordDepositsAndCheckpoint(
+	ctx context.Context,
+	observations []DepositObservation,
+	checkpoint ChainCheckpoint,
+) ([]Deposit, int, error) {
+	checkpoint.Network = strings.TrimSpace(checkpoint.Network)
+	if checkpoint.Network == "" {
+		checkpoint.Network = NetworkSepolia
+	}
+	checkpoint.Scanner = strings.TrimSpace(checkpoint.Scanner)
+	checkpoint.LastScannedHash = strings.ToLower(strings.TrimSpace(checkpoint.LastScannedHash))
+	if checkpoint.Network != NetworkSepolia || checkpoint.Scanner == "" || checkpoint.LastScannedBlock < 0 ||
+		!transactionHashPattern.MatchString(checkpoint.LastScannedHash) {
+		return nil, 0, errors.New("扫描检查点参数无效")
+	}
+	for index := range observations {
+		if err := validateDepositObservation(observations[index]); err != nil {
+			return nil, 0, err
+		}
+		observations[index].TxHash = strings.ToLower(strings.TrimSpace(observations[index].TxHash))
+		observations[index].BlockHash = strings.ToLower(strings.TrimSpace(observations[index].BlockHash))
+		if observations[index].BlockNumber != checkpoint.LastScannedBlock ||
+			observations[index].BlockHash != checkpoint.LastScannedHash {
+			return nil, 0, errors.New("充值记录与扫描检查点不属于同一区块")
+		}
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Deposit{}, false, fmt.Errorf("开启充值事务失败：%w", err)
+		return nil, 0, fmt.Errorf("开启充值事务失败：%w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	items := make([]Deposit, 0, len(observations))
+	createdCount := 0
+	for _, observation := range observations {
+		item, created, err := s.recordDepositInTx(ctx, tx, observation)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, item)
+		if created {
+			createdCount++
+		}
+	}
+	if err := advanceCheckpoint(ctx, tx, checkpoint); err != nil {
+		return nil, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, 0, fmt.Errorf("提交区块充值事务失败：%w", err)
+	}
+	return items, createdCount, nil
+}
+
+// recordDepositInTx 在既有事务中幂等写入一笔充值及其待确认余额流水。
+func (s *Store) recordDepositInTx(ctx context.Context, tx pgx.Tx, observation DepositObservation) (Deposit, bool, error) {
 	if err := ensureWalletOwnership(ctx, tx, observation.UserID, observation.AddressID); err != nil {
 		return Deposit{}, false, err
 	}
-
 	var depositID int64
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO deposits (
 			user_id, address_id, network, asset, tx_hash, tx_index,
 			block_number, block_hash, amount_wei, status
@@ -129,15 +180,9 @@ func (s *Store) RecordDepositAndCheckpoint(ctx context.Context, observation Depo
 		depositID = existing.ID
 	}
 
-	if err := advanceCheckpoint(ctx, tx, observation.Checkpoint); err != nil {
-		return Deposit{}, false, err
-	}
 	item, err := s.scanDeposit(tx.QueryRow(ctx, `SELECT `+depositColumns+` FROM deposits WHERE id = $1`, depositID))
 	if err != nil {
 		return Deposit{}, false, fmt.Errorf("读取已记录充值失败：%w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Deposit{}, false, fmt.Errorf("提交充值事务失败：%w", err)
 	}
 	return item, created, nil
 }

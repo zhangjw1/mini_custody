@@ -69,6 +69,94 @@ func TestIntegrationDepositIsIdempotentAndCreditsOnce(t *testing.T) {
 	}
 }
 
+// TestIntegrationBlockDepositsAreAtomicAndIdempotent 验证同一区块多笔充值原子落库且重扫不重复增加余额。
+func TestIntegrationBlockDepositsAreAtomicAndIdempotent(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	users, err := store.ListUsers(context.Background())
+	if err != nil || len(users) != 2 {
+		t.Fatalf("ListUsers() count = %d, error = %v", len(users), err)
+	}
+	first, err := store.WalletAddressByUser(context.Background(), users[0].ID)
+	if err != nil {
+		t.Fatalf("WalletAddressByUser(first) error = %v", err)
+	}
+	second, err := store.WalletAddressByUser(context.Background(), users[1].ID)
+	if err != nil {
+		t.Fatalf("WalletAddressByUser(second) error = %v", err)
+	}
+	blockHash := fmt.Sprintf("0x%064x", 2_000)
+	checkpoint := ChainCheckpoint{Network: NetworkSepolia, Scanner: "eth-deposit", LastScannedBlock: 100, LastScannedHash: blockHash}
+	observations := []DepositObservation{
+		{UserID: users[0].ID, AddressID: first.ID, TxHash: fmt.Sprintf("0x%064x", 101), TxIndex: 0, BlockNumber: 100, BlockHash: blockHash, AmountWei: big.NewInt(100)},
+		{UserID: users[1].ID, AddressID: second.ID, TxHash: fmt.Sprintf("0x%064x", 102), TxIndex: 1, BlockNumber: 100, BlockHash: blockHash, AmountWei: big.NewInt(200)},
+	}
+
+	items, created, err := store.RecordDepositsAndCheckpoint(context.Background(), observations, checkpoint)
+	if err != nil || created != 2 || len(items) != 2 {
+		t.Fatalf("RecordDepositsAndCheckpoint() created = %d, count = %d, error = %v", created, len(items), err)
+	}
+	_, created, err = store.RecordDepositsAndCheckpoint(context.Background(), observations, checkpoint)
+	if err != nil || created != 0 {
+		t.Fatalf("duplicate block created = %d, error = %v", created, err)
+	}
+	firstBalance, err := store.BalanceByUser(context.Background(), users[0].ID)
+	if err != nil {
+		t.Fatalf("BalanceByUser(first) error = %v", err)
+	}
+	secondBalance, err := store.BalanceByUser(context.Background(), users[1].ID)
+	if err != nil {
+		t.Fatalf("BalanceByUser(second) error = %v", err)
+	}
+	assertBigInt(t, "first pending deposit", firstBalance.PendingDepositWei, 100)
+	assertBigInt(t, "second pending deposit", secondBalance.PendingDepositWei, 200)
+}
+
+// TestIntegrationConcurrentDepositCreditOnlyAppliesOnce 验证并发确认同一充值时余额只入账一次。
+func TestIntegrationConcurrentDepositCreditOnlyAppliesOnce(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	user, address := firstDemoWallet(t, store)
+	deposit, _, err := store.RecordDepositAndCheckpoint(context.Background(), depositObservation(user.ID, address.ID, 30, 500))
+	if err != nil {
+		t.Fatalf("RecordDepositAndCheckpoint() error = %v", err)
+	}
+	type result struct {
+		credited bool
+		err      error
+	}
+	results := make(chan result, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			_, credited, err := store.CreditDeposit(context.Background(), deposit.ID, 3)
+			results <- result{credited: credited, err: err}
+		}()
+	}
+	group.Wait()
+	close(results)
+	creditedCount := 0
+	for item := range results {
+		if item.err != nil {
+			t.Fatalf("CreditDeposit() error = %v", item.err)
+		}
+		if item.credited {
+			creditedCount++
+		}
+	}
+	if creditedCount != 1 {
+		t.Fatalf("credited count = %d, want 1", creditedCount)
+	}
+	balance, err := store.BalanceByUser(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("BalanceByUser() error = %v", err)
+	}
+	assertBigInt(t, "available", balance.AvailableWei, 500)
+	assertBigInt(t, "pending deposit", balance.PendingDepositWei, 0)
+}
+
 // TestIntegrationConcurrentWithdrawalCannotOverspend 验证并发提币无法超额占用余额。
 func TestIntegrationConcurrentWithdrawalCannotOverspend(t *testing.T) {
 	store, cleanup := integrationStore(t)

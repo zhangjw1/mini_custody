@@ -53,6 +53,27 @@ func (s *Store) WalletAddressByUser(ctx context.Context, userID int64) (WalletAd
 	return item, mapNotFound(err)
 }
 
+// ListWalletAddresses 查询 Sepolia 网络上的全部托管地址，供充值扫描器构建地址索引。
+func (s *Store) ListWalletAddresses(ctx context.Context) ([]WalletAddress, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+walletColumns+` FROM wallet_addresses WHERE network = $1 ORDER BY id`,
+		NetworkSepolia,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询托管钱包地址失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]WalletAddress, 0)
+	for rows.Next() {
+		item, err := s.scanWalletAddress(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取托管钱包地址失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
 // BalanceByUser 查询用户的 ETH 余额汇总。
 func (s *Store) BalanceByUser(ctx context.Context, userID int64) (AssetBalance, error) {
 	item, err := s.scanBalance(s.pool.QueryRow(ctx,
@@ -104,6 +125,31 @@ func (s *Store) ListDeposits(ctx context.Context, userID int64, limit int) ([]De
 		item, err := s.scanDeposit(rows)
 		if err != nil {
 			return nil, fmt.Errorf("读取充值记录失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// ListConfirmingDeposits 查询仍需更新确认数或执行入账的充值记录。
+func (s *Store) ListConfirmingDeposits(ctx context.Context, limit int) ([]Deposit, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+depositColumns+`
+		 FROM deposits
+		 WHERE network = $1 AND status IN ($2, $3)
+		 ORDER BY block_number, id
+		 LIMIT $4`,
+		NetworkSepolia, DepositConfirming, DepositConfirmed, normalizedLimit(limit),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询待确认充值失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]Deposit, 0)
+	for rows.Next() {
+		item, err := s.scanDeposit(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取待确认充值失败：%w", err)
 		}
 		items = append(items, item)
 	}
