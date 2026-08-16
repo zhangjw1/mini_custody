@@ -241,6 +241,12 @@ func TestIntegrationWithdrawalIdempotencyAndFeeSettlement(t *testing.T) {
 	if err != nil || created || duplicate.ID != item.ID {
 		t.Fatalf("duplicate reserve: id = %d, created = %v, error = %v", duplicate.ID, created, err)
 	}
+	changedFeeRequest := request
+	changedFeeRequest.ReservedFeeWei = big.NewInt(300)
+	duplicate, created, err = store.ReserveWithdrawal(context.Background(), changedFeeRequest)
+	if err != nil || created || duplicate.ID != item.ID || duplicate.ReservedFeeWei.Cmp(big.NewInt(200)) != 0 {
+		t.Fatalf("changed fee retry: id = %d, created = %v, fee = %v, error = %v", duplicate.ID, created, duplicate.ReservedFeeWei, err)
+	}
 	for _, status := range []string{
 		WithdrawalSigning,
 		WithdrawalSigned,
@@ -272,6 +278,82 @@ func TestIntegrationWithdrawalIdempotencyAndFeeSettlement(t *testing.T) {
 	}
 	assertBigInt(t, "settled available", balance.AvailableWei, 900)
 	assertBigInt(t, "settled pending", balance.PendingWithdrawalWei, 0)
+}
+
+// TestIntegrationConcurrentNonceAllocationIsUnique 验证同一地址并发提币获得不同 Nonce。
+func TestIntegrationConcurrentNonceAllocationIsUnique(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	user, address := firstDemoWallet(t, store)
+	fundWallet(t, store, user.ID, address.ID, 50, 10_000)
+	first, _, err := store.ReserveWithdrawal(context.Background(), withdrawalRequest("nonce-1", user.ID, address.ID, 100, 100))
+	if err != nil {
+		t.Fatalf("ReserveWithdrawal(first) error = %v", err)
+	}
+	second, _, err := store.ReserveWithdrawal(context.Background(), withdrawalRequest("nonce-2", user.ID, address.ID, 100, 100))
+	if err != nil {
+		t.Fatalf("ReserveWithdrawal(second) error = %v", err)
+	}
+	type result struct {
+		item Withdrawal
+		err  error
+	}
+	results := make(chan result, 2)
+	var group sync.WaitGroup
+	for _, id := range []int64{first.ID, second.ID} {
+		id := id
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			item, _, err := store.AllocateWithdrawalNonce(context.Background(), id, 5)
+			results <- result{item: item, err: err}
+		}()
+	}
+	group.Wait()
+	close(results)
+	nonces := make(map[string]bool)
+	for item := range results {
+		if item.err != nil {
+			t.Fatalf("AllocateWithdrawalNonce() error = %v", item.err)
+		}
+		nonces[item.item.Nonce.String()] = true
+	}
+	if !nonces["5"] || !nonces["6"] || len(nonces) != 2 {
+		t.Fatalf("nonces = %v, want 5 and 6", nonces)
+	}
+}
+
+// TestIntegrationFailedWithdrawalChargesOnlyActualGas 验证链上失败时退回转账金额和未使用费用。
+func TestIntegrationFailedWithdrawalChargesOnlyActualGas(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	user, address := firstDemoWallet(t, store)
+	fundWallet(t, store, user.ID, address.ID, 60, 1_000)
+	item, _, err := store.ReserveWithdrawal(context.Background(), withdrawalRequest("failed-receipt", user.ID, address.ID, 600, 200))
+	if err != nil {
+		t.Fatalf("ReserveWithdrawal() error = %v", err)
+	}
+	for _, status := range []string{
+		WithdrawalSigning, WithdrawalSigned, WithdrawalBroadcasting, WithdrawalBroadcasted,
+	} {
+		item, err = store.TransitionWithdrawal(context.Background(), item.ID, status)
+		if err != nil {
+			t.Fatalf("TransitionWithdrawal(%s) error = %v", status, err)
+		}
+	}
+	item, changed, err := store.FinalizeWithdrawal(context.Background(), WithdrawalSettlement{
+		WithdrawalID: item.ID, ActualFeeWei: big.NewInt(50), Success: false,
+		BlockNumber: 100, Confirmations: 3,
+	})
+	if err != nil || !changed || item.Status != WithdrawalFailed {
+		t.Fatalf("FinalizeWithdrawal() changed = %v, status = %s, error = %v", changed, item.Status, err)
+	}
+	balance, err := store.BalanceByUser(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("BalanceByUser() error = %v", err)
+	}
+	assertBigInt(t, "failed withdrawal available", balance.AvailableWei, 950)
+	assertBigInt(t, "failed withdrawal pending", balance.PendingWithdrawalWei, 0)
 }
 
 // integrationStore 创建使用独立临时 Schema 的集成测试数据访问对象。

@@ -11,13 +11,14 @@ import (
 )
 
 const (
-	userColumns       = `id, code, display_name, created_at`
-	walletColumns     = `id, user_id, network, address, derivation_index, derivation_path, next_nonce::text, created_at`
-	balanceColumns    = `id, user_id, asset, available_wei::text, pending_deposit_wei::text, pending_withdrawal_wei::text, version, updated_at`
-	entryColumns      = `id, user_id, asset, entry_type, amount_wei::text, reference_type, reference_id, created_at`
-	depositColumns    = `id, user_id, address_id, network, asset, tx_hash, tx_index, block_number, block_hash, amount_wei::text, confirmations, status, created_at, updated_at`
-	withdrawalColumns = `id, idempotency_key, user_id, address_id, to_address, amount_wei::text, reserved_fee_wei::text, actual_fee_wei::text, nonce::text, gas_limit, max_fee_per_gas_wei::text, max_priority_fee_per_gas_wei::text, raw_tx, tx_hash, block_number, confirmations, status, error_code, error_message, created_at, updated_at`
-	checkpointColumns = `id, network, scanner, last_scanned_block, last_scanned_hash, updated_at`
+	userColumns        = `id, code, display_name, created_at`
+	walletColumns      = `id, user_id, network, address, derivation_index, derivation_path, next_nonce::text, created_at`
+	balanceColumns     = `id, user_id, asset, available_wei::text, pending_deposit_wei::text, pending_withdrawal_wei::text, version, updated_at`
+	entryColumns       = `id, user_id, asset, entry_type, amount_wei::text, reference_type, reference_id, created_at`
+	depositColumns     = `id, user_id, address_id, network, asset, tx_hash, tx_index, block_number, block_hash, amount_wei::text, confirmations, status, created_at, updated_at`
+	withdrawalColumns  = `id, idempotency_key, user_id, address_id, to_address, amount_wei::text, reserved_fee_wei::text, actual_fee_wei::text, nonce::text, gas_limit, max_fee_per_gas_wei::text, max_priority_fee_per_gas_wei::text, raw_tx, tx_hash, block_number, confirmations, status, error_code, error_message, created_at, updated_at`
+	checkpointColumns  = `id, network, scanner, last_scanned_block, last_scanned_hash, updated_at`
+	workerErrorColumns = `id, worker, stage, reference_type, reference_id, error_code, error_message, retry_count, first_occurred_at, last_occurred_at`
 )
 
 // ListUsers 按主键顺序查询全部演示用户。
@@ -131,6 +132,27 @@ func (s *Store) ListDeposits(ctx context.Context, userID int64, limit int) ([]De
 	return items, rows.Err()
 }
 
+// ListDepositsPage 按页倒序查询用户充值记录。
+func (s *Store) ListDepositsPage(ctx context.Context, userID int64, limit, offset int) ([]Deposit, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+depositColumns+` FROM deposits WHERE user_id = $1 ORDER BY id DESC LIMIT $2 OFFSET $3`,
+		userID, normalizedLimit(limit), normalizedOffset(offset),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("分页查询充值记录失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]Deposit, 0)
+	for rows.Next() {
+		item, err := s.scanDeposit(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取分页充值记录失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
 // ListConfirmingDeposits 查询仍需更新确认数或执行入账的充值记录。
 func (s *Store) ListConfirmingDeposits(ctx context.Context, limit int) ([]Deposit, error) {
 	rows, err := s.pool.Query(ctx,
@@ -162,6 +184,15 @@ func (s *Store) WithdrawalByID(ctx context.Context, id int64) (Withdrawal, error
 	return item, mapNotFound(err)
 }
 
+// WithdrawalByIdempotencyKey 根据用户和幂等标识查询原始提币请求。
+func (s *Store) WithdrawalByIdempotencyKey(ctx context.Context, userID int64, idempotencyKey string) (Withdrawal, error) {
+	item, err := s.scanWithdrawal(s.pool.QueryRow(ctx,
+		`SELECT `+withdrawalColumns+` FROM withdrawals WHERE user_id = $1 AND idempotency_key = $2`,
+		userID, strings.TrimSpace(idempotencyKey),
+	))
+	return item, mapNotFound(err)
+}
+
 // ListWithdrawals 倒序查询用户提币记录。
 func (s *Store) ListWithdrawals(ctx context.Context, userID int64, limit int) ([]Withdrawal, error) {
 	rows, err := s.pool.Query(ctx,
@@ -177,6 +208,108 @@ func (s *Store) ListWithdrawals(ctx context.Context, userID int64, limit int) ([
 		item, err := s.scanWithdrawal(rows)
 		if err != nil {
 			return nil, fmt.Errorf("读取提币记录失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// ListWithdrawalsPage 按页倒序查询用户提币记录。
+func (s *Store) ListWithdrawalsPage(ctx context.Context, userID int64, limit, offset int) ([]Withdrawal, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+withdrawalColumns+` FROM withdrawals WHERE user_id = $1 ORDER BY id DESC LIMIT $2 OFFSET $3`,
+		userID, normalizedLimit(limit), normalizedOffset(offset),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("分页查询提币记录失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]Withdrawal, 0)
+	for rows.Next() {
+		item, err := s.scanWithdrawal(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取分页提币记录失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// ListTransactionsPage 按时间倒序联合查询全局充值和提币记录。
+func (s *Store) ListTransactionsPage(ctx context.Context, limit, offset int) ([]TransactionRecord, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT transaction_type, id, user_id, asset, tx_hash, amount_wei, block_number,
+		       confirmations, status, created_at, updated_at
+		FROM (
+			SELECT 'DEPOSIT'::text AS transaction_type, id, user_id, asset, tx_hash,
+			       amount_wei::text AS amount_wei, block_number, confirmations, status,
+			       created_at, updated_at
+			FROM deposits
+			UNION ALL
+			SELECT 'WITHDRAWAL'::text AS transaction_type, id, user_id, 'ETH'::text AS asset,
+			       COALESCE(tx_hash, '') AS tx_hash, amount_wei::text AS amount_wei,
+			       block_number, confirmations, status, created_at, updated_at
+			FROM withdrawals
+		) transactions
+		ORDER BY created_at DESC, transaction_type, id DESC
+		LIMIT $1 OFFSET $2`, normalizedLimit(limit), normalizedOffset(offset),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("分页查询全局交易失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]TransactionRecord, 0)
+	for rows.Next() {
+		item, err := s.scanTransactionRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取全局交易失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// ListWorkerErrorsPage 按最近发生时间倒序查询后台任务错误。
+func (s *Store) ListWorkerErrorsPage(ctx context.Context, limit, offset int) ([]WorkerError, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+workerErrorColumns+` FROM worker_errors ORDER BY last_occurred_at DESC, id DESC LIMIT $1 OFFSET $2`,
+		normalizedLimit(limit), normalizedOffset(offset),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("分页查询 Worker 错误失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]WorkerError, 0)
+	for rows.Next() {
+		item, err := s.scanWorkerError(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取 Worker 错误失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// ListProcessableWithdrawals 查询需要提币 Worker 继续处理或恢复的记录。
+func (s *Store) ListProcessableWithdrawals(ctx context.Context, limit int) ([]Withdrawal, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+withdrawalColumns+`
+		 FROM withdrawals
+		 WHERE status IN ($1, $2, $3, $4, $5, $6, $7)
+		 ORDER BY id
+		 LIMIT $8`,
+		WithdrawalCreated, WithdrawalSigning, WithdrawalSigned, WithdrawalBroadcasting,
+		WithdrawalBroadcastUnknown, WithdrawalBroadcasted, WithdrawalConfirming, normalizedLimit(limit),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询待处理提币失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]Withdrawal, 0)
+	for rows.Next() {
+		item, err := s.scanWithdrawal(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取待处理提币失败：%w", err)
 		}
 		items = append(items, item)
 	}
@@ -263,6 +396,14 @@ func normalizedLimit(limit int) int {
 		return 200
 	}
 	return limit
+}
+
+// normalizedOffset 将分页偏移量限制为非负整数。
+func normalizedOffset(offset int) int {
+	if offset < 0 {
+		return 0
+	}
+	return offset
 }
 
 // mapNotFound 将 pgx 未找到错误映射为稳定的领域错误。

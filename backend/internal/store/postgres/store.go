@@ -234,3 +234,45 @@ func (s *Store) scanCheckpoint(row rowScanner) (ChainCheckpoint, error) {
 	item.UpdatedAt = s.localTime(item.UpdatedAt)
 	return item, nil
 }
+
+// scanWorkerError 从查询结果读取后台 Worker 错误模型。
+func (s *Store) scanWorkerError(row rowScanner) (WorkerError, error) {
+	var item WorkerError
+	var referenceType pgtype.Text
+	var referenceID pgtype.Int8
+	if err := row.Scan(
+		&item.ID, &item.Worker, &item.Stage, &referenceType, &referenceID,
+		&item.ErrorCode, &item.ErrorMessage, &item.RetryCount,
+		&item.FirstOccurredAt, &item.LastOccurredAt,
+	); err != nil {
+		return WorkerError{}, err
+	}
+	item.ReferenceType = optionalString(referenceType)
+	item.ReferenceID = optionalInt64(referenceID)
+	item.FirstOccurredAt = s.localTime(item.FirstOccurredAt)
+	item.LastOccurredAt = s.localTime(item.LastOccurredAt)
+	return item, nil
+}
+
+// scanTransactionRecord 从充值和提币联合查询中读取统一交易模型。
+func (s *Store) scanTransactionRecord(row rowScanner) (TransactionRecord, error) {
+	var item TransactionRecord
+	var amountValue string
+	var blockNumber pgtype.Int8
+	if err := row.Scan(
+		&item.Type, &item.ID, &item.UserID, &item.Asset, &item.TxHash,
+		&amountValue, &blockNumber, &item.Confirmations, &item.Status,
+		&item.CreatedAt, &item.UpdatedAt,
+	); err != nil {
+		return TransactionRecord{}, err
+	}
+	amountWei, err := parseDatabaseWei(amountValue, "transaction amount_wei")
+	if err != nil {
+		return TransactionRecord{}, err
+	}
+	item.AmountWei = amountWei
+	item.BlockNumber = optionalInt64(blockNumber)
+	item.CreatedAt = s.localTime(item.CreatedAt)
+	item.UpdatedAt = s.localTime(item.UpdatedAt)
+	return item, nil
+}

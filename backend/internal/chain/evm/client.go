@@ -437,6 +437,7 @@ func (c *Client) validateEndpoint(ctx context.Context, index int) error {
 	}
 	c.mu.Lock()
 	c.endpoints[index].validated = true
+	c.chainID = chainID.String()
 	c.mu.Unlock()
 	return nil
 }

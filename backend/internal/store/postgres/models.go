@@ -144,3 +144,17 @@ type WorkerError struct {
 	FirstOccurredAt time.Time
 	LastOccurredAt  time.Time
 }
+
+type TransactionRecord struct {
+	Type          string
+	ID            int64
+	UserID        int64
+	Asset         string
+	TxHash        string
+	AmountWei     *big.Int
+	BlockNumber   *int64
+	Confirmations int64
+	Status        string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}

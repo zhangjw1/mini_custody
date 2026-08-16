@@ -18,6 +18,7 @@ import (
 type fakeChain struct {
 	latest      uint64
 	blocks      map[uint64]*types.Block
+	blockErrors map[uint64]error
 	headers     map[uint64]*types.Header
 	blockCalls  []uint64
 	scanHeights []uint64
@@ -32,6 +33,9 @@ func (f *fakeChain) BlockNumber(context.Context) (uint64, error) {
 func (f *fakeChain) BlockByNumber(_ context.Context, number *big.Int) (*types.Block, error) {
 	height := number.Uint64()
 	f.blockCalls = append(f.blockCalls, height)
+	if err := f.blockErrors[height]; err != nil {
+		return nil, err
+	}
 	block, ok := f.blocks[height]
 	if !ok {
 		return nil, errors.New("测试区块不存在")
@@ -177,6 +181,41 @@ func TestScannerResumesAfterCheckpoint(t *testing.T) {
 	}
 	if len(chain.blockCalls) != 1 || chain.blockCalls[0] != 11 {
 		t.Fatalf("block calls = %v, want [11]", chain.blockCalls)
+	}
+}
+
+// TestScannerDoesNotAdvanceCheckpointAfterTemporaryRPCFailure 验证 RPC 临时失败不会跳过区块，恢复后仍从原高度重试。
+func TestScannerDoesNotAdvanceCheckpointAfterTemporaryRPCFailure(t *testing.T) {
+	block11 := testBlock(11)
+	chain := &fakeChain{
+		latest:      11,
+		blocks:      map[uint64]*types.Block{11: block11},
+		blockErrors: map[uint64]error{11: errors.New("测试 RPC 限流")},
+		headers:     map[uint64]*types.Header{},
+	}
+	store := &fakeStore{checkpoint: &postgres.ChainCheckpoint{
+		Network: postgres.NetworkSepolia, Scanner: defaultScannerName,
+		LastScannedBlock: 10, LastScannedHash: common.HexToHash("0x10").Hex(),
+	}}
+	scanner := newTestScanner(t, chain, store, Config{Confirmations: 3, BatchSize: 10, Interval: time.Second})
+
+	if err := scanner.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() error = nil, want temporary RPC failure")
+	}
+	if store.checkpoint.LastScannedBlock != 10 || len(store.observations) != 0 || len(store.credited) != 0 {
+		t.Fatalf("failed scan changed state: checkpoint = %d, observations = %d, credited = %d",
+			store.checkpoint.LastScannedBlock, len(store.observations), len(store.credited))
+	}
+
+	delete(chain.blockErrors, 11)
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("recovery RunOnce() error = %v", err)
+	}
+	if store.checkpoint.LastScannedBlock != 11 {
+		t.Fatalf("recovery checkpoint = %d, want 11", store.checkpoint.LastScannedBlock)
+	}
+	if len(chain.blockCalls) != 2 || chain.blockCalls[0] != 11 || chain.blockCalls[1] != 11 {
+		t.Fatalf("block calls = %v, want [11 11]", chain.blockCalls)
 	}
 }
 

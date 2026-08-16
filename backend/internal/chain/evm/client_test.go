@@ -63,6 +63,16 @@ func TestClientQueriesSupportedMethods(t *testing.T) {
 	}
 }
 
+// TestClientSnapshotContainsChainIDAfterInitialization 验证启动校验会立即写入健康快照 Chain ID。
+func TestClientSnapshotContainsChainIDAfterInitialization(t *testing.T) {
+	mock := newMockRPC(t)
+	client := newTestClient(t, mock.URL())
+	defer client.Close()
+	if got := client.Snapshot().ChainID; got != "11155111" {
+		t.Fatalf("Snapshot().ChainID = %q, want 11155111", got)
+	}
+}
+
 // TestClientRetriesRateLimit 验证 HTTP 429 会按策略重试并最终成功。
 func TestClientRetriesRateLimit(t *testing.T) {
 	mock := newMockRPC(t)

@@ -1,4 +1,4 @@
-.PHONY: fmt vet test integration-test check run migrate-up migrate-down migrate-version migrate-check
+.PHONY: fmt vet test integration-test e2e-test check run migrate-up migrate-down migrate-version migrate-check
 
 export CGO_ENABLED ?= 0
 
@@ -14,6 +14,9 @@ test:
 integration-test:
 	test -n "$$TEST_DATABASE_URL"
 	go test -count=1 ./internal/store/postgres
+
+e2e-test:
+	E2E_SEPOLIA=1 go test -count=1 -v ./e2e
 
 check: vet test
 

@@ -109,3 +109,107 @@ func TestConfigRejectsInvalidSepoliaScannerSettings(t *testing.T) {
 		t.Fatal("Load() error = nil, want invalid scanner config")
 	}
 }
+
+// TestConfigKeepsERC20DisabledByDefault 验证未启用 Token 时现有 ETH 配置仍可正常加载。
+func TestConfigKeepsERC20DisabledByDefault(t *testing.T) {
+	setRequiredConfigEnvironment(t)
+	t.Setenv("ERC20_ENABLED", "")
+	t.Setenv("ERC20_SWEEP_ENABLED", "")
+	t.Setenv("ERC20_CONTRACT_ADDRESS", "not-an-address")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ERC20.Enabled || cfg.ERC20.SweepEnabled {
+		t.Fatalf("ERC20 config = %+v, want disabled", cfg.ERC20)
+	}
+}
+
+// TestConfigLoadsERC20Settings 验证 Sepolia USDC、扫描、归集和平台热钱包配置解析。
+func TestConfigLoadsERC20Settings(t *testing.T) {
+	setRequiredConfigEnvironment(t)
+	t.Setenv("ERC20_ENABLED", "true")
+	t.Setenv("ERC20_CONTRACT_ADDRESS", "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238")
+	t.Setenv("ERC20_SYMBOL", "USDC")
+	t.Setenv("ERC20_DECIMALS", "6")
+	t.Setenv("ERC20_SCAN_START_BLOCK", "789")
+	t.Setenv("ERC20_SCAN_BATCH_SIZE", "250")
+	t.Setenv("ERC20_CONFIRMATIONS", "5")
+	t.Setenv("ERC20_SWEEP_ENABLED", "true")
+	t.Setenv("ERC20_SWEEP_INTERVAL", "30s")
+	t.Setenv("ERC20_GAS_SAFETY_BPS", "1500")
+	t.Setenv("ERC20_GAS_TOPUP_MAX_WEI", "4000000000000000")
+	t.Setenv("PLATFORM_HOT_WALLET_PATH", "m/44'/60'/0'/0/0")
+	t.Setenv("PLATFORM_MIN_ETH_BALANCE_WEI", "9000000000000000")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.ERC20.Enabled || !cfg.ERC20.SweepEnabled || cfg.ERC20.Symbol != "USDC" || cfg.ERC20.Decimals != 6 {
+		t.Fatalf("ERC20 config = %+v", cfg.ERC20)
+	}
+	if cfg.ERC20.ScanStartBlock == nil || *cfg.ERC20.ScanStartBlock != 789 || cfg.ERC20.ScanBatchSize != 250 ||
+		cfg.ERC20.Confirmations != 5 || cfg.ERC20.SweepInterval != 30*time.Second {
+		t.Fatalf("ERC20 scanner config = %+v", cfg.ERC20)
+	}
+	if cfg.ERC20.GasTopupMaxWei.String() != "4000000000000000" || cfg.PlatformWallet.MinETHBalanceWei.String() != "9000000000000000" {
+		t.Fatalf("Gas config = %+v, platform = %+v", cfg.ERC20, cfg.PlatformWallet)
+	}
+}
+
+// TestConfigRejectsInvalidERC20Settings 验证 Token 开启后会拒绝危险或无法解释的配置。
+func TestConfigRejectsInvalidERC20Settings(t *testing.T) {
+	testCases := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "合约地址", key: "ERC20_CONTRACT_ADDRESS", value: "not-an-address"},
+		{name: "零地址", key: "ERC20_CONTRACT_ADDRESS", value: "0x0000000000000000000000000000000000000000"},
+		{name: "精度", key: "ERC20_DECIMALS", value: "19"},
+		{name: "扫描批次", key: "ERC20_SCAN_BATCH_SIZE", value: "1001"},
+		{name: "Gas 安全余量", key: "ERC20_GAS_SAFETY_BPS", value: "10001"},
+		{name: "Gas 补充上限", key: "ERC20_GAS_TOPUP_MAX_WEI", value: "0"},
+		{name: "热钱包路径", key: "PLATFORM_HOT_WALLET_PATH", value: "m/44'/60'/0'/0/1"},
+		{name: "平台余额阈值", key: "PLATFORM_MIN_ETH_BALANCE_WEI", value: "invalid"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			setRequiredConfigEnvironment(t)
+			t.Setenv("ERC20_ENABLED", "true")
+			t.Setenv(testCase.key, testCase.value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() error = nil, want invalid %s", testCase.key)
+			}
+		})
+	}
+}
+
+// TestConfigRejectsSweepWithoutERC20 验证不能在 Token 关闭时单独启动归集 Worker。
+func TestConfigRejectsSweepWithoutERC20(t *testing.T) {
+	setRequiredConfigEnvironment(t)
+	t.Setenv("ERC20_ENABLED", "false")
+	t.Setenv("ERC20_SWEEP_ENABLED", "true")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want sweep dependency error")
+	}
+}
+
+// setRequiredConfigEnvironment 设置加载配置所需的最小非敏感测试值。
+func setRequiredConfigEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("DATABASE_URL", "postgres://configured")
+	t.Setenv("CUSTODY_KEYSTORE_FILE", "root.age")
+	t.Setenv("CUSTODY_KEYSTORE_PASSWORD", "password")
+	t.Setenv("SEPOLIA_RPC_URL", "https://primary.example")
+	for _, key := range []string{
+		"ERC20_CONTRACT_ADDRESS", "ERC20_SYMBOL", "ERC20_DECIMALS", "ERC20_SCAN_START_BLOCK",
+		"ERC20_SCAN_BATCH_SIZE", "ERC20_CONFIRMATIONS", "ERC20_SWEEP_INTERVAL", "ERC20_GAS_SAFETY_BPS",
+		"ERC20_GAS_TOPUP_MAX_WEI", "PLATFORM_HOT_WALLET_PATH", "PLATFORM_MIN_ETH_BALANCE_WEI",
+	} {
+		t.Setenv(key, "")
+	}
+}

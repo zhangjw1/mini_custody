@@ -2,12 +2,16 @@ package amount
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 	"regexp"
 	"strings"
 )
 
 var unsignedDecimal = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
+var ethDecimal = regexp.MustCompile(`^(0|[1-9][0-9]*)(?:\.([0-9]{1,18}))?$`)
+
+var weiPerETH = new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
 
 // ParseWei 将无符号十进制字符串解析为 Wei 整数。
 func ParseWei(value string) (*big.Int, error) {
@@ -20,6 +24,44 @@ func ParseWei(value string) (*big.Int, error) {
 		return nil, errors.New("Wei 金额无效")
 	}
 	return parsed, nil
+}
+
+// ParseETH 将最多 18 位小数的 ETH 十进制字符串精确转换为 Wei。
+func ParseETH(value string) (*big.Int, error) {
+	value = strings.TrimSpace(value)
+	matches := ethDecimal.FindStringSubmatch(value)
+	if matches == nil {
+		return nil, errors.New("ETH 金额必须是最多 18 位小数的非负十进制数")
+	}
+	whole, ok := new(big.Int).SetString(matches[1], 10)
+	if !ok {
+		return nil, errors.New("ETH 整数部分无效")
+	}
+	result := new(big.Int).Mul(whole, weiPerETH)
+	if matches[2] == "" {
+		return result, nil
+	}
+	fraction := matches[2] + strings.Repeat("0", 18-len(matches[2]))
+	fractionWei, ok := new(big.Int).SetString(fraction, 10)
+	if !ok {
+		return nil, errors.New("ETH 小数部分无效")
+	}
+	return result.Add(result, fractionWei), nil
+}
+
+// FormatETH 将非负 Wei 精确格式化为不带多余尾零的 ETH 十进制字符串。
+func FormatETH(value *big.Int) (string, error) {
+	if err := RequireNonNegative(value); err != nil {
+		return "", err
+	}
+	whole := new(big.Int)
+	fraction := new(big.Int)
+	whole.QuoRem(value, weiPerETH, fraction)
+	if fraction.Sign() == 0 {
+		return whole.String(), nil
+	}
+	fractionText := fmt.Sprintf("%018s", fraction.String())
+	return whole.String() + "." + strings.TrimRight(fractionText, "0"), nil
 }
 
 // RequirePositive 校验 Wei 金额必须大于零。
