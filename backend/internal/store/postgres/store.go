@@ -119,7 +119,7 @@ func (s *Store) scanBalance(row rowScanner) (AssetBalance, error) {
 	var item AssetBalance
 	var available, pendingDeposit, pendingWithdrawal string
 	if err := row.Scan(
-		&item.ID, &item.UserID, &item.Asset, &available, &pendingDeposit,
+		&item.ID, &item.UserID, &item.AssetID, &item.Asset, &available, &pendingDeposit,
 		&pendingWithdrawal, &item.Version, &item.UpdatedAt,
 	); err != nil {
 		return AssetBalance{}, err
@@ -143,7 +143,7 @@ func (s *Store) scanBalanceEntry(row rowScanner) (BalanceEntry, error) {
 	var item BalanceEntry
 	var value string
 	if err := row.Scan(
-		&item.ID, &item.UserID, &item.Asset, &item.EntryType, &value,
+		&item.ID, &item.UserID, &item.AssetID, &item.Asset, &item.EntryType, &value,
 		&item.ReferenceType, &item.ReferenceID, &item.CreatedAt,
 	); err != nil {
 		return BalanceEntry{}, err
@@ -260,7 +260,7 @@ func (s *Store) scanTransactionRecord(row rowScanner) (TransactionRecord, error)
 	var amountValue string
 	var blockNumber pgtype.Int8
 	if err := row.Scan(
-		&item.Type, &item.ID, &item.UserID, &item.Asset, &item.TxHash,
+		&item.Type, &item.ID, &item.UserID, &item.Asset, &item.Decimals, &item.TxHash,
 		&amountValue, &blockNumber, &item.Confirmations, &item.Status,
 		&item.CreatedAt, &item.UpdatedAt,
 	); err != nil {

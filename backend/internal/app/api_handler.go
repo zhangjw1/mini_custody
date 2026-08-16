@@ -23,13 +23,22 @@ const (
 // APIStore 定义后台页面只读 API 所需的数据查询能力。
 type APIStore interface {
 	ListUsers(ctx context.Context) ([]postgres.User, error)
+	ListAssets(ctx context.Context) ([]postgres.Asset, error)
 	UserByID(ctx context.Context, id int64) (postgres.User, error)
 	WalletAddressByUser(ctx context.Context, userID int64) (postgres.WalletAddress, error)
 	BalanceByUser(ctx context.Context, userID int64) (postgres.AssetBalance, error)
+	BalanceByUserAndAsset(ctx context.Context, userID, assetID int64) (postgres.AssetBalance, error)
 	ListDepositsPage(ctx context.Context, userID int64, limit, offset int) ([]postgres.Deposit, error)
 	ListWithdrawalsPage(ctx context.Context, userID int64, limit, offset int) ([]postgres.Withdrawal, error)
 	WithdrawalByID(ctx context.Context, id int64) (postgres.Withdrawal, error)
 	ListTransactionsPage(ctx context.Context, limit, offset int) ([]postgres.TransactionRecord, error)
+	ListTransactionsFilteredPage(ctx context.Context, asset, transactionType string, limit, offset int) ([]postgres.TransactionRecord, error)
+	ListTokenDepositsPage(ctx context.Context, userID int64, limit, offset int) ([]postgres.TokenDeposit, error)
+	ListTokenWithdrawalsPage(ctx context.Context, userID int64, limit, offset int) ([]postgres.TokenWithdrawal, error)
+	TokenWithdrawalByID(ctx context.Context, id int64) (postgres.TokenWithdrawal, error)
+	ListTokenSweepsPage(ctx context.Context, limit, offset int) ([]postgres.TokenSweep, error)
+	ListInternalTransfersPage(ctx context.Context, limit, offset int) ([]postgres.InternalTransfer, error)
+	PlatformWalletByRole(ctx context.Context, network, role string) (postgres.PlatformWallet, error)
 	ListWorkerErrorsPage(ctx context.Context, limit, offset int) ([]postgres.WorkerError, error)
 }
 
@@ -94,6 +103,9 @@ type transactionResponse struct {
 	ID            int64     `json:"id"`
 	UserID        int64     `json:"user_id"`
 	Asset         string    `json:"asset"`
+	Decimals      uint8     `json:"decimals"`
+	Amount        string    `json:"amount"`
+	AmountUnits   string    `json:"amount_units"`
 	TxHash        string    `json:"tx_hash,omitempty"`
 	ExplorerURL   string    `json:"explorer_url,omitempty"`
 	AmountWei     string    `json:"amount_wei"`
@@ -121,15 +133,50 @@ type workerErrorResponse struct {
 
 // chainResponse 描述 Sepolia RPC 和扫描器状态。
 type chainResponse struct {
-	Network       string    `json:"network"`
+	Network        string                  `json:"network"`
+	Status         string                  `json:"status"`
+	Endpoint       string                  `json:"endpoint"`
+	ChainID        string                  `json:"chain_id"`
+	NetworkHeight  uint64                  `json:"network_height"`
+	ScanHeight     uint64                  `json:"scan_height"`
+	Lag            uint64                  `json:"lag"`
+	LastError      string                  `json:"last_error,omitempty"`
+	CheckedAt      time.Time               `json:"checked_at"`
+	TokenScanner   *tokenScannerResponse   `json:"token_scanner,omitempty"`
+	GasStation     *gasStationResponse     `json:"gas_station,omitempty"`
+	TokenInventory *tokenInventoryResponse `json:"token_inventory,omitempty"`
+}
+
+// tokenScannerResponse 描述 ERC-20 充值扫描器的独立进度和错误状态。
+type tokenScannerResponse struct {
 	Status        string    `json:"status"`
-	Endpoint      string    `json:"endpoint"`
-	ChainID       string    `json:"chain_id"`
 	NetworkHeight uint64    `json:"network_height"`
 	ScanHeight    uint64    `json:"scan_height"`
 	Lag           uint64    `json:"lag"`
 	LastError     string    `json:"last_error,omitempty"`
 	CheckedAt     time.Time `json:"checked_at"`
+}
+
+// gasStationResponse 描述平台热钱包 ETH Gas 余额和告警阈值。
+type gasStationResponse struct {
+	Status     string    `json:"status"`
+	Address    string    `json:"address"`
+	BalanceWei string    `json:"balance_wei"`
+	BalanceETH string    `json:"balance_eth"`
+	MinimumWei string    `json:"minimum_wei"`
+	MinimumETH string    `json:"minimum_eth"`
+	LastError  string    `json:"last_error,omitempty"`
+	CheckedAt  time.Time `json:"checked_at"`
+}
+
+// tokenInventoryResponse 描述平台热钱包 Token 链上库存快照。
+type tokenInventoryResponse struct {
+	Status       string    `json:"status"`
+	Symbol       string    `json:"symbol"`
+	Address      string    `json:"address"`
+	BalanceUnits string    `json:"balance_units"`
+	LastError    string    `json:"last_error,omitempty"`
+	CheckedAt    time.Time `json:"checked_at"`
 }
 
 // listUsers 返回全部演示用户。
@@ -260,13 +307,15 @@ func (a *App) getWithdrawal(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-// listTransactions 返回全局分页充值和提币记录。
+// listTransactions 返回支持资产和任务类型筛选的全局统一流水。
 func (a *App) listTransactions(w http.ResponseWriter, r *http.Request) {
 	page, pageSize, offset, ok := parsePage(w, r)
 	if !ok {
 		return
 	}
-	items, err := a.apiStore.ListTransactionsPage(r.Context(), pageSize+1, offset)
+	asset := normalizeTransactionFilter(r.URL.Query().Get("asset"))
+	transactionType := normalizeTransactionFilter(r.URL.Query().Get("type"))
+	items, err := a.apiStore.ListTransactionsFilteredPage(r.Context(), asset, transactionType, pageSize+1, offset)
 	if err != nil {
 		a.writeStoreError(r.Context(), w, err)
 		return
@@ -277,15 +326,20 @@ func (a *App) listTransactions(w http.ResponseWriter, r *http.Request) {
 	}
 	response := make([]transactionResponse, 0, len(items))
 	for _, item := range items {
-		amountETH, err := amount.FormatETH(item.AmountWei)
+		decimals := item.Decimals
+		if decimals == 0 {
+			decimals = 18
+		}
+		formattedAmount, err := amount.FormatDecimal(item.AmountWei, decimals)
 		if err != nil {
 			a.writeMappingError(r.Context(), w, err)
 			return
 		}
 		response = append(response, transactionResponse{
-			Type: item.Type, ID: item.ID, UserID: item.UserID, Asset: item.Asset,
+			Type: item.Type, ID: item.ID, UserID: item.UserID, Asset: item.Asset, Decimals: decimals,
+			Amount: formattedAmount, AmountUnits: item.AmountWei.String(),
 			TxHash: item.TxHash, ExplorerURL: a.transactionExplorerURL(item.TxHash),
-			AmountWei: item.AmountWei.String(), AmountETH: amountETH,
+			AmountWei: item.AmountWei.String(), AmountETH: formattedAmount,
 			BlockNumber: item.BlockNumber, Confirmations: item.Confirmations,
 			Status: item.Status, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 		})
@@ -300,11 +354,39 @@ func (a *App) getChainStatus(w http.ResponseWriter, _ *http.Request) {
 	if health.NetworkHeight > health.ScanHeight {
 		lag = health.NetworkHeight - health.ScanHeight
 	}
-	writeJSON(w, http.StatusOK, chainResponse{
+	response := chainResponse{
 		Network: postgres.NetworkSepolia, Status: health.Status, Endpoint: health.Endpoint,
 		ChainID: health.ChainID, NetworkHeight: health.NetworkHeight, ScanHeight: health.ScanHeight,
 		Lag: lag, LastError: health.LastError, CheckedAt: health.CheckedAt,
-	})
+	}
+	if a.tokenScanner != nil {
+		tokenHealth := a.tokenScanner.Snapshot()
+		response.TokenScanner = &tokenScannerResponse{
+			Status: tokenHealth.Status, NetworkHeight: tokenHealth.NetworkHeight,
+			ScanHeight: tokenHealth.ScanHeight, Lag: tokenHealth.LagBlocks,
+			LastError: tokenHealth.LastError, CheckedAt: tokenHealth.CheckedAt,
+		}
+	}
+	if a.gasStation != nil {
+		gasHealth := a.gasStation.Snapshot()
+		balanceETH, _ := amount.FormatETH(gasHealth.BalanceWei)
+		minimumETH, _ := amount.FormatETH(gasHealth.MinBalanceWei)
+		response.GasStation = &gasStationResponse{
+			Status: gasHealth.Status, Address: gasHealth.Address,
+			BalanceWei: gasHealth.BalanceWei.String(), BalanceETH: balanceETH,
+			MinimumWei: gasHealth.MinBalanceWei.String(), MinimumETH: minimumETH,
+			LastError: gasHealth.LastError, CheckedAt: gasHealth.CheckedAt,
+		}
+	}
+	if a.tokenSweeper != nil {
+		inventory := a.tokenSweeper.Snapshot()
+		response.TokenInventory = &tokenInventoryResponse{
+			Status: inventory.Status, Symbol: inventory.Symbol, Address: inventory.Address,
+			BalanceUnits: inventory.BalanceUnits.String(), LastError: inventory.LastError,
+			CheckedAt: inventory.CheckedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // listWorkerErrors 返回最近后台任务错误。

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +67,7 @@ type fakeStore struct {
 	confirmations map[int64]int64
 	credited      map[int64]int64
 	workerErrors  []postgres.WorkerError
+	internalTxs   map[string]bool
 	nextDepositID int64
 }
 
@@ -80,6 +82,11 @@ func (f *fakeStore) Checkpoint(context.Context, string, string) (postgres.ChainC
 		return postgres.ChainCheckpoint{}, postgres.ErrNotFound
 	}
 	return *f.checkpoint, nil
+}
+
+// IsInternalTransferTx 判断测试交易是否属于平台内部转账。
+func (f *fakeStore) IsInternalTransferTx(_ context.Context, txHash string) (bool, error) {
+	return f.internalTxs[txHash], nil
 }
 
 // RecordDepositsAndCheckpoint 保存整区块观察结果并推进内存检查点。
@@ -161,6 +168,31 @@ func TestScannerFindsOnlyTopLevelMonitoredTransfers(t *testing.T) {
 	}
 	if got := store.confirmations[1]; got != 2 {
 		t.Fatalf("confirmations = %d, want 2", got)
+	}
+}
+
+// TestScannerSkipsInternalGasTopup 验证平台补气交易只推进检查点且不创建用户 ETH 充值。
+func TestScannerSkipsInternalGasTopup(t *testing.T) {
+	target := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	internal := testTransaction(1, &target, 100)
+	external := testTransaction(2, &target, 200)
+	block := testBlock(10, internal, external)
+	chain := &fakeChain{latest: 10, blocks: map[uint64]*types.Block{10: block}, headers: map[uint64]*types.Header{}}
+	store := &fakeStore{
+		addresses:   []postgres.WalletAddress{{ID: 7, UserID: 5, Address: target.Hex()}},
+		internalTxs: map[string]bool{strings.ToLower(internal.Hash().Hex()): true},
+	}
+	start := uint64(10)
+	scanner := newTestScanner(t, chain, store, Config{StartBlock: &start, Confirmations: 3, BatchSize: 1, Interval: time.Second})
+
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if len(store.observations) != 1 || store.observations[0].TxHash != strings.ToLower(external.Hash().Hex()) {
+		t.Fatalf("observations = %+v, want only external transfer", store.observations)
+	}
+	if store.checkpoint == nil || store.checkpoint.LastScannedBlock != 10 {
+		t.Fatalf("checkpoint = %+v, want block 10", store.checkpoint)
 	}
 }
 

@@ -95,4 +95,15 @@ export E2E_WITHDRAWAL_TX_HASH='0x...'
 make e2e-test
 ```
 
+执行真实 USDC 流程前，先运行只读环境预检。它只查询 RPC、合约余额和数据库，不签名、不广播交易：
+
+```bash
+cd backend
+set -a
+source ../deploy/.env.local
+set +a
+export E2E_EXTERNAL_ADDRESS='0x外部测试地址'
+make erc20-preflight
+```
+
 完整的测试密钥、RPC、测试币准备方式和 A-E 场景演示步骤见 `docs/testing/sepolia-e2e.md`。仓库中的 `deploy/env.example` 只保留变量名和非敏感默认值；真实值必须放在已被 Git 忽略的 `deploy/.env.local`。

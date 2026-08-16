@@ -13,8 +13,8 @@ import (
 const (
 	userColumns        = `id, code, display_name, created_at`
 	walletColumns      = `id, user_id, network, address, derivation_index, derivation_path, next_nonce::text, created_at`
-	balanceColumns     = `id, user_id, asset, available_wei::text, pending_deposit_wei::text, pending_withdrawal_wei::text, version, updated_at`
-	entryColumns       = `id, user_id, asset, entry_type, amount_wei::text, reference_type, reference_id, created_at`
+	balanceColumns     = `id, user_id, asset_id, asset, available_wei::text, pending_deposit_wei::text, pending_withdrawal_wei::text, version, updated_at`
+	entryColumns       = `id, user_id, asset_id, asset, entry_type, amount_wei::text, reference_type, reference_id, created_at`
 	depositColumns     = `id, user_id, address_id, network, asset, tx_hash, tx_index, block_number, block_hash, amount_wei::text, confirmations, status, created_at, updated_at`
 	withdrawalColumns  = `id, idempotency_key, user_id, address_id, to_address, amount_wei::text, reserved_fee_wei::text, actual_fee_wei::text, nonce::text, gas_limit, max_fee_per_gas_wei::text, max_priority_fee_per_gas_wei::text, raw_tx, tx_hash, block_number, confirmations, status, error_code, error_message, created_at, updated_at`
 	checkpointColumns  = `id, network, scanner, last_scanned_block, last_scanned_hash, updated_at`
@@ -235,24 +235,50 @@ func (s *Store) ListWithdrawalsPage(ctx context.Context, userID int64, limit, of
 	return items, rows.Err()
 }
 
-// ListTransactionsPage 按时间倒序联合查询全局充值和提币记录。
+// ListTransactionsPage 按时间倒序联合查询全部资产和任务流水。
 func (s *Store) ListTransactionsPage(ctx context.Context, limit, offset int) ([]TransactionRecord, error) {
+	return s.ListTransactionsFilteredPage(ctx, "", "", limit, offset)
+}
+
+// ListTransactionsFilteredPage 按资产和任务类型筛选统一流水投影。
+func (s *Store) ListTransactionsFilteredPage(ctx context.Context, asset, transactionType string, limit, offset int) ([]TransactionRecord, error) {
+	asset = strings.ToUpper(strings.TrimSpace(asset))
+	transactionType = strings.ToUpper(strings.TrimSpace(transactionType))
 	rows, err := s.pool.Query(ctx, `
-		SELECT transaction_type, id, user_id, asset, tx_hash, amount_wei, block_number,
+		SELECT transaction_type, id, user_id, asset, decimals, tx_hash, amount_wei, block_number,
 		       confirmations, status, created_at, updated_at
 		FROM (
-			SELECT 'DEPOSIT'::text AS transaction_type, id, user_id, asset, tx_hash,
-			       amount_wei::text AS amount_wei, block_number, confirmations, status,
-			       created_at, updated_at
+			SELECT 'DEPOSIT'::text AS transaction_type, id, user_id, asset, 18::smallint AS decimals,
+			       tx_hash, amount_wei::text AS amount_wei, block_number, confirmations, status, created_at, updated_at
 			FROM deposits
 			UNION ALL
-			SELECT 'WITHDRAWAL'::text AS transaction_type, id, user_id, 'ETH'::text AS asset,
-			       COALESCE(tx_hash, '') AS tx_hash, amount_wei::text AS amount_wei,
-			       block_number, confirmations, status, created_at, updated_at
+			SELECT 'WITHDRAWAL'::text, id, user_id, 'ETH'::text, 18::smallint,
+			       COALESCE(tx_hash, ''), amount_wei::text, block_number, confirmations, status, created_at, updated_at
 			FROM withdrawals
+			UNION ALL
+			SELECT 'TOKEN_DEPOSIT'::text, deposit.id, deposit.user_id, asset.symbol, asset.decimals,
+			       deposit.tx_hash, deposit.amount_units::text, deposit.block_number,
+			       deposit.confirmations, deposit.status, deposit.created_at, deposit.updated_at
+			FROM token_deposits deposit JOIN assets asset ON asset.id = deposit.asset_id
+			UNION ALL
+			SELECT 'TOKEN_WITHDRAWAL'::text, withdrawal.id, withdrawal.user_id, asset.symbol, asset.decimals,
+			       COALESCE(withdrawal.tx_hash, ''), withdrawal.amount_units::text, withdrawal.block_number,
+			       withdrawal.confirmations, withdrawal.status, withdrawal.created_at, withdrawal.updated_at
+			FROM token_withdrawals withdrawal JOIN assets asset ON asset.id = withdrawal.asset_id
+			UNION ALL
+			SELECT 'TOKEN_SWEEP'::text, sweep.id, sweep.user_id, asset.symbol, asset.decimals,
+			       COALESCE(sweep.tx_hash, ''), COALESCE(sweep.sweep_amount_units, sweep.recognized_amount_units)::text,
+			       sweep.block_number, sweep.confirmations, sweep.status, sweep.created_at, sweep.updated_at
+			FROM token_sweeps sweep JOIN assets asset ON asset.id = sweep.asset_id
+			UNION ALL
+			SELECT 'GAS_TOPUP'::text, transfer.id, sweep.user_id, 'ETH'::text, 18::smallint,
+			       COALESCE(transfer.tx_hash, ''), transfer.amount_wei::text, transfer.block_number,
+			       transfer.confirmations, transfer.status, transfer.created_at, transfer.updated_at
+			FROM internal_transfers transfer JOIN token_sweeps sweep ON sweep.id = transfer.sweep_id
 		) transactions
+		WHERE ($1 = '' OR asset = $1) AND ($2 = '' OR transaction_type = $2)
 		ORDER BY created_at DESC, transaction_type, id DESC
-		LIMIT $1 OFFSET $2`, normalizedLimit(limit), normalizedOffset(offset),
+		LIMIT $3 OFFSET $4`, asset, transactionType, normalizedLimit(limit), normalizedOffset(offset),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("分页查询全局交易失败：%w", err)

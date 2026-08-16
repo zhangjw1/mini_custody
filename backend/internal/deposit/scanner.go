@@ -37,6 +37,7 @@ type ChainClient interface {
 type Store interface {
 	ListWalletAddresses(ctx context.Context) ([]postgres.WalletAddress, error)
 	Checkpoint(ctx context.Context, network, scanner string) (postgres.ChainCheckpoint, error)
+	IsInternalTransferTx(ctx context.Context, txHash string) (bool, error)
 	RecordDepositsAndCheckpoint(ctx context.Context, observations []postgres.DepositObservation, checkpoint postgres.ChainCheckpoint) ([]postgres.Deposit, int, error)
 	ListConfirmingDeposits(ctx context.Context, limit int) ([]postgres.Deposit, error)
 	UpdateDepositConfirmations(ctx context.Context, depositID, confirmations int64) (postgres.Deposit, error)
@@ -219,10 +220,19 @@ func (s *Scanner) scanBlock(ctx context.Context, height uint64) error {
 		if !monitored {
 			continue
 		}
+		txHash := strings.ToLower(transaction.Hash().Hex())
+		internal, err := s.store.IsInternalTransferTx(ctx, txHash)
+		if err != nil {
+			return fmt.Errorf("识别 Sepolia 内部转账失败：%w", err)
+		}
+		if internal {
+			s.logger.Info("跳过平台内部 Gas 补充交易", "block_number", height, "tx_hash", txHash)
+			continue
+		}
 		observations = append(observations, postgres.DepositObservation{
 			UserID:      address.UserID,
 			AddressID:   address.ID,
-			TxHash:      strings.ToLower(transaction.Hash().Hex()),
+			TxHash:      txHash,
 			TxIndex:     int32(index),
 			BlockNumber: int64(height),
 			BlockHash:   blockHash,

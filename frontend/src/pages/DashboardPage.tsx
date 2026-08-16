@@ -7,16 +7,22 @@ import { useAppContext } from '../AppContext'
 import { EmptyState, formatDate, formatETH, HashLink, PageHeader, QueryState, SectionHeader, StatusTag } from '../components/Common'
 import type { Transaction, WorkerError } from '../types'
 
+function TransactionType({ type }: { type: Transaction['type'] }) {
+  if (type === 'DEPOSIT' || type === 'TOKEN_DEPOSIT') return <span className="type-cell deposit"><ArrowDownToLine size={15} />充值</span>
+  if (type === 'WITHDRAWAL' || type === 'TOKEN_WITHDRAWAL') return <span className="type-cell withdrawal"><ArrowUpFromLine size={15} />提币</span>
+  return <span className="type-cell operation"><Blocks size={15} />{type === 'TOKEN_SWEEP' ? '归集' : '补 Gas'}</span>
+}
+
 export default function DashboardPage() {
-  const { userId } = useAppContext()
-  const walletQuery = useQuery({ queryKey: ['wallet', userId], queryFn: () => api.wallet(userId), enabled: userId > 0 })
+  const { userId, asset } = useAppContext()
+  const balancesQuery = useQuery({ queryKey: ['balances', userId], queryFn: () => api.balances(userId), enabled: userId > 0 })
   const chainQuery = useQuery({ queryKey: ['chain'], queryFn: api.chain, refetchInterval: 15_000 })
-  const transactionsQuery = useQuery({ queryKey: ['transactions', 1, 5], queryFn: () => api.transactions(1, 5) })
+  const transactionsQuery = useQuery({ queryKey: ['transactions', 1, 5, asset.symbol, ''], queryFn: () => api.transactions(1, 5, asset.symbol) })
   const errorsQuery = useQuery({ queryKey: ['worker-errors', 1, 5], queryFn: () => api.workerErrors(1, 5) })
 
   const columns: ColumnsType<Transaction> = [
-    { title: '类型', dataIndex: 'type', width: 110, render: (type) => type === 'DEPOSIT' ? <span className="type-cell deposit"><ArrowDownToLine size={15} />充值</span> : <span className="type-cell withdrawal"><ArrowUpFromLine size={15} />提币</span> },
-    { title: '金额', dataIndex: 'amount_eth', width: 150, render: (value, row) => <strong>{row.type === 'DEPOSIT' ? '+' : '-'}{formatETH(value)} ETH</strong> },
+    { title: '类型', dataIndex: 'type', width: 110, render: (type) => <TransactionType type={type} /> },
+    { title: '金额', dataIndex: 'amount', width: 150, render: (value, row) => <strong>{['DEPOSIT', 'TOKEN_DEPOSIT'].includes(row.type) ? '+' : '-'}{formatETH(value)} {row.asset}</strong> },
     { title: '交易哈希', dataIndex: 'tx_hash', render: (_, row) => <HashLink hash={row.tx_hash} url={row.explorer_url} /> },
     { title: '状态', dataIndex: 'status', width: 130, render: (status) => <StatusTag status={status} /> },
     { title: '时间', dataIndex: 'created_at', width: 160, render: formatDate },
@@ -34,9 +40,9 @@ export default function DashboardPage() {
     <>
       <PageHeader title="资产总览" />
       <div className="metrics-band">
-        <div className="metric"><span className="metric-icon"><CircleGauge size={18} /></span><span className="metric-label">可用余额</span><strong>{walletQuery.data ? formatETH(walletQuery.data.balance.available_eth) : '--'} <small>ETH</small></strong></div>
-        <div className="metric"><span className="metric-icon"><ArrowDownToLine size={18} /></span><span className="metric-label">待确认充值</span><strong>{walletQuery.data ? formatETH(walletQuery.data.balance.pending_deposit_eth) : '--'} <small>ETH</small></strong></div>
-        <div className="metric"><span className="metric-icon"><ArrowUpFromLine size={18} /></span><span className="metric-label">处理中提币</span><strong>{walletQuery.data ? formatETH(walletQuery.data.balance.pending_withdrawal_eth) : '--'} <small>ETH</small></strong></div>
+        <div className="metric"><span className="metric-icon"><CircleGauge size={18} /></span><span className="metric-label">{asset.symbol} 可用余额</span><strong>{balancesQuery.data ? formatETH(balancesQuery.data.items.find((item) => item.asset === asset.symbol)?.available ?? '0') : '--'} <small>{asset.symbol}</small></strong></div>
+        <div className="metric"><span className="metric-icon"><ArrowDownToLine size={18} /></span><span className="metric-label">待确认充值</span><strong>{balancesQuery.data ? formatETH(balancesQuery.data.items.find((item) => item.asset === asset.symbol)?.pending_deposit ?? '0') : '--'} <small>{asset.symbol}</small></strong></div>
+        <div className="metric"><span className="metric-icon"><ArrowUpFromLine size={18} /></span><span className="metric-label">处理中提币</span><strong>{balancesQuery.data ? formatETH(balancesQuery.data.items.find((item) => item.asset === asset.symbol)?.pending_withdrawal ?? '0') : '--'} <small>{asset.symbol}</small></strong></div>
         <div className="metric"><span className="metric-icon"><Blocks size={18} /></span><span className="metric-label">扫描落后区块</span><strong>{chainQuery.data?.lag ?? '--'} <small>blocks</small></strong></div>
       </div>
 
@@ -50,6 +56,17 @@ export default function DashboardPage() {
             <div><span>网络高度</span><strong>{chainQuery.data.network_height.toLocaleString()}</strong></div>
             <div><span>扫描高度</span><strong>{chainQuery.data.scan_height.toLocaleString()}</strong></div>
             <div><span>检查时间</span><strong>{formatDate(chainQuery.data.checked_at)}</strong></div>
+            {chainQuery.data.token_scanner && <div><span>Token 扫描状态</span><StatusTag status={chainQuery.data.token_scanner.status} /></div>}
+            {chainQuery.data.token_scanner && <div><span>Token 扫描高度</span><strong>{chainQuery.data.token_scanner.scan_height.toLocaleString()}</strong></div>}
+            {chainQuery.data.token_scanner && <div><span>Token 落后区块</span><strong>{chainQuery.data.token_scanner.lag.toLocaleString()}</strong></div>}
+            {chainQuery.data.token_scanner && <div><span>Token 检查时间</span><strong>{formatDate(chainQuery.data.token_scanner.checked_at)}</strong></div>}
+			{chainQuery.data.gas_station && <div><span>Gas Station 状态</span><StatusTag status={chainQuery.data.gas_station.status} /></div>}
+			{chainQuery.data.gas_station && <div><span>热钱包 ETH</span><strong>{formatETH(chainQuery.data.gas_station.balance_eth)} ETH</strong></div>}
+			{chainQuery.data.gas_station && <div><span>余额告警阈值</span><strong>{formatETH(chainQuery.data.gas_station.minimum_eth)} ETH</strong></div>}
+			{chainQuery.data.gas_station && <div><span>Gas 检查时间</span><strong>{formatDate(chainQuery.data.gas_station.checked_at)}</strong></div>}
+			{chainQuery.data.token_inventory && <div><span>热钱包 Token 状态</span><StatusTag status={chainQuery.data.token_inventory.status} /></div>}
+			{chainQuery.data.token_inventory && <div><span>热钱包 {chainQuery.data.token_inventory.symbol}</span><strong>{chainQuery.data.token_inventory.balance_units} <small>units</small></strong></div>}
+			{chainQuery.data.token_inventory && <div><span>库存检查时间</span><strong>{formatDate(chainQuery.data.token_inventory.checked_at)}</strong></div>}
           </div>
         )}
       </section>

@@ -1,10 +1,13 @@
 import { createContext, useContext } from 'react'
-import type { User } from './types'
+import type { Asset, User } from './types'
 
 type AppContextValue = {
   users: User[]
   userId: number
   setUserId: (userId: number) => void
+  assets: Asset[]
+  asset: Asset
+  setAssetSymbol: (symbol: string) => void
 }
 
 export const AppContext = createContext<AppContextValue | null>(null)

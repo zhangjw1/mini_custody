@@ -5,6 +5,32 @@ export type User = {
   created_at: string
 }
 
+export type Asset = {
+  id: number
+  network: string
+  asset_type: 'NATIVE' | 'ERC20'
+  symbol: string
+  contract_address?: string
+  decimals: number
+  enabled: boolean
+  updated_at: string
+}
+
+export type MultiAssetBalance = {
+  asset_id: number
+  asset: string
+  asset_type: 'NATIVE' | 'ERC20'
+  contract_address?: string
+  decimals: number
+  available_units: string
+  available: string
+  pending_deposit_units: string
+  pending_deposit: string
+  pending_withdrawal_units: string
+  pending_withdrawal: string
+  updated_at: string
+}
+
 export type Balance = {
   asset: string
   available_wei: string
@@ -68,10 +94,13 @@ export type Withdrawal = {
 }
 
 export type Transaction = {
-  type: 'DEPOSIT' | 'WITHDRAWAL'
+  type: 'DEPOSIT' | 'WITHDRAWAL' | 'TOKEN_DEPOSIT' | 'TOKEN_WITHDRAWAL' | 'TOKEN_SWEEP' | 'GAS_TOPUP'
   id: number
   user_id: number
   asset: string
+  decimals: number
+  amount: string
+  amount_units: string
   tx_hash?: string
   explorer_url?: string
   amount_wei: string
@@ -81,6 +110,122 @@ export type Transaction = {
   status: string
   created_at: string
   updated_at: string
+}
+
+export type TokenDeposit = {
+  id: number
+  user_id: number
+  asset: string
+  decimals: number
+  tx_hash: string
+  explorer_url: string
+  log_index: number
+  block_number: number
+  block_url: string
+  from_address: string
+  to_address: string
+  amount: string
+  amount_units: string
+  confirmations: number
+  status: string
+  created_at: string
+  updated_at: string
+}
+
+export type TokenWithdrawal = {
+  id: number
+  user_id: number
+  asset: string
+  decimals: number
+  to_address: string
+  amount: string
+  amount_units: string
+  estimated_gas_wei?: string
+  estimated_gas_eth?: string
+  actual_fee_wei?: string
+  actual_fee_eth?: string
+  gas_limit: number
+  max_fee_per_gas_wei?: string
+  max_priority_fee_per_gas_wei?: string
+  status: string
+  created: boolean
+  tx_hash?: string
+  explorer_url?: string
+  confirmations: number
+  nonce?: string
+  block_number?: number
+  error_code?: string
+  error_message?: string
+  created_at: string
+  updated_at: string
+}
+
+export type TokenWithdrawalQuote = {
+  asset: string
+  decimals: number
+  amount: string
+  amount_units: string
+  gas_limit: number
+  max_fee_per_gas_wei: string
+  max_priority_fee_per_gas_wei: string
+  estimated_gas_wei: string
+  estimated_gas_eth: string
+}
+
+export type TokenSweep = {
+  id: number
+  user_id: number
+  asset: string
+  recognized_amount: string
+  recognized_amount_units: string
+  sweep_amount?: string
+  sweep_amount_units?: string
+  gas_topup_transfer_id?: number
+  tx_hash?: string
+  explorer_url?: string
+  confirmations: number
+  actual_fee_wei?: string
+  actual_fee_eth?: string
+  status: string
+  error_code?: string
+  error_message?: string
+  created_at: string
+  updated_at: string
+}
+
+export type InternalTransfer = {
+  id: number
+  sweep_id: number
+  transfer_type: string
+  from_address: string
+  to_address: string
+  amount_wei: string
+  amount_eth: string
+  tx_hash?: string
+  explorer_url?: string
+  confirmations: number
+  actual_fee_wei?: string
+  actual_fee_eth?: string
+  status: string
+  error_code?: string
+  error_message?: string
+  created_at: string
+  updated_at: string
+}
+
+export type PlatformWallet = {
+  network: string
+  role: string
+  address: string
+  next_nonce: string
+  gas_status: string
+  eth_balance_wei: string
+  eth_balance: string
+  token_status: string
+  token_symbol?: string
+  token_balance_units?: string
+  token_balance?: string
+  last_error?: string
 }
 
 export type ChainStatus = {
@@ -93,6 +238,32 @@ export type ChainStatus = {
   lag: number
   last_error?: string
   checked_at: string
+  token_scanner?: {
+    status: string
+    network_height: number
+    scan_height: number
+    lag: number
+    last_error?: string
+    checked_at: string
+  }
+	gas_station?: {
+		status: string
+		address: string
+		balance_wei: string
+		balance_eth: string
+		minimum_wei: string
+		minimum_eth: string
+		last_error?: string
+		checked_at: string
+	}
+	token_inventory?: {
+		status: string
+		symbol: string
+		address: string
+		balance_units: string
+		last_error?: string
+		checked_at: string
+	}
 }
 
 export type WorkerError = {

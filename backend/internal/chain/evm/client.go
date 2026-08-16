@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ const (
 	FailureServiceUnavailable FailureClass = "service_unavailable"
 	FailureNetwork            FailureClass = "network"
 	FailureRPC                FailureClass = "rpc"
+	FailureLogRangeTooLarge   FailureClass = "log_range_too_large"
 	FailureUnknown            FailureClass = "unknown"
 )
 
@@ -83,6 +85,12 @@ type EVMClient interface {
 	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
 	// EstimateGas 估算交易 Gas。
 	EstimateGas(ctx context.Context, call ethereum.CallMsg) (uint64, error)
+	// CodeAt 查询合约在指定区块的字节码。
+	CodeAt(ctx context.Context, contract common.Address, block *big.Int) ([]byte, error)
+	// CallContract 执行只读 EVM 合约调用。
+	CallContract(ctx context.Context, call ethereum.CallMsg, block *big.Int) ([]byte, error)
+	// FilterLogs 按地址、Topic 和区块范围查询 EVM 日志。
+	FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]types.Log, error)
 	// SendTransaction 广播已签名交易。
 	SendTransaction(ctx context.Context, tx *types.Transaction) error
 	// TransactionReceipt 查询交易执行回执。
@@ -303,6 +311,39 @@ func (c *Client) EstimateGas(ctx context.Context, call ethereum.CallMsg) (uint64
 	err := c.invoke(ctx, func(client *ethclient.Client) error {
 		var err error
 		result, err = client.EstimateGas(ctx, call)
+		return err
+	})
+	return result, err
+}
+
+// CodeAt 查询合约在指定区块的字节码。
+func (c *Client) CodeAt(ctx context.Context, contract common.Address, block *big.Int) ([]byte, error) {
+	var result []byte
+	err := c.invoke(ctx, func(client *ethclient.Client) error {
+		var err error
+		result, err = client.CodeAt(ctx, contract, block)
+		return err
+	})
+	return result, err
+}
+
+// CallContract 执行不会改变链状态的 EVM 合约调用。
+func (c *Client) CallContract(ctx context.Context, call ethereum.CallMsg, block *big.Int) ([]byte, error) {
+	var result []byte
+	err := c.invoke(ctx, func(client *ethclient.Client) error {
+		var err error
+		result, err = client.CallContract(ctx, call, block)
+		return err
+	})
+	return result, err
+}
+
+// FilterLogs 按结构化过滤条件查询 EVM Event 日志。
+func (c *Client) FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
+	var result []types.Log
+	err := c.invoke(ctx, func(client *ethclient.Client) error {
+		var err error
+		result, err = client.FilterLogs(ctx, query)
 		return err
 	})
 	return result, err
@@ -551,6 +592,9 @@ func retryable(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	if isLogRangeTooLarge(err) {
+		return false
+	}
 	var httpErr rpc.HTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode == http.StatusBadGateway ||
@@ -571,6 +615,9 @@ func retryable(err error) bool {
 
 // classify 将底层故障归类为不包含敏感信息的类型。
 func classify(err error) FailureClass {
+	if isLogRangeTooLarge(err) {
+		return FailureLogRangeTooLarge
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return FailureTimeout
 	}
@@ -591,6 +638,31 @@ func classify(err error) FailureClass {
 		return FailureRPC
 	}
 	return FailureUnknown
+}
+
+// IsLogRangeTooLarge 判断错误是否要求调用方缩小日志查询区块范围。
+func IsLogRangeTooLarge(err error) bool {
+	return isLogRangeTooLarge(err)
+}
+
+// isLogRangeTooLarge 识别常见公共 RPC 的日志范围或结果数量上限错误。
+func isLogRangeTooLarge(err error) bool {
+	var rpcErr rpc.Error
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	message := strings.ToLower(rpcErr.Error())
+	if rpcErr.ErrorCode() == -32005 {
+		return true
+	}
+	for _, fragment := range []string{
+		"query returned more than", "block range", "range is too wide", "limit exceeded", "response size exceeded",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyHTTPStatus 将 HTTP 状态码映射为 RPC 故障类型。
@@ -622,6 +694,8 @@ func failureText(class FailureClass) string {
 		return "网络错误"
 	case FailureRPC:
 		return "JSON-RPC 错误"
+	case FailureLogRangeTooLarge:
+		return "日志查询范围过大"
 	default:
 		return "未知错误"
 	}

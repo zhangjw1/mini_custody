@@ -68,6 +68,16 @@ type Config struct {
 
 // Load 从环境变量加载并校验应用配置。
 func Load() (Config, error) {
+	return load(true)
+}
+
+// LoadPreflight 从环境变量加载只读预检配置，不要求托管密钥文件和密码。
+func LoadPreflight() (Config, error) {
+	return load(false)
+}
+
+// load 加载环境变量，并按运行场景决定是否校验托管密钥配置。
+func load(requireCustody bool) (Config, error) {
 	timezoneName := envOrDefault("APP_TIMEZONE", defaultTimezone)
 	timezone, err := time.LoadLocation(timezoneName)
 	if err != nil {
@@ -127,7 +137,7 @@ func Load() (Config, error) {
 		},
 	}
 
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.validate(requireCustody); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -135,15 +145,22 @@ func Load() (Config, error) {
 
 // Validate 校验启动所需的配置是否完整。
 func (c Config) Validate() error {
+	return c.validate(true)
+}
+
+// validate 校验公共配置，并按运行场景决定是否要求托管密钥。
+func (c Config) validate(requireCustody bool) error {
 	missing := make([]string, 0, 4)
 	if c.DatabaseURL == "" {
 		missing = append(missing, "DATABASE_URL")
 	}
-	if c.CustodyKeyStoreFile == "" {
-		missing = append(missing, "CUSTODY_KEYSTORE_FILE")
-	}
-	if c.CustodyPassword == "" {
-		missing = append(missing, "CUSTODY_KEYSTORE_PASSWORD")
+	if requireCustody {
+		if c.CustodyKeyStoreFile == "" {
+			missing = append(missing, "CUSTODY_KEYSTORE_FILE")
+		}
+		if c.CustodyPassword == "" {
+			missing = append(missing, "CUSTODY_KEYSTORE_PASSWORD")
+		}
 	}
 	if c.SepoliaRPCURL == "" {
 		missing = append(missing, "SEPOLIA_RPC_URL")

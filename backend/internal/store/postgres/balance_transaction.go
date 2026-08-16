@@ -161,8 +161,8 @@ func (s *Store) recordDepositInTx(ctx context.Context, tx pgx.Tx, observation De
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO balance_entries (
-				user_id, asset, entry_type, amount_wei, reference_type, reference_id
-			) VALUES ($1, $2, 'DEPOSIT_PENDING', $3::numeric, 'DEPOSIT', $4)`,
+				user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
+			) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, 'DEPOSIT_PENDING', $3::numeric, 'DEPOSIT', $4)`,
 			observation.UserID, AssetETH, observation.AmountWei.String(), depositID,
 		); err != nil {
 			return Deposit{}, false, fmt.Errorf("写入待确认充值流水失败：%w", err)
@@ -271,8 +271,8 @@ func (s *Store) CreditDeposit(ctx context.Context, depositID, confirmations int6
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO balance_entries (
-			user_id, asset, entry_type, amount_wei, reference_type, reference_id
-		) VALUES ($1, $2, 'DEPOSIT_CREDIT', $3::numeric, 'DEPOSIT', $4)`,
+			user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
+		) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, 'DEPOSIT_CREDIT', $3::numeric, 'DEPOSIT', $4)`,
 		item.UserID, AssetETH, item.AmountWei.String(), item.ID,
 	); err != nil {
 		return Deposit{}, false, fmt.Errorf("写入充值入账流水失败：%w", err)
@@ -362,8 +362,8 @@ func (s *Store) ReserveWithdrawal(ctx context.Context, request WithdrawalRequest
 	reservedEntry := new(big.Int).Neg(new(big.Int).Set(total))
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO balance_entries (
-			user_id, asset, entry_type, amount_wei, reference_type, reference_id
-		) VALUES ($1, $2, 'WITHDRAW_RESERVE', $3::numeric, 'WITHDRAWAL', $4)`,
+			user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
+		) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, 'WITHDRAW_RESERVE', $3::numeric, 'WITHDRAWAL', $4)`,
 		request.UserID, AssetETH, reservedEntry.String(), withdrawalID,
 	); err != nil {
 		return Withdrawal{}, false, fmt.Errorf("写入提币占用流水失败：%w", err)
@@ -427,8 +427,8 @@ func (s *Store) IncreaseWithdrawalFee(ctx context.Context, withdrawalID int64, n
 	entryAmount := new(big.Int).Neg(new(big.Int).Set(difference))
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO balance_entries (
-			user_id, asset, entry_type, amount_wei, reference_type, reference_id
-		) VALUES ($1, $2, 'FEE_ADJUST', $3::numeric, 'WITHDRAWAL', $4)
+			user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
+		) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, 'FEE_ADJUST', $3::numeric, 'WITHDRAWAL', $4)
 		ON CONFLICT (entry_type, reference_type, reference_id) DO UPDATE SET
 			amount_wei = balance_entries.amount_wei + EXCLUDED.amount_wei`,
 		item.UserID, AssetETH, entryAmount.String(), item.ID,
@@ -664,8 +664,8 @@ func (s *Store) ReleaseWithdrawal(ctx context.Context, withdrawalID int64, error
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO balance_entries (
-			user_id, asset, entry_type, amount_wei, reference_type, reference_id
-		) VALUES ($1, $2, 'WITHDRAW_RELEASE', $3::numeric, 'WITHDRAWAL', $4)`,
+			user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
+		) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, 'WITHDRAW_RELEASE', $3::numeric, 'WITHDRAWAL', $4)`,
 		item.UserID, AssetETH, total.String(), item.ID,
 	); err != nil {
 		return Withdrawal{}, false, fmt.Errorf("写入提币释放流水失败：%w", err)
@@ -749,8 +749,8 @@ func (s *Store) FinalizeWithdrawal(ctx context.Context, settlement WithdrawalSet
 	entryAmount := new(big.Int).Neg(new(big.Int).Set(netSpent))
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO balance_entries (
-			user_id, asset, entry_type, amount_wei, reference_type, reference_id
-		) VALUES ($1, $2, 'WITHDRAW_FINALIZE', $3::numeric, 'WITHDRAWAL', $4)`,
+			user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
+		) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, 'WITHDRAW_FINALIZE', $3::numeric, 'WITHDRAWAL', $4)`,
 		item.UserID, AssetETH, entryAmount.String(), item.ID,
 	); err != nil {
 		return Withdrawal{}, false, fmt.Errorf("写入提币结算流水失败：%w", err)

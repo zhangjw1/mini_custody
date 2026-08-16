@@ -17,6 +17,12 @@ var businessTables = []string{
 	"balance_entries",
 	"chain_checkpoints",
 	"worker_errors",
+	"assets",
+	"platform_wallets",
+	"token_deposits",
+	"token_sweeps",
+	"internal_transfers",
+	"token_withdrawals",
 }
 
 type Verification struct {
@@ -107,9 +113,11 @@ func VerifySchema(ctx context.Context, pool *pgxpool.Pool) (Verification, error)
 	if err := pool.QueryRow(ctx, `SHOW TIME ZONE`).Scan(&result.Timezone); err != nil {
 		return Verification{}, fmt.Errorf("校验数据库时区失败：%w", err)
 	}
-	if result.MigrationVersion < 1 || result.Tables != 8 || result.Columns != 79 ||
-		result.IdentityIDs != 8 || result.PrimaryKeyIDs != 8 || result.TableComments != 8 ||
-		result.ColumnComments != 79 || result.Timezone != "Asia/Shanghai" {
+	expectedTables := len(businessTables)
+	if result.MigrationVersion < 2 || result.Tables != expectedTables || result.Columns == 0 ||
+		result.IdentityIDs != expectedTables || result.PrimaryKeyIDs != expectedTables ||
+		result.TableComments != expectedTables || result.ColumnComments != result.Columns ||
+		result.Timezone != "Asia/Shanghai" {
 		return result, errors.New("数据库结构校验未通过")
 	}
 	return result, nil

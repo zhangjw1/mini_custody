@@ -61,6 +61,18 @@ func TestClientQueriesSupportedMethods(t *testing.T) {
 	if err != nil || receipt.Status != types.ReceiptStatusSuccessful {
 		t.Fatalf("TransactionReceipt() status = %d, error = %v", receiptStatus(receipt), err)
 	}
+	code, err := client.CodeAt(ctx, common.HexToAddress("0x1111111111111111111111111111111111111111"), nil)
+	if err != nil || len(code) != 2 {
+		t.Fatalf("CodeAt() = %x, error = %v", code, err)
+	}
+	callResult, err := client.CallContract(ctx, ethereum.CallMsg{To: new(common.Address)}, nil)
+	if err != nil || len(callResult) != 2 {
+		t.Fatalf("CallContract() = %x, error = %v", callResult, err)
+	}
+	logs, err := client.FilterLogs(ctx, ethereum.FilterQuery{FromBlock: big.NewInt(1), ToBlock: big.NewInt(2)})
+	if err != nil || len(logs) != 0 {
+		t.Fatalf("FilterLogs() count = %d, error = %v", len(logs), err)
+	}
 }
 
 // TestClientSnapshotContainsChainIDAfterInitialization 验证启动校验会立即写入健康快照 Chain ID。
@@ -176,6 +188,80 @@ func TestClientHealthSnapshot(t *testing.T) {
 	}
 }
 
+// TestClientFilterLogsRetriesRateLimit 验证日志查询遇到 HTTP 429 时会重试且不会返回伪造空结果。
+func TestClientFilterLogsRetriesRateLimit(t *testing.T) {
+	mock := newMockRPC(t)
+	mock.failStatus("eth_getLogs", http.StatusTooManyRequests, 1)
+	client := newTestClientWithPolicy(t, mock.URL(), "", RetryPolicy{MaxAttempts: 2})
+	defer client.Close()
+
+	logs, err := client.FilterLogs(context.Background(), ethereum.FilterQuery{FromBlock: big.NewInt(1), ToBlock: big.NewInt(2)})
+	if err != nil || len(logs) != 0 {
+		t.Fatalf("FilterLogs() count = %d, error = %v", len(logs), err)
+	}
+	if got := mock.calls("eth_getLogs"); got != 2 {
+		t.Fatalf("eth_getLogs calls = %d, want 2", got)
+	}
+}
+
+// TestClientFilterLogsRetriesTimeout 验证日志查询超时会按策略重试且保留失败语义。
+func TestClientFilterLogsRetriesTimeout(t *testing.T) {
+	mock := newMockRPC(t)
+	mock.delay("eth_getLogs", 100*time.Millisecond)
+	client, err := New(context.Background(), Config{
+		PrimaryURL: mock.URL(), Timeout: 20 * time.Millisecond, Retry: RetryPolicy{MaxAttempts: 2},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.FilterLogs(context.Background(), ethereum.FilterQuery{FromBlock: big.NewInt(1), ToBlock: big.NewInt(2)})
+	if err == nil {
+		t.Fatal("FilterLogs() error = nil, want timeout")
+	}
+	if got := mock.calls("eth_getLogs"); got != 2 {
+		t.Fatalf("eth_getLogs calls = %d, want 2", got)
+	}
+}
+
+// TestClientFilterLogsSwitchesToFallback 验证主端点日志查询持续失败时会切换备用端点。
+func TestClientFilterLogsSwitchesToFallback(t *testing.T) {
+	primary := newMockRPC(t)
+	fallback := newMockRPC(t)
+	primary.failStatus("eth_getLogs", http.StatusServiceUnavailable, -1)
+	client := newTestClientWithPolicy(t, primary.URL(), fallback.URL(), RetryPolicy{MaxAttempts: 1})
+	defer client.Close()
+
+	_, err := client.FilterLogs(context.Background(), ethereum.FilterQuery{FromBlock: big.NewInt(1), ToBlock: big.NewInt(2)})
+	if err != nil || client.ActiveEndpoint() != "fallback" {
+		t.Fatalf("FilterLogs() endpoint = %s, error = %v", client.ActiveEndpoint(), err)
+	}
+	if got := fallback.calls("eth_getLogs"); got != 1 {
+		t.Fatalf("fallback eth_getLogs calls = %d, want 1", got)
+	}
+}
+
+// TestClientClassifiesLogRangeTooLarge 验证日志范围超限可被扫描器识别且不会原样重试。
+func TestClientClassifiesLogRangeTooLarge(t *testing.T) {
+	mock := newMockRPC(t)
+	mock.failRPC("eth_getLogs", -32005, "query returned more than 10000 results", -1)
+	client := newTestClientWithPolicy(t, mock.URL(), "", RetryPolicy{MaxAttempts: 3})
+	defer client.Close()
+
+	_, err := client.FilterLogs(context.Background(), ethereum.FilterQuery{FromBlock: big.NewInt(1), ToBlock: big.NewInt(20_000)})
+	if err == nil || !IsLogRangeTooLarge(err) {
+		t.Fatalf("FilterLogs() error = %v, want range error", err)
+	}
+	var rpcError *RPCError
+	if !errors.As(err, &rpcError) || rpcError.Class != FailureLogRangeTooLarge {
+		t.Fatalf("RPC error = %+v", rpcError)
+	}
+	if got := mock.calls("eth_getLogs"); got != 1 {
+		t.Fatalf("eth_getLogs calls = %d, want 1", got)
+	}
+}
+
 // testConfig 构造无等待的 RPC 测试配置。
 func testConfig(primary, fallback string) Config {
 	return Config{PrimaryURL: primary, FallbackURL: fallback, Timeout: time.Second, Retry: RetryPolicy{MaxAttempts: 2}}
@@ -228,7 +314,9 @@ type mockRPC struct {
 	mu          sync.Mutex
 	counts      map[string]int
 	statusFails map[string]mockFailure
+	rpcFails    map[string]mockRPCFailure
 	delays      map[string]time.Duration
+	results     map[string]any
 	chainID     string
 	blockNumber string
 }
@@ -238,12 +326,20 @@ type mockFailure struct {
 	left   int
 }
 
+type mockRPCFailure struct {
+	code    int
+	message string
+	left    int
+}
+
 // newMockRPC 创建响应固定的 JSON-RPC 测试服务器。
 func newMockRPC(t *testing.T) *mockRPC {
 	mock := &mockRPC{
 		counts:      make(map[string]int),
 		statusFails: make(map[string]mockFailure),
+		rpcFails:    make(map[string]mockRPCFailure),
 		delays:      make(map[string]time.Duration),
+		results:     make(map[string]any),
 		chainID:     mockChainID,
 		blockNumber: "0x2a",
 	}
@@ -266,6 +362,20 @@ func (m *mockRPC) URL() string { return m.server.URL }
 func (m *mockRPC) failStatus(method string, status, times int) {
 	m.mu.Lock()
 	m.statusFails[method] = mockFailure{status: status, left: times}
+	m.mu.Unlock()
+}
+
+// failRPC 配置指定方法返回固定次数或无限次的 JSON-RPC 错误。
+func (m *mockRPC) failRPC(method string, code int, message string, times int) {
+	m.mu.Lock()
+	m.rpcFails[method] = mockRPCFailure{code: code, message: message, left: times}
+	m.mu.Unlock()
+}
+
+// setResult 配置指定 JSON-RPC 方法的自定义成功结果。
+func (m *mockRPC) setResult(method string, result any) {
+	m.mu.Lock()
+	m.results[method] = result
 	m.mu.Unlock()
 }
 
@@ -299,15 +409,34 @@ func (m *mockRPC) handler(w http.ResponseWriter, request *http.Request) {
 		w.WriteHeader(failure.status)
 		return
 	}
+	rpcFailure, shouldFailRPC := m.rpcFails[payload.Method]
+	shouldFailRPC = shouldFailRPC && (rpcFailure.left == -1 || rpcFailure.left > 0)
+	if shouldFailRPC && rpcFailure.left > 0 {
+		rpcFailure.left--
+		m.rpcFails[payload.Method] = rpcFailure
+	}
+	if shouldFailRPC {
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0", "id": payload.ID,
+			"error": map[string]any{"code": rpcFailure.code, "message": rpcFailure.message},
+		})
+		return
+	}
 	chainID := m.chainID
 	blockNumberValue := m.blockNumber
 	delay := m.delays[payload.Method]
+	customResult, hasCustomResult := m.results[payload.Method]
 	m.mu.Unlock()
 	if delay > 0 {
 		time.Sleep(delay)
 	}
 
 	result := mockResult(payload.Method, chainID, blockNumberValue)
+	if hasCustomResult {
+		result = customResult
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": payload.ID, "result": result})
 }
@@ -327,6 +456,12 @@ func mockResult(method, chainID, blockNumberValue string) any {
 		return "0x3b9aca00"
 	case "eth_estimateGas":
 		return "0x5208"
+	case "eth_getCode":
+		return "0x6000"
+	case "eth_call":
+		return "0x1234"
+	case "eth_getLogs":
+		return []any{}
 	case "eth_getBlockByNumber":
 		block := types.NewBlockWithHeader(&types.Header{
 			Number: big.NewInt(42), GasLimit: 30_000_000, BaseFee: big.NewInt(1),

@@ -83,9 +83,9 @@ func (s *Store) BootstrapDemoUsers(ctx context.Context, provider wallet.KeyProvi
 		}
 
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO asset_balances (user_id, asset)
-			VALUES ($1, $2)
-			ON CONFLICT (user_id, asset) DO NOTHING`, userID, AssetETH,
+			INSERT INTO asset_balances (user_id, asset_id, asset)
+			SELECT $1, id, symbol FROM assets WHERE network = $2 AND symbol = $3
+			ON CONFLICT (user_id, asset) DO NOTHING`, userID, NetworkSepolia, AssetETH,
 		); err != nil {
 			return fmt.Errorf("初始化用户 %s 的资产余额失败：%w", definition.code, err)
 		}

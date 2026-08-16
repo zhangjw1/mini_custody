@@ -1,4 +1,4 @@
-.PHONY: fmt vet test integration-test e2e-test check run migrate-up migrate-down migrate-version migrate-check
+.PHONY: fmt vet test integration-test e2e-test erc20-preflight check run migrate-up migrate-down migrate-version migrate-check
 
 export CGO_ENABLED ?= 0
 
@@ -17,6 +17,9 @@ integration-test:
 
 e2e-test:
 	E2E_SEPOLIA=1 go test -count=1 -v ./e2e
+
+erc20-preflight:
+	go run ./cmd/erc20-preflight
 
 check: vet test
 

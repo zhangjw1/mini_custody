@@ -84,3 +84,59 @@ func TestFormatETHProducesCanonicalDecimal(t *testing.T) {
 		}
 	}
 }
+
+// TestParseDecimalConvertsTokenAmountExactly 验证不同 Token 精度都能无损转换为最小单位。
+func TestParseDecimalConvertsTokenAmountExactly(t *testing.T) {
+	tests := []struct {
+		input    string
+		decimals uint8
+		want     string
+	}{
+		{input: "1", decimals: 6, want: "1000000"},
+		{input: "0.000001", decimals: 6, want: "1"},
+		{input: "12.3456", decimals: 6, want: "12345600"},
+		{input: "1.000000000000000001", decimals: 18, want: "1000000000000000001"},
+	}
+	for _, test := range tests {
+		got, err := ParseDecimal(test.input, test.decimals)
+		if err != nil {
+			t.Fatalf("ParseDecimal(%q, %d) error = %v", test.input, test.decimals, err)
+		}
+		if got.String() != test.want {
+			t.Fatalf("ParseDecimal(%q, %d) = %s, want %s", test.input, test.decimals, got, test.want)
+		}
+	}
+}
+
+// TestParseDecimalRejectsAmbiguousTokenAmounts 验证 Token 金额拒绝符号、科学计数法和超精度输入。
+func TestParseDecimalRejectsAmbiguousTokenAmounts(t *testing.T) {
+	for _, input := range []string{"", "-1", "+1", ".1", "1.", "01", "1e-3", "1.0000001"} {
+		if _, err := ParseDecimal(input, 6); err == nil {
+			t.Fatalf("ParseDecimal(%q, 6) error = nil", input)
+		}
+	}
+	for _, decimals := range []uint8{0, 19} {
+		if _, err := ParseDecimal("1", decimals); err == nil {
+			t.Fatalf("ParseDecimal(1, %d) error = nil", decimals)
+		}
+	}
+}
+
+// TestFormatDecimalProducesCanonicalTokenAmount 验证 Token 最小单位格式化不会产生多余小数尾零。
+func TestFormatDecimalProducesCanonicalTokenAmount(t *testing.T) {
+	tests := map[string]string{
+		"0":        "0",
+		"1":        "0.000001",
+		"12345600": "12.3456",
+	}
+	for input, want := range tests {
+		value, _ := new(big.Int).SetString(input, 10)
+		got, err := FormatDecimal(value, 6)
+		if err != nil {
+			t.Fatalf("FormatDecimal(%s, 6) error = %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("FormatDecimal(%s, 6) = %s, want %s", input, got, want)
+		}
+	}
+}

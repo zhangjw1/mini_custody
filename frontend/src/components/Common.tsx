@@ -16,6 +16,7 @@ const statusTone: Record<string, string> = {
   CREATED: 'default',
   DETECTED: 'default',
   DEGRADED: 'warning',
+	LOW_BALANCE: 'warning',
   BROADCAST_UNKNOWN: 'warning',
   FAILED: 'error',
   DOWN: 'error',

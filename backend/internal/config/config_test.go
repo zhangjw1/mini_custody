@@ -44,6 +44,20 @@ func TestConfigUsesAsiaShanghaiByDefault(t *testing.T) {
 	}
 }
 
+// TestLoadPreflightDoesNotRequireCustodySecrets 验证只读预检无需密钥文件和密码。
+func TestLoadPreflightDoesNotRequireCustodySecrets(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://configured")
+	t.Setenv("SEPOLIA_RPC_URL", "https://primary.example")
+	t.Setenv("CUSTODY_KEYSTORE_FILE", "")
+	t.Setenv("CUSTODY_KEYSTORE_PASSWORD", "")
+	if _, err := LoadPreflight(); err != nil {
+		t.Fatalf("LoadPreflight() error = %v", err)
+	}
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want missing custody config")
+	}
+}
+
 // TestConfigLoadsSepoliaRPCRetrySettings 验证 Sepolia RPC 主备和重试配置解析。
 func TestConfigLoadsSepoliaRPCRetrySettings(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://configured")
