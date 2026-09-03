@@ -96,3 +96,24 @@ func TestERC20MigrationContainsCriticalConstraints(t *testing.T) {
 		}
 	}
 }
+
+// TestBitcoinMigrationContainsCriticalConstraints 验证 BTC UTXO、锁租约和归集唯一约束。
+func TestBitcoinMigrationContainsCriticalConstraints(t *testing.T) {
+	sqlBytes, err := migrationFiles.ReadFile("000003_bitcoin.up.sql")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	sql := string(sqlBytes)
+	for _, fragment := range []string{
+		"UNIQUE (network, txid, vout)",
+		"deposit_id BIGINT UNIQUE REFERENCES btc_deposits(id)",
+		"btc_sweeps_txid_idx",
+		"locked_until",
+		"UNIQUE (user_id, idempotency_key)",
+		"btc_withdrawals_status_created_idx",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Errorf("critical BTC constraint %q is missing", fragment)
+		}
+	}
+}

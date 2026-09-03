@@ -6,6 +6,7 @@ import { api } from '../api'
 import { useAppContext } from '../AppContext'
 import { addETH, formatDate, formatETH, HashLink, PageHeader, QueryState, SectionHeader, StatusTag } from '../components/Common'
 import type { TokenWithdrawal, TokenWithdrawalQuote, Withdrawal, WithdrawalQuote } from '../types'
+import BitcoinWithdrawPanel from './BitcoinWithdrawPanel'
 
 type WithdrawForm = { to_address: string; amount: string }
 type Quote = { kind: 'ETH'; data: WithdrawalQuote } | { kind: 'TOKEN'; data: TokenWithdrawalQuote }
@@ -69,6 +70,8 @@ export default function WithdrawPage() {
       queryClient.invalidateQueries({ queryKey: ['wallet', userId] })
     },
   })
+
+  if (asset.network.startsWith('bitcoin-')) return <BitcoinWithdrawPanel userId={userId} />
 
   const requestQuote = async () => {
     const values = await form.validateFields()

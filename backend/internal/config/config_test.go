@@ -58,6 +58,43 @@ func TestLoadPreflightDoesNotRequireCustodySecrets(t *testing.T) {
 	}
 }
 
+// TestConfigLoadsBitcoinSignetSettings 验证 Bitcoin Signet 配置解析。
+func TestConfigLoadsBitcoinSignetSettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://configured")
+	t.Setenv("CUSTODY_KEYSTORE_FILE", "root.age")
+	t.Setenv("CUSTODY_KEYSTORE_PASSWORD", "password")
+	t.Setenv("SEPOLIA_RPC_URL", "https://primary.example")
+	t.Setenv("BITCOIN_ENABLED", "true")
+	t.Setenv("BITCOIN_RPC_URL", "http://bitcoin.example:38332")
+	t.Setenv("BITCOIN_CONFIRMATIONS", "6")
+	t.Setenv("BITCOIN_SWEEP_FEE_RATE_SAT_VB", "5")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Bitcoin.Enabled || cfg.Bitcoin.Confirmations != 6 || cfg.Bitcoin.SweepFeeRateSatVB != 5 {
+		t.Fatalf("Bitcoin config = %+v", cfg.Bitcoin)
+	}
+}
+
+// TestConfigAcceptsBitcoinTestnet4 验证 Bitcoin 网络可切换到 Testnet4。
+func TestConfigAcceptsBitcoinTestnet4(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://configured")
+	t.Setenv("CUSTODY_KEYSTORE_FILE", "root.age")
+	t.Setenv("CUSTODY_KEYSTORE_PASSWORD", "password")
+	t.Setenv("SEPOLIA_RPC_URL", "https://primary.example")
+	t.Setenv("BITCOIN_ENABLED", "true")
+	t.Setenv("BITCOIN_NETWORK", "testnet4")
+	t.Setenv("BITCOIN_RPC_URL", "http://bitcoin.example:48332")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Bitcoin.Network != "testnet4" {
+		t.Fatalf("network=%q", cfg.Bitcoin.Network)
+	}
+}
+
 // TestConfigLoadsSepoliaRPCRetrySettings 验证 Sepolia RPC 主备和重试配置解析。
 func TestConfigLoadsSepoliaRPCRetrySettings(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://configured")

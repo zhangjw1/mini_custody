@@ -32,11 +32,8 @@ Mini Custody 是一个面向学习和求职展示的多链托管钱包项目。�
 ```bash
 docker compose -f deploy/compose.yaml up -d postgres
 cd backend
-cp ../deploy/env.example .env
-# 填写空白的数据库、测试网 RPC 和测试密钥配置后：
-set -a
-source .env
-set +a
+# 将真实配置写入 ../deploy/config.local.yaml（该文件已被 Git 忽略）
+export CONFIG_FILE=../deploy/config.local.yaml
 make run
 ```
 
@@ -77,7 +74,7 @@ curl -X POST http://localhost:8080/api/v1/users/1/withdrawals \
 配置专用 PostgreSQL 测试库后，可以运行真实事务和并发测试：
 
 ```bash
-TEST_DATABASE_URL='postgres://...' make integration-test
+CONFIG_FILE=../deploy/config.local.yaml make integration-test
 ```
 
 ## Sepolia 端到端验收
@@ -86,9 +83,7 @@ TEST_DATABASE_URL='postgres://...' make integration-test
 
 ```bash
 cd backend
-set -a
-source ../deploy/.env.local
-set +a
+export CONFIG_FILE=../deploy/config.local.yaml
 export E2E_EXPECTED_WALLET_ADDRESS='0x...'
 export E2E_DEPOSIT_TX_HASH='0x...'
 export E2E_WITHDRAWAL_TX_HASH='0x...'
@@ -99,11 +94,9 @@ make e2e-test
 
 ```bash
 cd backend
-set -a
-source ../deploy/.env.local
-set +a
+export CONFIG_FILE=../deploy/config.local.yaml
 export E2E_EXTERNAL_ADDRESS='0x外部测试地址'
 make erc20-preflight
 ```
 
-完整的测试密钥、RPC、测试币准备方式和 A-E 场景演示步骤见 `docs/testing/sepolia-e2e.md`。仓库中的 `deploy/env.example` 只保留变量名和非敏感默认值；真实值必须放在已被 Git 忽略的 `deploy/.env.local`。
+完整的测试密钥、RPC、测试币准备方式和 A-E 场景演示步骤见 `docs/testing/sepolia-e2e.md`。仓库中的 `deploy/env.example` 只保留变量名和非敏感默认值；真实值应放在已被 Git 忽略的 `deploy/config.local.yaml`。

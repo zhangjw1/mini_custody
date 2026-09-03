@@ -12,11 +12,114 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/xiaoqi/mini-custody/backend/internal/btc"
+	"github.com/xiaoqi/mini-custody/backend/internal/config"
 	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 	"github.com/xiaoqi/mini-custody/backend/migrations"
 )
 
 const integrationTestMnemonic = "tag volcano eight thank tide danger coast health above argue embrace heavy"
+
+// TestIntegrationBTCReorgReversesPendingDeposit 验证 BTC 重组原子撤销待确认余额、充值和 UTXO。
+func TestIntegrationBTCReorgReversesPendingDeposit(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	provider, err := wallet.NewMnemonicKeyProvider(integrationTestMnemonic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.EnsureBitcoinWallets(context.Background(), provider); err != nil {
+		t.Fatal(err)
+	}
+	addresses, err := store.ListBTCAddresses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var address btc.Address
+	for _, item := range addresses {
+		address = item
+		break
+	}
+	if address.ID == 0 {
+		t.Fatal("missing BTC address")
+	}
+	observation := btc.DepositObservation{UserID: address.UserID, AddressID: address.ID, TxID: strings.Repeat("a", 64), Vout: 0, BlockHash: strings.Repeat("b", 64), BlockHeight: 10, AmountSats: 1000, ScriptPubKey: address.ScriptPubKey}
+	if _, err = store.RecordBTCDepositsAndCheckpoint(context.Background(), []btc.DepositObservation{observation}, btc.Checkpoint{Network: btc.Network, Scanner: "btc-deposit", LastScannedBlock: 10, LastScannedHash: observation.BlockHash}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RewindBTCCheckpoint(context.Background(), 9, strings.Repeat("c", 64)); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListConfirmingBTCDeposits(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("confirming deposits = %d, want 0", len(items))
+	}
+}
+
+// TestIntegrationBTCLockUTXOsConcurrent 验证并发选币只允许一个事务锁定同一组 UTXO。
+func TestIntegrationBTCLockUTXOsConcurrent(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	provider, err := wallet.NewMnemonicKeyProvider(integrationTestMnemonic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.EnsureBitcoinWallets(context.Background(), provider); err != nil {
+		t.Fatal(err)
+	}
+	addresses, err := store.ListBTCAddresses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var address btc.Address
+	for _, item := range addresses {
+		address = item
+		break
+	}
+	if address.ID == 0 {
+		t.Fatal("missing BTC address")
+	}
+	for i, txid := range []string{strings.Repeat("d", 64), strings.Repeat("e", 64)} {
+		observation := btc.DepositObservation{UserID: address.UserID, AddressID: address.ID, TxID: txid, Vout: uint32(i), BlockHash: strings.Repeat("f", 64), BlockHeight: int64(20 + i), AmountSats: 1000, ScriptPubKey: address.ScriptPubKey}
+		if _, err = store.RecordBTCDepositsAndCheckpoint(context.Background(), []btc.DepositObservation{observation}, btc.Checkpoint{Network: btc.Network, Scanner: "btc-deposit", LastScannedBlock: int64(20 + i), LastScannedHash: observation.BlockHash}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.pool.Exec(context.Background(), `UPDATE btc_utxos SET status='UNSPENT' WHERE address_id=$1`, address.ID); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		count int
+		err   error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, locker := range []string{"worker-a", "worker-b"} {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			items, _, lockErr := store.LockBTCUTXOs(context.Background(), 750, 1, name)
+			results <- result{len(items), lockErr}
+		}(locker)
+	}
+	wg.Wait()
+	close(results)
+	success := 0
+	for item := range results {
+		if item.err == nil {
+			success++
+			if item.count == 0 {
+				t.Fatal("successful lock returned no UTXO")
+			}
+		}
+	}
+	if success != 1 {
+		t.Fatalf("successful concurrent locks=%d, want 1", success)
+	}
+}
 
 // TestIntegrationDepositIsIdempotentAndCreditsOnce 验证充值发现和入账的数据库幂等性。
 func TestIntegrationDepositIsIdempotentAndCreditsOnce(t *testing.T) {
@@ -1120,7 +1223,10 @@ func creditAdditionalToken(t *testing.T, store *Store, userID int64, address Wal
 // integrationStore 创建使用独立临时 Schema 的集成测试数据访问对象。
 func integrationStore(t *testing.T) (*Store, func()) {
 	t.Helper()
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	databaseURL, configErr := config.TestDatabaseURL()
+	if configErr != nil {
+		t.Fatalf("load test config: %v", configErr)
+	}
 	if databaseURL == "" {
 		t.Skip("TEST_DATABASE_URL is not configured")
 	}

@@ -12,6 +12,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/xiaoqi/mini-custody/backend/internal/btc"
+	bitcoinchain "github.com/xiaoqi/mini-custody/backend/internal/chain/bitcoin"
 	"github.com/xiaoqi/mini-custody/backend/internal/chain/evm"
 	"github.com/xiaoqi/mini-custody/backend/internal/config"
 	"github.com/xiaoqi/mini-custody/backend/internal/deposit"
@@ -27,24 +29,29 @@ import (
 )
 
 type App struct {
-	config                config.Config
-	logger                *slog.Logger
-	pool                  *pgxpool.Pool
-	store                 *postgres.Store
-	apiStore              APIStore
-	keys                  wallet.KeyProvider
-	chain                 *evm.Client
-	tokenContract         *erc20.Contract
-	tokenScanner          *tokendeposit.Scanner
-	gasStation            *gasstation.Worker
-	tokenSweeper          *tokensweep.Worker
-	tokenAsset            postgres.Asset
-	tokenWithdrawals      *tokenwithdrawal.Service
-	tokenWithdrawalWorker *tokenwithdrawal.Worker
-	scanner               *deposit.Scanner
-	withdrawals           *withdrawal.Service
-	withdrawalWorker      *withdrawal.Worker
-	server                *http.Server
+	config                  config.Config
+	logger                  *slog.Logger
+	pool                    *pgxpool.Pool
+	store                   *postgres.Store
+	apiStore                APIStore
+	keys                    wallet.KeyProvider
+	chain                   *evm.Client
+	tokenContract           *erc20.Contract
+	tokenScanner            *tokendeposit.Scanner
+	gasStation              *gasstation.Worker
+	tokenSweeper            *tokensweep.Worker
+	tokenAsset              postgres.Asset
+	tokenWithdrawals        *tokenwithdrawal.Service
+	tokenWithdrawalWorker   *tokenwithdrawal.Worker
+	bitcoinClient           *bitcoinchain.Client
+	bitcoinScanner          *btc.Scanner
+	bitcoinSweeper          *btc.SweepWorker
+	bitcoinWithdrawals      *btc.WithdrawalService
+	bitcoinWithdrawalWorker *btc.WithdrawalWorker
+	scanner                 *deposit.Scanner
+	withdrawals             *withdrawal.Service
+	withdrawalWorker        *withdrawal.Worker
+	server                  *http.Server
 }
 
 // componentResult 描述单体应用中一个长期运行组件的退出结果。
@@ -102,6 +109,57 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	}
 	if err := store.BootstrapDemoUsers(ctx, provider); err != nil {
 		return nil, fmt.Errorf("初始化演示用户失败：%w", err)
+	}
+	var bitcoinClient *bitcoinchain.Client
+	var bitcoinScanner *btc.Scanner
+	var bitcoinSweeper *btc.SweepWorker
+	var bitcoinWithdrawals *btc.WithdrawalService
+	var bitcoinWithdrawalWorker *btc.WithdrawalWorker
+	if cfg.Bitcoin.Enabled {
+		profile, profileErr := bitcoinchain.ResolveNetwork(cfg.Bitcoin.Network)
+		if profileErr != nil {
+			return nil, profileErr
+		}
+		if err = postgres.ConfigureBitcoinNetwork(profile.DatabaseNetwork); err != nil {
+			return nil, err
+		}
+		if err = btc.ConfigureNetwork(profile.DatabaseNetwork); err != nil {
+			return nil, err
+		}
+		bitcoinClient, err = bitcoinchain.NewClient(cfg.Bitcoin.RPCURL, cfg.Bitcoin.RPCUser, cfg.Bitcoin.RPCPassword, cfg.Bitcoin.RPCTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("初始化 Bitcoin RPC 失败：%w", err)
+		}
+		if err = bitcoinClient.VerifyNetwork(ctx, profile.RPCChain); err != nil {
+			return nil, fmt.Errorf("校验 Bitcoin 网络失败：%w", err)
+		}
+		if err = store.EnsureBitcoinWallets(ctx, provider); err != nil {
+			return nil, fmt.Errorf("初始化 Bitcoin 钱包失败：%w", err)
+		}
+		addresses, loadErr := store.ListBTCAddresses(ctx)
+		if loadErr != nil {
+			return nil, fmt.Errorf("加载 Bitcoin 地址失败：%w", loadErr)
+		}
+		start := int64(0)
+		if cfg.Bitcoin.ScanStartBlock != nil {
+			start = int64(*cfg.Bitcoin.ScanStartBlock)
+		}
+		bitcoinScanner, err = btc.NewScanner(bitcoinClient, store, addresses, start, int64(cfg.Bitcoin.Confirmations), int64(cfg.Bitcoin.ScanBatchSize), cfg.Bitcoin.ScanInterval, logger)
+		if err != nil {
+			return nil, err
+		}
+		bitcoinSweeper, err = btc.NewSweepWorker(bitcoinClient, store, provider, cfg.Bitcoin.SweepInterval, cfg.Bitcoin.SweepFeeRateSatVB, int64(cfg.Bitcoin.Confirmations), logger)
+		if err != nil {
+			return nil, err
+		}
+		bitcoinWithdrawals, err = btc.NewWithdrawalService(store, cfg.Bitcoin.SweepFeeRateSatVB)
+		if err != nil {
+			return nil, err
+		}
+		bitcoinWithdrawalWorker, err = btc.NewWithdrawalWorker(bitcoinClient, store, provider, cfg.Bitcoin.SweepInterval, int64(cfg.Bitcoin.Confirmations), logger)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var tokenAsset postgres.Asset
 	if cfg.ERC20.Enabled {
@@ -207,15 +265,20 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		tokenAsset:            tokenAsset,
 		tokenWithdrawals:      tokenWithdrawalService,
 		tokenWithdrawalWorker: tokenWithdrawalWorker,
-		scanner:               depositScanner,
-		withdrawals:           withdrawalService,
-		withdrawalWorker:      withdrawalWorker,
+		bitcoinClient:         bitcoinClient, bitcoinScanner: bitcoinScanner, bitcoinSweeper: bitcoinSweeper,
+		bitcoinWithdrawals:      bitcoinWithdrawals,
+		bitcoinWithdrawalWorker: bitcoinWithdrawalWorker,
+		scanner:                 depositScanner,
+		withdrawals:             withdrawalService,
+		withdrawalWorker:        withdrawalWorker,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", application.health)
 	mux.HandleFunc("GET /api/v1/users", application.listUsers)
 	mux.HandleFunc("GET /api/v1/assets", application.listAssets)
 	mux.HandleFunc("GET /api/v1/users/{user_id}/wallet", application.getWallet)
+	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-wallet", application.getBitcoinWallet)
+	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-deposits", application.listBitcoinDeposits)
 	mux.HandleFunc("GET /api/v1/users/{user_id}/balances", application.listUserBalances)
 	mux.HandleFunc("GET /api/v1/users/{user_id}/deposits", application.listDeposits)
 	mux.HandleFunc("GET /api/v1/users/{user_id}/token-deposits", application.listTokenDeposits)
@@ -231,6 +294,12 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	mux.HandleFunc("GET /api/v1/token-withdrawals/{withdrawal_id}", application.getTokenWithdrawal)
 	mux.HandleFunc("GET /api/v1/transactions", application.listTransactions)
 	mux.HandleFunc("GET /api/v1/sweeps", application.listTokenSweeps)
+	mux.HandleFunc("GET /api/v1/btc/sweeps", application.listBitcoinSweeps)
+	if application.bitcoinWithdrawals != nil {
+		mux.HandleFunc("POST /api/v1/users/{user_id}/btc-withdrawals", application.createBitcoinWithdrawal)
+		mux.HandleFunc("GET /api/v1/users/{user_id}/btc-withdrawals", application.listBitcoinWithdrawals)
+		mux.HandleFunc("GET /api/v1/btc-withdrawals/{withdrawal_id}", application.getBitcoinWithdrawal)
+	}
 	mux.HandleFunc("GET /api/v1/internal-transfers", application.listInternalTransfers)
 	mux.HandleFunc("GET /api/v1/system/platform-wallet", application.getPlatformWalletStatus)
 	mux.HandleFunc("GET /api/v1/system/chains/sepolia", application.getChainStatus)
@@ -278,6 +347,18 @@ func (a *App) Run(ctx context.Context) error {
 		components = append(components, component{name: "token-deposit", run: func() error {
 			a.logger.Info("Token 充值扫描器已启动")
 			return a.tokenScanner.Run(runCtx)
+		}})
+	}
+	if a.bitcoinScanner != nil {
+		components = append(components, component{name: "bitcoin-deposit", run: func() error { a.logger.Info("Bitcoin 充值扫描器已启动"); return a.bitcoinScanner.Run(runCtx) }})
+	}
+	if a.bitcoinSweeper != nil {
+		components = append(components, component{name: "bitcoin-sweep", run: func() error { a.logger.Info("Bitcoin 归集 Worker 已启动"); return a.bitcoinSweeper.Run(runCtx) }})
+	}
+	if a.bitcoinWithdrawalWorker != nil {
+		components = append(components, component{name: "bitcoin-withdrawal", run: func() error {
+			a.logger.Info("Bitcoin 提币 Worker 已启动")
+			return a.bitcoinWithdrawalWorker.Run(runCtx)
 		}})
 	}
 	if a.gasStation != nil {

@@ -23,6 +23,11 @@ var businessTables = []string{
 	"token_sweeps",
 	"internal_transfers",
 	"token_withdrawals",
+	"btc_addresses",
+	"btc_deposits",
+	"btc_utxos",
+	"btc_sweeps",
+	"btc_withdrawals",
 }
 
 type Verification struct {
@@ -114,7 +119,7 @@ func VerifySchema(ctx context.Context, pool *pgxpool.Pool) (Verification, error)
 		return Verification{}, fmt.Errorf("校验数据库时区失败：%w", err)
 	}
 	expectedTables := len(businessTables)
-	if result.MigrationVersion < 2 || result.Tables != expectedTables || result.Columns == 0 ||
+	if result.MigrationVersion < 3 || result.Tables != expectedTables || result.Columns == 0 ||
 		result.IdentityIDs != expectedTables || result.PrimaryKeyIDs != expectedTables ||
 		result.TableComments != expectedTables || result.ColumnComments != result.Columns ||
 		result.Timezone != "Asia/Shanghai" {

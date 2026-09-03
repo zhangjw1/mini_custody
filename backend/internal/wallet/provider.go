@@ -26,6 +26,7 @@ type KeyProvider interface {
 
 type MnemonicKeyProvider struct {
 	wallet *hdwallet.Wallet
+	seed   []byte
 }
 
 // NewMnemonicKeyProvider 使用 BIP-39 助记词创建密钥提供器。
@@ -38,7 +39,7 @@ func NewMnemonicKeyProvider(mnemonic string) (*MnemonicKeyProvider, error) {
 	if err != nil {
 		return nil, errors.New("初始化 HD 钱包失败")
 	}
-	return &MnemonicKeyProvider{wallet: hdWallet}, nil
+	return &MnemonicKeyProvider{wallet: hdWallet, seed: bip39.NewSeed(mnemonic, "")}, nil
 }
 
 // UserPath 根据用户索引生成 Ethereum BIP-44 派生路径。

@@ -9,10 +9,22 @@ import (
 const (
 	NetworkSepolia  = "ethereum-sepolia"
 	AssetETH        = "ETH"
+	AssetBTC        = "BTC"
 	AssetTypeNative = "NATIVE"
 	AssetTypeERC20  = "ERC20"
 	PlatformRoleHot = "HOT"
 )
+
+var NetworkBitcoinSignet = "bitcoin-signet"
+
+// ConfigureBitcoinNetwork 为单网络部署设置活动 Bitcoin 数据库网络。
+func ConfigureBitcoinNetwork(network string) error {
+	if network != "bitcoin-signet" && network != "bitcoin-testnet4" {
+		return errors.New("Bitcoin 数据库网络无效")
+	}
+	NetworkBitcoinSignet = network
+	return nil
+}
 
 const (
 	DepositDetected   = "DETECTED"
@@ -22,14 +34,22 @@ const (
 )
 
 const (
-	TokenSweepCreated     = "CREATED"
-	TokenSweepWaitingGas  = "WAITING_GAS"
-	TokenSweepSigning     = "SIGNING"
-	TokenSweepSigned      = "SIGNED"
-	TokenSweepBroadcasted = "BROADCASTED"
-	TokenSweepConfirming  = "CONFIRMING"
-	TokenSweepCompleted   = "COMPLETED"
-	TokenSweepFailed      = "FAILED"
+	TokenSweepCreated        = "CREATED"
+	TokenSweepWaitingGas     = "WAITING_GAS"
+	TokenSweepSigning        = "SIGNING"
+	TokenSweepSigned         = "SIGNED"
+	TokenSweepBroadcasted    = "BROADCASTED"
+	TokenSweepConfirming     = "CONFIRMING"
+	TokenSweepCompleted      = "COMPLETED"
+	TokenSweepFailed         = "FAILED"
+	BTCSweepCreated          = "CREATED"
+	BTCSweepSigning          = "SIGNING"
+	BTCSweepSigned           = "SIGNED"
+	BTCSweepBroadcastUnknown = "BROADCAST_UNKNOWN"
+	BTCSweepBroadcasted      = "BROADCASTED"
+	BTCSweepConfirming       = "CONFIRMING"
+	BTCSweepCompleted        = "COMPLETED"
+	BTCSweepFailed           = "FAILED"
 )
 
 const (
@@ -237,6 +257,35 @@ type TokenSweep struct {
 	ErrorMessage            string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
+}
+
+type BTCAddress struct {
+	ID                                                      int64
+	UserID                                                  *int64
+	Network, Purpose, Address, ScriptPubKey, DerivationPath string
+	DerivationIndex                                         uint32
+	Enabled                                                 bool
+	CreatedAt, UpdatedAt                                    time.Time
+}
+type BTCDeposit struct {
+	ID, UserID, AddressID, BlockHeight, AmountSats, Confirmations int64
+	Network, TxID, BlockHash, Status                              string
+	Vout                                                          int32
+	CreatedAt, UpdatedAt                                          time.Time
+}
+type BTCUTXO struct {
+	ID, DepositID, AddressID, BlockHeight, ValueSats int64
+	Network, TxID, ScriptPubKey, Status, SpendTxID   string
+	Vout                                             int32
+	LockedBy                                         string
+	LockedUntil                                      *time.Time
+	CreatedAt, UpdatedAt                             time.Time
+}
+type BTCSweep struct {
+	ID, DepositID, UTXOID, FromAddressID, ToAddressID, InputValueSats, OutputValueSats, FeeSats, FeeRateSatVB, BlockHeight, Confirmations int64
+	RawTx                                                                                                                                 []byte
+	TxID, Status, ErrorCode, ErrorMessage                                                                                                 string
+	CreatedAt, UpdatedAt                                                                                                                  time.Time
 }
 
 type InternalTransfer struct {

@@ -1,0 +1,14 @@
+DROP TABLE IF EXISTS btc_sweeps;
+DROP TABLE IF EXISTS btc_withdrawals;
+DROP TABLE IF EXISTS btc_utxos;
+DROP TABLE IF EXISTS btc_deposits;
+DROP TABLE IF EXISTS btc_addresses;
+DELETE FROM balance_entries WHERE asset = 'BTC';
+DELETE FROM asset_balances WHERE asset = 'BTC';
+DELETE FROM assets WHERE network = 'bitcoin-signet';
+ALTER TABLE chain_checkpoints DROP CONSTRAINT chain_checkpoints_network_check;
+ALTER TABLE chain_checkpoints ADD CONSTRAINT chain_checkpoints_network_check CHECK (network = 'ethereum-sepolia');
+ALTER TABLE balance_entries DROP CONSTRAINT balance_entries_reference_type_check;
+ALTER TABLE balance_entries ADD CONSTRAINT balance_entries_reference_type_check CHECK (reference_type IN ('DEPOSIT', 'WITHDRAWAL', 'TOKEN_DEPOSIT', 'TOKEN_WITHDRAWAL'));
+ALTER TABLE assets DROP CONSTRAINT assets_network_check;
+ALTER TABLE assets ADD CONSTRAINT assets_network_check CHECK (network = 'ethereum-sepolia');

@@ -14,6 +14,10 @@ import type {
   Transaction,
   User,
   Wallet,
+  BitcoinWallet,
+  BitcoinSweep,
+  BitcoinDeposit,
+  BitcoinWithdrawal,
   Withdrawal,
   WithdrawalQuote,
   WorkerError,
@@ -54,6 +58,12 @@ export const api = {
   assets: () => request<{ items: Asset[] }>('/api/v1/assets'),
   balances: (userId: number) => request<{ items: MultiAssetBalance[] }>(`/api/v1/users/${userId}/balances`),
   wallet: (userId: number) => request<Wallet>(`/api/v1/users/${userId}/wallet`),
+  bitcoinWallet: (userId:number) => request<BitcoinWallet>(`/api/v1/users/${userId}/btc-wallet`),
+  bitcoinDeposits: (userId:number,page=1,pageSize=20) => request<Page<BitcoinDeposit>>(`/api/v1/users/${userId}/btc-deposits?page=${page}&page_size=${pageSize}`),
+  bitcoinSweeps: (page=1,pageSize=20) => request<Page<BitcoinSweep>>(`/api/v1/btc/sweeps?page=${page}&page_size=${pageSize}`),
+  bitcoinWithdrawal: (id:number) => request<BitcoinWithdrawal>(`/api/v1/btc-withdrawals/${id}`),
+  bitcoinWithdrawals: (userId:number,page=1,pageSize=20) => request<Page<BitcoinWithdrawal>>(`/api/v1/users/${userId}/btc-withdrawals?page=${page}&page_size=${pageSize}`),
+  createBitcoinWithdrawal: (userId:number,key:string,input:{to_address:string;amount_sats:number}) => request<BitcoinWithdrawal>(`/api/v1/users/${userId}/btc-withdrawals`,{method:'POST',headers:{'Idempotency-Key':key},body:JSON.stringify(input)}),
   deposits: (userId: number, page = 1, pageSize = 20) =>
     request<Page<Deposit>>(`/api/v1/users/${userId}/deposits?page=${page}&page_size=${pageSize}`),
   withdrawals: (userId: number, page = 1, pageSize = 20) =>

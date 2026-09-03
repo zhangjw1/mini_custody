@@ -5,7 +5,7 @@
 本手册用于 Phase 8 的 Sepolia 原生 ETH 验收。所有密钥、RPC Key 和资产必须专用于测试网，不得复用生产、主网或个人钱包凭据。
 
 - `deploy/env.example` 只保存变量结构，不填写真实凭据。
-- 真实值只写入已被 Git 忽略的 `deploy/.env.local`，文件权限设为 `600`。
+- 真实值只写入已被 Git 忽略的 `deploy/config.local.yaml`，文件权限设为 `600`。
 - `backend/e2e` 是只读证据测试，不创建充值、提币或数据库记录。
 - 测试不自动请求水龙头；测试币由操作者提前准备。
 - 助记词只在离线终端初始化时显示一次，不得放入文档、Issue、聊天或 CI 日志。
@@ -22,17 +22,17 @@
 docker compose -f deploy/compose.yaml up -d postgres
 ```
 
-创建本地配置并限制权限：
+创建或编辑本地 YAML 配置并限制权限：
 
 ```bash
-cp deploy/env.example deploy/.env.local
-chmod 600 deploy/.env.local
+${EDITOR:-vi} deploy/config.local.yaml
+chmod 600 deploy/config.local.yaml
 ```
 
 至少填写以下变量：
 
-```env
-DATABASE_URL=postgres://...
+```yaml
+DATABASE_URL: 'postgres://...'
 CUSTODY_KEYSTORE_FILE=../secrets/custody-root.age
 CUSTODY_KEYSTORE_PASSWORD=...
 SEPOLIA_RPC_URL=https://...
@@ -44,9 +44,7 @@ SEPOLIA_SCAN_START_BLOCK=...
 
 ```bash
 cd backend
-set -a
-source ../deploy/.env.local
-set +a
+export CONFIG_FILE=../deploy/config.local.yaml
 go run ./cmd/walletgen init --out ../secrets/custody-root.age
 go run ./cmd/walletgen verify --file ../secrets/custody-root.age --index 1
 go run ./cmd/walletgen verify --file ../secrets/custody-root.age --index 2
@@ -58,9 +56,7 @@ go run ./cmd/walletgen verify --file ../secrets/custody-root.age --index 2
 
 ```bash
 cd backend
-set -a
-source ../deploy/.env.local
-set +a
+export CONFIG_FILE=../deploy/config.local.yaml
 make run
 ```
 
@@ -80,9 +76,7 @@ npm run dev
 
 ```bash
 cd backend
-set -a
-source ../deploy/.env.local
-set +a
+export CONFIG_FILE=../deploy/config.local.yaml
 export E2E_USER_ID=1
 export E2E_EXPECTED_WALLET_ADDRESS='0x...'
 export E2E_DEPOSIT_TX_HASH='0x...'

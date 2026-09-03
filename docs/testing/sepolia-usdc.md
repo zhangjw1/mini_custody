@@ -60,7 +60,7 @@ E2E_EXTERNAL_ADDRESS=0x外部测试地址
 ```bash
 cd backend
 set -a
-source ../deploy/.env.local
+export CONFIG_FILE=../deploy/config.local.yaml
 set +a
 make erc20-preflight
 ```

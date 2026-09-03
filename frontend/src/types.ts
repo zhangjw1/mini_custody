@@ -50,6 +50,11 @@ export type Wallet = {
   created_at: string
 }
 
+export type BitcoinWallet = { network: string; address: string; address_type: 'P2WPKH' }
+export type BitcoinSweep = { id:number; source_address:string; destination_address:string; input_sats:number; output_sats:number; fee_sats:number; fee_rate_sat_vb:number; txid?:string; status:string }
+export type BitcoinDeposit = { id:number; txid:string; vout:number; block_height:number; amount_sats:number; confirmations:number; status:string }
+export type BitcoinWithdrawal = { id:number; user_id?:number; to_address:string; amount_sats:number; fee_rate_sat_vb:number; status:string; txid?:string; created?:boolean }
+
 export type Deposit = {
   id: number
   user_id: number

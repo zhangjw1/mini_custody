@@ -1,0 +1,25 @@
+# Bitcoin Signet 任务清单
+
+- [x] B001 确认 Signet RPC 节点、Chain 字符串和网络配置
+- [x] B002 增加 Bitcoin Signet 金额、地址和交易哈希类型
+- [x] B003 实现 Bitcoin Core JSON-RPC 客户端和错误分类
+- [x] B004 实现 BIP84 Signet P2WPKH 地址派生
+- [x] B005 新增 BTC 地址、充值、UTXO 和提币表
+- [x] B006 实现区块输出扫描和 `txid:vout` 幂等
+- [x] B007 实现确认数、余额入账和检查点推进
+- [ ] B008 实现区块哈希复核和重组回退（已加入检查点哈希复核和确认窗口回退，受影响充值重扫幂等及余额逆向处理待补）
+- [x] B009 实现 UTXO 锁租约和并发选币
+- [x] B010 实现 P2WPKH 交易构建、找零和 dust 处理
+- [x] B011 实现 Signet 离线签名、PSBT 摘要和交易复核
+- [x] B012 实现 mempool 检查、广播和 `BROADCAST_UNKNOWN` 恢复
+- [x] B013 实现 BTC 提币幂等、余额占用和状态结算
+- [x] B014 编写扫描、选币、找零、手续费和重启单元测试
+- [x] B015 编写 PostgreSQL 并发和重组集成测试
+- [x] B016 接入 Web BTC 资产选择、充值和提币页面
+- [x] B017 增加 Signet 只读预检命令
+- [ ] B018 完成真实 Signet 充值、提币和重启验收
+- [x] B019 新增 BTC 归集表和同 UTXO 唯一任务约束
+- [x] B020 充值入账后幂等创建归集任务，且不改变用户账本
+- [x] B021 实现单 UTXO P2WPKH 归集构建、签名和 dust/费用上限检查
+- [x] B022 实现归集 raw transaction 先落库、广播、确认和重启恢复
+- [x] B023 接入 BTC 归集配置、worker 生命周期和 Operations API

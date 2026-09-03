@@ -344,6 +344,7 @@ func newMockRPC(t *testing.T) *mockRPC {
 		blockNumber: "0x2a",
 	}
 	mock.server = httptest.NewServer(http.HandlerFunc(mock.handler))
+	mock.server.Start()
 	t.Cleanup(mock.server.Close)
 	return mock
 }

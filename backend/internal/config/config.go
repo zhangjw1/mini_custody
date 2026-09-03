@@ -5,13 +5,23 @@ import (
 	"fmt"
 	"math/big"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/spf13/viper"
 )
+
+// settings 使用 Viper 统一读取环境变量，同时保留现有的大写下划线命名约定。
+var settings = newViper()
+
+func newViper() *viper.Viper {
+	v := viper.New()
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+	return v
+}
 
 const (
 	defaultTimezone            = "Asia/Shanghai"
@@ -44,6 +54,18 @@ type PlatformWalletConfig struct {
 	MinETHBalanceWei *big.Int
 }
 
+// BitcoinConfig 描述 Signet RPC、扫描、确认和自动归集参数。
+type BitcoinConfig struct {
+	Enabled                      bool
+	Network                      string
+	RPCURL, RPCUser, RPCPassword string
+	RPCTimeout                   time.Duration
+	ScanStartBlock               *uint64
+	Confirmations, ScanBatchSize uint64
+	ScanInterval, SweepInterval  time.Duration
+	SweepFeeRateSatVB            int64
+}
+
 type Config struct {
 	AppEnv                 string
 	HTTPAddr               string
@@ -64,6 +86,7 @@ type Config struct {
 	SepoliaExplorerBaseURL string
 	ERC20                  ERC20Config
 	PlatformWallet         PlatformWalletConfig
+	Bitcoin                BitcoinConfig
 }
 
 // Load 从环境变量加载并校验应用配置。
@@ -76,8 +99,33 @@ func LoadPreflight() (Config, error) {
 	return load(false)
 }
 
+// TestDatabaseURL 返回集成测试数据库地址，来源同样由 Viper 配置文件或环境变量提供。
+func TestDatabaseURL() (string, error) {
+	if err := loadConfigFile(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(settings.GetString("TEST_DATABASE_URL")), nil
+}
+
+// BitcoinTestSettings 返回 Testnet4 集成测试所需的只读配置。
+func BitcoinTestSettings() (network, rpcURL, rpcUser, rpcPassword, testAddress string, timeout time.Duration, err error) {
+	if err = loadConfigFile(); err != nil {
+		return
+	}
+	network = envOrDefault("BITCOIN_NETWORK", "signet")
+	rpcURL = strings.TrimSpace(settings.GetString("BITCOIN_RPC_URL"))
+	rpcUser = settings.GetString("BITCOIN_RPC_USER")
+	rpcPassword = settings.GetString("BITCOIN_RPC_PASSWORD")
+	testAddress = strings.TrimSpace(settings.GetString("BITCOIN_TEST_ADDRESS"))
+	timeout = durationOrDefault("BITCOIN_RPC_TIMEOUT", 15*time.Second)
+	return
+}
+
 // load 加载环境变量，并按运行场景决定是否校验托管密钥配置。
 func load(requireCustody bool) (Config, error) {
+	if err := loadConfigFile(); err != nil {
+		return Config{}, err
+	}
 	timezoneName := envOrDefault("APP_TIMEZONE", defaultTimezone)
 	timezone, err := time.LoadLocation(timezoneName)
 	if err != nil {
@@ -99,16 +147,24 @@ func load(requireCustody bool) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	bitcoinEnabled, err := boolOrDefault("BITCOIN_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	bitcoinStartBlock, err := optionalUint64("BITCOIN_SCAN_START_BLOCK")
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		AppEnv:                 envOrDefault("APP_ENV", "development"),
 		HTTPAddr:               envOrDefault("HTTP_ADDR", ":8080"),
 		Timezone:               timezone,
-		DatabaseURL:            strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		CustodyKeyStoreFile:    strings.TrimSpace(os.Getenv("CUSTODY_KEYSTORE_FILE")),
-		CustodyPassword:        os.Getenv("CUSTODY_KEYSTORE_PASSWORD"),
-		SepoliaRPCURL:          strings.TrimSpace(os.Getenv("SEPOLIA_RPC_URL")),
-		SepoliaRPCFallbackURL:  strings.TrimSpace(os.Getenv("SEPOLIA_RPC_FALLBACK_URL")),
+		DatabaseURL:            strings.TrimSpace(settings.GetString("DATABASE_URL")),
+		CustodyKeyStoreFile:    strings.TrimSpace(settings.GetString("CUSTODY_KEYSTORE_FILE")),
+		CustodyPassword:        settings.GetString("CUSTODY_KEYSTORE_PASSWORD"),
+		SepoliaRPCURL:          strings.TrimSpace(settings.GetString("SEPOLIA_RPC_URL")),
+		SepoliaRPCFallbackURL:  strings.TrimSpace(settings.GetString("SEPOLIA_RPC_FALLBACK_URL")),
 		SepoliaRPCTimeout:      durationOrDefault("SEPOLIA_RPC_TIMEOUT", 10*time.Second),
 		SepoliaRPCMaxAttempts:  intOrDefault("SEPOLIA_RPC_MAX_ATTEMPTS", 3),
 		SepoliaRPCBaseDelay:    durationOrDefault("SEPOLIA_RPC_BASE_DELAY", 250*time.Millisecond),
@@ -135,12 +191,29 @@ func load(requireCustody bool) (Config, error) {
 			HotWalletPath:    envOrDefault("PLATFORM_HOT_WALLET_PATH", defaultPlatformWalletPath),
 			MinETHBalanceWei: bigIntOrDefault("PLATFORM_MIN_ETH_BALANCE_WEI", defaultPlatformMinETHWei),
 		},
+		Bitcoin: BitcoinConfig{Enabled: bitcoinEnabled, Network: envOrDefault("BITCOIN_NETWORK", "signet"), RPCURL: strings.TrimSpace(settings.GetString("BITCOIN_RPC_URL")), RPCUser: strings.TrimSpace(settings.GetString("BITCOIN_RPC_USER")), RPCPassword: settings.GetString("BITCOIN_RPC_PASSWORD"), RPCTimeout: durationOrDefault("BITCOIN_RPC_TIMEOUT", 10*time.Second), ScanStartBlock: bitcoinStartBlock, Confirmations: uint64OrDefault("BITCOIN_CONFIRMATIONS", 3), ScanBatchSize: uint64OrDefault("BITCOIN_SCAN_BATCH_SIZE", 20), ScanInterval: durationOrDefault("BITCOIN_SCAN_INTERVAL", 30*time.Second), SweepInterval: durationOrDefault("BITCOIN_SWEEP_INTERVAL", 30*time.Second), SweepFeeRateSatVB: int64(uint64OrDefault("BITCOIN_SWEEP_FEE_RATE_SAT_VB", 2))},
 	}
 
 	if err := cfg.validate(requireCustody); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// loadConfigFile 读取可选的 Viper 配置文件，环境变量仍优先于文件值。
+func loadConfigFile() error {
+	path := strings.TrimSpace(settings.GetString("CONFIG_FILE"))
+	if path == "" {
+		return nil
+	}
+	settings.SetConfigFile(path)
+	if err := settings.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			return fmt.Errorf("Viper 配置文件不存在：%s", path)
+		}
+		return fmt.Errorf("读取 Viper 配置文件失败：%w", err)
+	}
+	return nil
 }
 
 // Validate 校验启动所需的配置是否完整。
@@ -176,6 +249,18 @@ func (c Config) validate(requireCustody bool) error {
 	}
 	if c.SepoliaConfirmations == 0 || c.SepoliaScanInterval <= 0 || c.SepoliaScanBatchSize == 0 || c.SepoliaScanBatchSize > 100 {
 		return errors.New("Sepolia 充值扫描配置无效")
+	}
+	if c.Bitcoin.Enabled {
+		if c.Bitcoin.Network != "signet" && c.Bitcoin.Network != "testnet4" {
+			return errors.New("BITCOIN_NETWORK 必须是 signet 或 testnet4")
+		}
+		parsed, parseErr := url.Parse(c.Bitcoin.RPCURL)
+		if parseErr != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return errors.New("Bitcoin RPC 地址无效")
+		}
+		if c.Bitcoin.RPCTimeout <= 0 || c.Bitcoin.Confirmations == 0 || c.Bitcoin.ScanBatchSize == 0 || c.Bitcoin.ScanBatchSize > 100 || c.Bitcoin.ScanInterval <= 0 || c.Bitcoin.SweepInterval <= 0 || c.Bitcoin.SweepFeeRateSatVB <= 0 {
+			return errors.New("Bitcoin Signet 配置无效")
+		}
 	}
 	explorerURL, err := url.Parse(c.SepoliaExplorerBaseURL)
 	if err != nil || explorerURL.Scheme != "https" || explorerURL.Host == "" {
@@ -238,12 +323,15 @@ func (c Config) SafeSummary() map[string]string {
 		"erc20_decimals":        strconv.FormatUint(uint64(c.ERC20.Decimals), 10),
 		"erc20_sweep_enabled":   strconv.FormatBool(c.ERC20.SweepEnabled),
 		"platform_wallet_path":  c.PlatformWallet.HotWalletPath,
+		"bitcoin_enabled":       strconv.FormatBool(c.Bitcoin.Enabled),
+		"bitcoin_rpc":           configured(c.Bitcoin.RPCURL),
+		"bitcoin_confirmations": strconv.FormatUint(c.Bitcoin.Confirmations, 10),
 	}
 }
 
 // envOrDefault 读取环境变量，空值时返回默认值。
 func envOrDefault(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+	if value := strings.TrimSpace(settings.GetString(key)); value != "" {
 		return value
 	}
 	return fallback
@@ -259,7 +347,7 @@ func configured(value string) string {
 
 // durationOrDefault 读取时长配置，格式错误时返回默认值，由 Validate 负责最终校验范围。
 func durationOrDefault(key string, fallback time.Duration) time.Duration {
-	value := strings.TrimSpace(os.Getenv(key))
+	value := strings.TrimSpace(settings.GetString(key))
 	if value == "" {
 		return fallback
 	}
@@ -272,7 +360,7 @@ func durationOrDefault(key string, fallback time.Duration) time.Duration {
 
 // intOrDefault 读取整数配置，格式错误时返回零，由 Validate 负责最终校验范围。
 func intOrDefault(key string, fallback int) int {
-	value := strings.TrimSpace(os.Getenv(key))
+	value := strings.TrimSpace(settings.GetString(key))
 	if value == "" {
 		return fallback
 	}
@@ -285,7 +373,7 @@ func intOrDefault(key string, fallback int) int {
 
 // boolOrDefault 读取布尔配置，格式错误时返回中文错误。
 func boolOrDefault(key string, fallback bool) (bool, error) {
-	value := strings.TrimSpace(os.Getenv(key))
+	value := strings.TrimSpace(settings.GetString(key))
 	if value == "" {
 		return fallback, nil
 	}
@@ -298,7 +386,7 @@ func boolOrDefault(key string, fallback bool) (bool, error) {
 
 // uint64OrDefault 读取无符号整数配置，格式错误时返回零并交由 Validate 拒绝。
 func uint64OrDefault(key string, fallback uint64) uint64 {
-	value := strings.TrimSpace(os.Getenv(key))
+	value := strings.TrimSpace(settings.GetString(key))
 	if value == "" {
 		return fallback
 	}
@@ -311,7 +399,7 @@ func uint64OrDefault(key string, fallback uint64) uint64 {
 
 // uint8OrDefault 读取八位无符号整数，格式错误时返回零并交由 Validate 拒绝。
 func uint8OrDefault(key string, fallback uint8) uint8 {
-	value := strings.TrimSpace(os.Getenv(key))
+	value := strings.TrimSpace(settings.GetString(key))
 	if value == "" {
 		return fallback
 	}
@@ -324,7 +412,7 @@ func uint8OrDefault(key string, fallback uint8) uint8 {
 
 // bigIntOrDefault 读取十进制大整数，格式错误时返回 nil 并交由 Validate 拒绝。
 func bigIntOrDefault(key, fallback string) *big.Int {
-	value := strings.TrimSpace(os.Getenv(key))
+	value := strings.TrimSpace(settings.GetString(key))
 	if value == "" {
 		value = fallback
 	}
@@ -350,7 +438,7 @@ func isTokenSymbol(value string) bool {
 
 // optionalUint64 读取可选无符号整数，空值表示继续使用数据库检查点。
 func optionalUint64(key string) (*uint64, error) {
-	value := strings.TrimSpace(os.Getenv(key))
+	value := strings.TrimSpace(settings.GetString(key))
 	if value == "" {
 		return nil, nil
 	}

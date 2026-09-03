@@ -4,13 +4,23 @@ import type { ColumnsType } from 'antd/es/table'
 import { Activity, Fuel, PackageCheck, Radio, WalletCards } from 'lucide-react'
 import { api } from '../api'
 import { AddressText, EmptyState, formatDate, formatETH, HashLink, PageHeader, QueryState, SectionHeader, StatusTag } from '../components/Common'
-import type { InternalTransfer, TokenSweep, WorkerError } from '../types'
+import type { BitcoinSweep, InternalTransfer, TokenSweep, WorkerError } from '../types'
 
 export default function OperationsPage() {
   const platformQuery = useQuery({ queryKey: ['platform-wallet'], queryFn: api.platformWallet })
   const sweepsQuery = useQuery({ queryKey: ['sweeps', 1, 20], queryFn: () => api.sweeps(1, 20) })
   const transfersQuery = useQuery({ queryKey: ['internal-transfers', 1, 20], queryFn: () => api.internalTransfers(1, 20) })
   const errorsQuery = useQuery({ queryKey: ['worker-errors', 1, 10], queryFn: () => api.workerErrors(1, 10) })
+  const bitcoinSweepsQuery = useQuery({ queryKey:['bitcoin-sweeps',1,20],queryFn:()=>api.bitcoinSweeps(1,20) })
+
+  const bitcoinSweepColumns: ColumnsType<BitcoinSweep> = [
+    {title:'来源',dataIndex:'source_address',render:(value)=><AddressText value={value} />},
+    {title:'目标',dataIndex:'destination_address',render:(value)=><AddressText value={value} />},
+    {title:'输入 sat',dataIndex:'input_sats'}, {title:'输出 sat',dataIndex:'output_sats'},
+    {title:'费用 sat',dataIndex:'fee_sats'}, {title:'费率 sat/vB',dataIndex:'fee_rate_sat_vb'},
+    {title:'交易 ID',dataIndex:'txid',render:(value)=><HashLink hash={value} />},
+    {title:'状态',dataIndex:'status',render:(status)=><StatusTag status={status} />},
+  ]
 
   const sweepColumns: ColumnsType<TokenSweep> = [
     { title: '用户 ID', dataIndex: 'user_id', width: 90 },
@@ -58,6 +68,11 @@ export default function OperationsPage() {
           <div><span>地址</span><AddressText value={platformQuery.data.address} /></div>
           <div><span>最近错误</span><strong className="error-text">{platformQuery.data.last_error || '无'}</strong></div>
         </div>}
+      </section>
+      <section className="panel table-panel operation-panel">
+        <SectionHeader title="BTC 归集任务" />
+        <QueryState loading={bitcoinSweepsQuery.isLoading} error={bitcoinSweepsQuery.error} retry={() => bitcoinSweepsQuery.refetch()} />
+        {bitcoinSweepsQuery.data && (bitcoinSweepsQuery.data.items.length ? <Table rowKey="id" columns={bitcoinSweepColumns} dataSource={bitcoinSweepsQuery.data.items} pagination={false} scroll={{x:1100}} /> : <EmptyState description="暂无 BTC 归集任务" />)}
       </section>
       <section className="panel table-panel operation-panel">
         <SectionHeader title="Token 归集任务" />

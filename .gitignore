@@ -3,6 +3,7 @@
 .env
 .env.*
 !.env.example
+deploy/config.local.yaml
 backend/bin/
 backend/coverage.out
 frontend/dist/

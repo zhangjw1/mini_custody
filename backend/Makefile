@@ -1,6 +1,7 @@
 .PHONY: fmt vet test integration-test e2e-test erc20-preflight check run migrate-up migrate-down migrate-version migrate-check
 
 export CGO_ENABLED ?= 0
+export CONFIG_FILE ?= ../deploy/config.local.yaml
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -not -path './vendor/*')

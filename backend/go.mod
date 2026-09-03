@@ -7,6 +7,7 @@ require (
 	github.com/ethereum/go-ethereum v1.15.11
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/miguelmota/go-ethereum-hdwallet v0.1.3
+	github.com/spf13/viper v1.19.0
 	github.com/tyler-smith/go-bip39 v1.1.0
 )
 
