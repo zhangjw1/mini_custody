@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/xiaoqi/mini-custody/backend/internal/chain/bitcoin"
@@ -26,6 +27,7 @@ type SweepStore interface {
 	MarkBTCSweepBroadcasted(context.Context, int64, string) (Sweep, error)
 	CompleteBTCSweep(context.Context, int64, int64, int64) error
 	MarkBTCSweepBroadcastUnknown(context.Context, int64, string) error
+	MarkBTCSweepManualReview(context.Context, int64, string, string) error
 	FailBTCSweep(context.Context, int64, string, string) error
 }
 
@@ -69,7 +71,7 @@ func (w *SweepWorker) Run(ctx context.Context) error {
 
 // RunOnce 逐条推进当前可处理归集任务。
 func (w *SweepWorker) RunOnce(ctx context.Context) error {
-	items, err := w.store.ListProcessableBTCSweeps(ctx, 100)
+	items, err := w.store.ListProcessableBTCSweeps(ctx, DefaultProcessBatch)
 	if err != nil {
 		return err
 	}
@@ -95,10 +97,25 @@ func (w *SweepWorker) Process(ctx context.Context, item Sweep) error {
 		}
 		item = persisted
 		fallthrough
-	case SweepSigned, "BROADCAST_UNKNOWN":
+	case SweepSigned, SweepBroadcastUnknown:
 		if len(item.RawTx) == 0 {
 			return errors.New("已签名 BTC 归集缺少原始交易")
 		}
+		txid := strings.ToLower(strings.TrimSpace(item.TxID))
+		if txid == "" {
+			computed, err := txHashFromRaw(item.RawTx)
+			if err != nil {
+				return err
+			}
+			txid = computed
+		}
+		if _, err := w.chain.RawTransaction(ctx, txid); err == nil {
+			_, markErr := w.store.MarkBTCSweepBroadcasted(ctx, item.ID, txid)
+			return markErr
+		} else if !isBitcoinTxNotFound(err) {
+			return err
+		}
+
 		rawHex := hex.EncodeToString(item.RawTx)
 		if item.Status == SweepSigned {
 			check, checkErr := w.chain.TestMempoolAccept(ctx, rawHex)
@@ -106,20 +123,29 @@ func (w *SweepWorker) Process(ctx context.Context, item Sweep) error {
 				return checkErr
 			}
 			if !check.Allowed {
-				return w.store.FailBTCSweep(ctx, item.ID, "MEMPOOL_REJECTED", check.RejectReason)
+				if _, txErr := w.chain.RawTransaction(ctx, txid); txErr == nil {
+					_, markErr := w.store.MarkBTCSweepBroadcasted(ctx, item.ID, txid)
+					return markErr
+				} else if !isBitcoinTxNotFound(txErr) {
+					return txErr
+				}
+				return w.store.MarkBTCSweepManualReview(ctx, item.ID, "MEMPOOL_REJECTED", check.RejectReason)
 			}
 		}
-		txid, err := w.chain.SendRawTransaction(ctx, rawHex)
+		sentTxID, err := w.chain.SendRawTransaction(ctx, rawHex)
 		if err != nil {
 			if markErr := w.store.MarkBTCSweepBroadcastUnknown(ctx, item.ID, err.Error()); markErr != nil {
-				return markErr
+				return errors.Join(err, markErr)
 			}
 			return err
 		}
-		_, err = w.store.MarkBTCSweepBroadcasted(ctx, item.ID, txid)
+		if sentTxID == "" {
+			sentTxID = txid
+		}
+		_, err = w.store.MarkBTCSweepBroadcasted(ctx, item.ID, sentTxID)
 		return err
-	case SweepBroadcasted, SweepConfirming, SweepCompleted:
-		if item.Status == SweepCompleted {
+	case SweepBroadcasted, SweepConfirming, SweepCompleted, SweepManualReview:
+		if item.Status == SweepCompleted || item.Status == SweepManualReview {
 			return nil
 		}
 		if item.TxID == "" {

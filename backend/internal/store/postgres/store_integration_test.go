@@ -59,7 +59,7 @@ func TestIntegrationBTCReorgReversesPendingDeposit(t *testing.T) {
 	}
 }
 
-// TestIntegrationBTCLockUTXOsConcurrent 验证并发选币只允许一个事务锁定同一组 UTXO。
+// TestIntegrationBTCLockUTXOsConcurrent 验证并发提币选币只允许一个事务锁定同一组平台 UTXO。
 func TestIntegrationBTCLockUTXOsConcurrent(t *testing.T) {
 	store, cleanup := integrationStore(t)
 	defer cleanup()
@@ -70,40 +70,51 @@ func TestIntegrationBTCLockUTXOsConcurrent(t *testing.T) {
 	if err = store.EnsureBitcoinWallets(context.Background(), provider); err != nil {
 		t.Fatal(err)
 	}
-	addresses, err := store.ListBTCAddresses(context.Background())
+	users, err := store.ListUsers(context.Background())
+	if err != nil || len(users) == 0 {
+		t.Fatalf("ListUsers() error = %v", err)
+	}
+	user := users[0]
+	var assetID, platformAddrID int64
+	var platformScript string
+	if err = store.pool.QueryRow(context.Background(), `SELECT id FROM assets WHERE network=$1 AND symbol='BTC'`, NetworkBitcoinSignet).Scan(&assetID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.pool.QueryRow(context.Background(), `SELECT id, script_pub_key FROM btc_addresses WHERE network=$1 AND purpose='PLATFORM_CHANGE' LIMIT 1`, NetworkBitcoinSignet).Scan(&platformAddrID, &platformScript); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.pool.Exec(context.Background(), `UPDATE asset_balances SET available_wei=50000 WHERE user_id=$1 AND asset_id=$2`, user.ID, assetID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.pool.Exec(context.Background(), `INSERT INTO btc_utxos(deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) VALUES(NULL,$1,$2,$3,0,5000,$4,10,'UNSPENT')`, platformAddrID, NetworkBitcoinSignet, strings.Repeat("d", 64), platformScript); err != nil {
+		t.Fatal(err)
+	}
+	userBTC, err := store.BTCAddressByUser(context.Background(), user.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var address btc.Address
-	for _, item := range addresses {
-		address = item
-		break
-	}
-	if address.ID == 0 {
-		t.Fatal("missing BTC address")
-	}
-	for i, txid := range []string{strings.Repeat("d", 64), strings.Repeat("e", 64)} {
-		observation := btc.DepositObservation{UserID: address.UserID, AddressID: address.ID, TxID: txid, Vout: uint32(i), BlockHash: strings.Repeat("f", 64), BlockHeight: int64(20 + i), AmountSats: 1000, ScriptPubKey: address.ScriptPubKey}
-		if _, err = store.RecordBTCDepositsAndCheckpoint(context.Background(), []btc.DepositObservation{observation}, btc.Checkpoint{Network: btc.Network, Scanner: "btc-deposit", LastScannedBlock: int64(20 + i), LastScannedHash: observation.BlockHash}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err = store.pool.Exec(context.Background(), `UPDATE btc_utxos SET status='UNSPENT' WHERE address_id=$1`, address.ID); err != nil {
+	w1, _, err := store.CreateBTCWithdrawal(context.Background(), user.ID, "btc-lock-1", userBTC.Address, 1000, 1)
+	if err != nil {
 		t.Fatal(err)
 	}
+	w2, _, err := store.CreateBTCWithdrawal(context.Background(), user.ID, "btc-lock-2", userBTC.Address, 1000, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	type result struct {
 		count int
 		err   error
 	}
 	results := make(chan result, 2)
 	var wg sync.WaitGroup
-	for _, locker := range []string{"worker-a", "worker-b"} {
+	for _, wID := range []int64{w1.ID, w2.ID} {
 		wg.Add(1)
-		go func(name string) {
+		go func(id int64) {
 			defer wg.Done()
-			items, _, lockErr := store.LockBTCUTXOs(context.Background(), 750, 1, name)
+			items, _, _, _, lockErr := store.LockWithdrawalInputs(context.Background(), id, 1000, btc.WithdrawalLocker(id))
 			results <- result{len(items), lockErr}
-		}(locker)
+		}(wID)
 	}
 	wg.Wait()
 	close(results)
@@ -118,6 +129,235 @@ func TestIntegrationBTCLockUTXOsConcurrent(t *testing.T) {
 	}
 	if success != 1 {
 		t.Fatalf("successful concurrent locks=%d, want 1", success)
+	}
+}
+
+// TestIntegrationBTCFixesA1ToA5 验证 A1-A5 资金安全修复：raw_tx/txid落库、防重复出款、找零入库与幂等结算、充值UTXO锁定隔离及重入复用。
+func TestIntegrationBTCFixesA1ToA5(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	provider, err := wallet.NewMnemonicKeyProvider(integrationTestMnemonic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.EnsureBitcoinWallets(context.Background(), provider); err != nil {
+		t.Fatal(err)
+	}
+	users, err := store.ListUsers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := users[0]
+	userBTC, err := store.BTCAddressByUser(context.Background(), user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var platformAddrID int64
+	var platformScriptHex, platformPath string
+	if err = store.pool.QueryRow(context.Background(), `SELECT id, script_pub_key, derivation_path FROM btc_addresses WHERE network=$1 AND purpose='PLATFORM_CHANGE' LIMIT 1`, NetworkBitcoinSignet).Scan(&platformAddrID, &platformScriptHex, &platformPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 验证 A4：充值入账直接锁定 UTXO 给归集任务，提币绝不选中充值 UTXO；归集完成后 UTXO 为 SPENT，输出为 UNSPENT。
+	obs := btc.DepositObservation{
+		UserID: user.ID, AddressID: userBTC.ID, TxID: strings.Repeat("1", 64), Vout: 0,
+		BlockHash: strings.Repeat("2", 64), BlockHeight: 30, AmountSats: 20_000, ScriptPubKey: userBTC.ScriptPubKey,
+	}
+	if _, err = store.RecordBTCDepositsAndCheckpoint(context.Background(), []btc.DepositObservation{obs}, btc.Checkpoint{
+		Network: btc.Network, Scanner: "btc-deposit", LastScannedBlock: 30, LastScannedHash: obs.BlockHash,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var depID int64
+	if err = store.pool.QueryRow(context.Background(), `SELECT id FROM btc_deposits WHERE txid=$1`, obs.TxID).Scan(&depID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CreditBTCDeposit(context.Background(), depID, 3); err != nil {
+		t.Fatal(err)
+	}
+	var utxoStatus, lockedBy string
+	if err = store.pool.QueryRow(context.Background(), `SELECT status, locked_by FROM btc_utxos WHERE deposit_id=$1`, depID).Scan(&utxoStatus, &lockedBy); err != nil {
+		t.Fatal(err)
+	}
+	if utxoStatus != btc.UTXOStatusLocked || lockedBy != btc.SweepLockBy {
+		t.Fatalf("deposit utxo status=%s locked_by=%s, want LOCKED/%s", utxoStatus, lockedBy, btc.SweepLockBy)
+	}
+	// 到期租约清理不得释放归集锁。
+	if _, err = store.pool.Exec(context.Background(), `UPDATE btc_utxos SET locked_until=CURRENT_TIMESTAMP-INTERVAL '1 minute' WHERE deposit_id=$1`, depID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ReleaseExpiredBTCUTXOLocks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.pool.QueryRow(context.Background(), `SELECT status FROM btc_utxos WHERE deposit_id=$1`, depID).Scan(&utxoStatus); err != nil {
+		t.Fatal(err)
+	}
+	if utxoStatus != btc.UTXOStatusLocked {
+		t.Fatalf("sweep lock was released unexpectedly: status=%s", utxoStatus)
+	}
+	// 此时没有 PLATFORM_CHANGE UTXO，提币必须失败而不能选中充值 UTXO。
+	wNoFund, _, err := store.CreateBTCWithdrawal(context.Background(), user.ID, "btc-no-platform-utxo", userBTC.Address, 1000, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, lockErr := store.LockWithdrawalInputs(context.Background(), wNoFund.ID, wNoFund.AmountSats, btc.WithdrawalLocker(wNoFund.ID)); lockErr == nil {
+		t.Fatal("expected withdrawal to fail when only USER_DEPOSIT UTXO exists")
+	}
+	if err = store.FailBTCWithdrawal(context.Background(), wNoFund.ID, "NO_UTXO", "缺少平台 UTXO"); err != nil {
+		t.Fatal(err)
+	}
+	var releaseCount int
+	if err = store.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM balance_entries WHERE reference_type='BTC_WITHDRAWAL' AND reference_id=$1 AND entry_type='WITHDRAW_RELEASE'`, wNoFund.ID).Scan(&releaseCount); err != nil || releaseCount != 1 {
+		t.Fatalf("WITHDRAW_RELEASE count=%d err=%v", releaseCount, err)
+	}
+
+	// 完成归集，产生平台 UNSPENT UTXO。
+	sweeps, err := store.ListProcessableBTCSweeps(context.Background(), 10)
+	if err != nil || len(sweeps) != 1 {
+		t.Fatalf("ListProcessableBTCSweeps() count=%d err=%v", len(sweeps), err)
+	}
+	builtSweep, err := btc.BuildSweep(provider, sweeps[0].From.Path, sweeps[0].UTXO, sweeps[0].To, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.SaveBTCSweepSigned(context.Background(), sweeps[0].ID, builtSweep.RawTx, builtSweep.TxID, builtSweep.OutputValueSats, builtSweep.FeeSats, builtSweep.FeeRateSatVB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.MarkBTCSweepBroadcasted(context.Background(), sweeps[0].ID, builtSweep.TxID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompleteBTCSweep(context.Background(), sweeps[0].ID, 3, 35); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.pool.QueryRow(context.Background(), `SELECT status FROM btc_utxos WHERE deposit_id=$1`, depID).Scan(&utxoStatus); err != nil || utxoStatus != btc.UTXOStatusSpent {
+		t.Fatalf("deposit utxo status=%s err=%v, want SPENT", utxoStatus, err)
+	}
+
+	// 2. 验证 A5 + A1 + A2 + A3：LockWithdrawalInputs 推进状态并复用、raw_tx/txid 落库、SIGNED 禁退款、并发 CompleteBTCWithdrawal 幂等和找零入库。
+	w, _, err := store.CreateBTCWithdrawal(context.Background(), user.ID, "btc-main-flow", userBTC.Address, 5_000, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs1, addrs1, targetScript, changeScript, err := store.LockWithdrawalInputs(context.Background(), w.ID, w.AmountSats, btc.WithdrawalLocker(w.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wStatus string
+	if err = store.pool.QueryRow(context.Background(), `SELECT status FROM btc_withdrawals WHERE id=$1`, w.ID).Scan(&wStatus); err != nil || wStatus != btc.WithdrawalInputsLocked {
+		t.Fatalf("status=%s err=%v, want INPUTS_LOCKED", wStatus, err)
+	}
+	// 模拟崩溃重试：再次调用 LockWithdrawalInputs 必须返回完全相同的一批输入，不新锁 UTXO。
+	inputs2, _, _, _, err := store.LockWithdrawalInputs(context.Background(), w.ID, w.AmountSats, btc.WithdrawalLocker(w.ID))
+	if err != nil || len(inputs2) != len(inputs1) || inputs2[0].ID != inputs1[0].ID {
+		t.Fatalf("retry LockWithdrawalInputs mismatch: inputs1=%+v inputs2=%+v err=%v", inputs1, inputs2, err)
+	}
+	raw, fee, changeAmt, err := btc.BuildWithdrawal(provider, inputs1, addrs1, targetScript, changeScript, w.AmountSats, w.FeeRateSatVB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedItem, err := store.SaveBTCWithdrawalSigned(context.Background(), w.ID, raw, fee, changeAmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signedItem.RawTx) == 0 || len(signedItem.TxID) != 64 {
+		t.Fatalf("expected raw_tx and txid saved, got len(raw)=%d txid=%q", len(signedItem.RawTx), signedItem.TxID)
+	}
+	// SIGNED 状态下不允许 FailBTCWithdrawal 退款。
+	if failErr := store.FailBTCWithdrawal(context.Background(), w.ID, "MEMPOOL_REJECTED", "不应退款"); !errors.Is(failErr, ErrInvalidState) {
+		t.Fatalf("FailBTCWithdrawal on SIGNED err = %v, want ErrInvalidState", failErr)
+	}
+	// 推进到 BROADCASTED 后，并发调用两次 CompleteBTCWithdrawal。
+	if err = store.MarkBTCWithdrawalBroadcasted(context.Background(), w.ID, signedItem.TxID); err != nil {
+		t.Fatal(err)
+	}
+	var completeWG sync.WaitGroup
+	completeErrs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		completeWG.Add(1)
+		go func() {
+			defer completeWG.Done()
+			completeErrs <- store.CompleteBTCWithdrawal(context.Background(), w.ID, 3, 40)
+		}()
+	}
+	completeWG.Wait()
+	close(completeErrs)
+	for cErr := range completeErrs {
+		if cErr != nil {
+			t.Fatalf("CompleteBTCWithdrawal() concurrent error = %v", cErr)
+		}
+	}
+	var finalizeCount int
+	if err = store.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM balance_entries WHERE reference_type='BTC_WITHDRAWAL' AND reference_id=$1 AND entry_type='WITHDRAW_FINALIZE'`, w.ID).Scan(&finalizeCount); err != nil || finalizeCount != 1 {
+		t.Fatalf("WITHDRAW_FINALIZE count=%d err=%v", finalizeCount, err)
+	}
+	var pendingStr string
+	if err = store.pool.QueryRow(context.Background(), `SELECT pending_withdrawal_wei::text FROM asset_balances WHERE user_id=$1 AND asset='BTC'`, user.ID).Scan(&pendingStr); err != nil || pendingStr != "0" {
+		t.Fatalf("pending_withdrawal_wei=%s err=%v, want 0", pendingStr, err)
+	}
+	// 验证找零 UTXO 已入库为 PLATFORM_CHANGE UNSPENT，且下一笔提币可以选中它。
+	var changeUTXOValue int64
+	if err = store.pool.QueryRow(context.Background(), `SELECT value_sats FROM btc_utxos WHERE txid=$1 AND vout=$2 AND status='UNSPENT'`, signedItem.TxID, btc.ChangeOutputVout).Scan(&changeUTXOValue); err != nil || changeUTXOValue != changeAmt {
+		t.Fatalf("change utxo value=%d want %d err=%v", changeUTXOValue, changeAmt, err)
+	}
+	wNext, _, err := store.CreateBTCWithdrawal(context.Background(), user.ID, "btc-use-change", userBTC.Address, 1_000, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextInputs, _, _, _, err := store.LockWithdrawalInputs(context.Background(), wNext.ID, wNext.AmountSats, btc.WithdrawalLocker(wNext.ID))
+	if err != nil || len(nextInputs) != 1 || nextInputs[0].TxID != signedItem.TxID {
+		t.Fatalf("next withdrawal failed to select change UTXO: inputs=%+v err=%v", nextInputs, err)
+	}
+}
+
+// TestIntegrationBTCManualReviewKeepsBalanceAndUTXO 验证 SIGNED 转入人工审核时保留余额占用与 UTXO 锁并写入 worker_errors。
+func TestIntegrationBTCManualReviewKeepsBalanceAndUTXO(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	provider, err := wallet.NewMnemonicKeyProvider(integrationTestMnemonic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.EnsureBitcoinWallets(context.Background(), provider); err != nil {
+		t.Fatal(err)
+	}
+	users, _ := store.ListUsers(context.Background())
+	user := users[0]
+	userBTC, _ := store.BTCAddressByUser(context.Background(), user.ID)
+	var assetID, platformAddrID int64
+	var platformScript string
+	_ = store.pool.QueryRow(context.Background(), `SELECT id FROM assets WHERE network=$1 AND symbol='BTC'`, NetworkBitcoinSignet).Scan(&assetID)
+	_ = store.pool.QueryRow(context.Background(), `SELECT id, script_pub_key FROM btc_addresses WHERE network=$1 AND purpose='PLATFORM_CHANGE' LIMIT 1`, NetworkBitcoinSignet).Scan(&platformAddrID, &platformScript)
+	_, _ = store.pool.Exec(context.Background(), `UPDATE asset_balances SET available_wei=50000 WHERE user_id=$1 AND asset_id=$2`, user.ID, assetID)
+	_, _ = store.pool.Exec(context.Background(), `INSERT INTO btc_utxos(deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) VALUES(NULL,$1,$2,$3,0,20000,$4,10,'UNSPENT')`, platformAddrID, NetworkBitcoinSignet, strings.Repeat("9", 64), platformScript)
+
+	w, _, err := store.CreateBTCWithdrawal(context.Background(), user.ID, "btc-manual-review", userBTC.Address, 2_000, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs, addrs, targetScript, changeScript, err := store.LockWithdrawalInputs(context.Background(), w.ID, w.AmountSats, btc.WithdrawalLocker(w.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, fee, changeAmt, err := btc.BuildWithdrawal(provider, inputs, addrs, targetScript, changeScript, w.AmountSats, w.FeeRateSatVB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.SaveBTCWithdrawalSigned(context.Background(), w.ID, raw, fee, changeAmt); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.MarkBTCWithdrawalManualReview(context.Background(), w.ID, "MEMPOOL_REJECTED", "missing-inputs"); err != nil {
+		t.Fatal(err)
+	}
+	var status, available, pending string
+	_ = store.pool.QueryRow(context.Background(), `SELECT status FROM btc_withdrawals WHERE id=$1`, w.ID).Scan(&status)
+	_ = store.pool.QueryRow(context.Background(), `SELECT available_wei::text, pending_withdrawal_wei::text FROM asset_balances WHERE user_id=$1 AND asset_id=$2`, user.ID, assetID).Scan(&available, &pending)
+	if status != btc.WithdrawalManualReview || available != "48000" || pending != "2000" {
+		t.Fatalf("status=%s available=%s pending=%s", status, available, pending)
+	}
+	var errCount int
+	_ = store.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM worker_errors WHERE reference_type='BTC_WITHDRAWAL' AND reference_id=$1`, w.ID).Scan(&errCount)
+	if errCount != 1 {
+		t.Fatalf("worker_errors count=%d, want 1", errCount)
 	}
 }
 
@@ -633,8 +873,17 @@ func TestIntegrationERC20MigrationRollsBackAndReapplies(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	runner := migrations.NewRunner(store.pool)
-	if err := runner.Down(ctx); err != nil {
-		t.Fatalf("migrations.Down() error = %v", err)
+	for {
+		currentVersion, err := runner.Version(ctx)
+		if err != nil {
+			t.Fatalf("runner.Version() error = %v", err)
+		}
+		if currentVersion <= 1 {
+			break
+		}
+		if err := runner.Down(ctx); err != nil {
+			t.Fatalf("migrations.Down() from %d error = %v", currentVersion, err)
+		}
 	}
 	version, err := runner.Version(ctx)
 	if err != nil || version != 1 {

@@ -72,7 +72,7 @@ func (s *Store) MarkBTCSweepBroadcastUnknown(ctx context.Context, id int64, mess
 	return nil
 }
 
-// FailBTCSweep 标记广播前确定性失败并释放未花费 UTXO。
+// FailBTCSweep 仅允许在广播前（CREATED）失败归集并释放未花费 UTXO。
 func (s *Store) FailBTCSweep(ctx context.Context, id int64, code, message string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -80,10 +80,51 @@ func (s *Store) FailBTCSweep(ctx context.Context, id int64, code, message string
 	}
 	defer tx.Rollback(context.Background())
 	var utxoID int64
-	if err = tx.QueryRow(ctx, `UPDATE btc_sweeps SET status='FAILED',error_code=$2,error_message=$3,updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND status IN ('CREATED','SIGNED') RETURNING utxo_id`, id, strings.TrimSpace(code), strings.TrimSpace(message)).Scan(&utxoID); err != nil {
-		return mapNotFound(err)
+	if err = tx.QueryRow(ctx, `
+		UPDATE btc_sweeps
+		SET status='FAILED', error_code=$2, error_message=$3, updated_at=CURRENT_TIMESTAMP
+		WHERE id=$1 AND status='CREATED'
+		RETURNING utxo_id`, id, strings.TrimSpace(code), strings.TrimSpace(message)).Scan(&utxoID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			var exists bool
+			if checkErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM btc_sweeps WHERE id=$1)`, id).Scan(&exists); checkErr == nil && exists {
+				return ErrInvalidState
+			}
+			return ErrNotFound
+		}
+		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='UNSPENT',updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND status='LOCKED'`, utxoID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='UNSPENT', locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND status='LOCKED'`, utxoID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// MarkBTCSweepManualReview 将已签名但被内存池拒绝且链上未查到的归集转入人工审核，保留 UTXO 锁。
+func (s *Store) MarkBTCSweepManualReview(ctx context.Context, id int64, code, message string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	command, err := tx.Exec(ctx, `
+		UPDATE btc_sweeps
+		SET status='MANUAL_REVIEW', error_code=$2, error_message=$3, updated_at=CURRENT_TIMESTAMP
+		WHERE id=$1 AND status IN ('SIGNED', 'BROADCAST_UNKNOWN')`, id, strings.TrimSpace(code), strings.TrimSpace(message))
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrInvalidState
+	}
+	if err := insertWorkerErrorInTx(ctx, tx, WorkerError{
+		Worker:        "btc-sweep-worker",
+		Stage:         "broadcast",
+		ReferenceType: "BTC_SWEEP",
+		ReferenceID:   &id,
+		ErrorCode:     strings.TrimSpace(code),
+		ErrorMessage:  strings.TrimSpace(message),
+	}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -100,13 +141,20 @@ func (s *Store) CompleteBTCSweep(ctx context.Context, id, confirmations, blockHe
 	}
 	defer tx.Rollback(context.Background())
 	var utxoID int64
-	if err = tx.QueryRow(ctx, `SELECT utxo_id FROM btc_sweeps WHERE id=$1 FOR UPDATE`, id).Scan(&utxoID); err != nil {
+	var status string
+	if err = tx.QueryRow(ctx, `SELECT utxo_id, status FROM btc_sweeps WHERE id=$1 FOR UPDATE`, id).Scan(&utxoID, &status); err != nil {
 		return mapNotFound(err)
 	}
-	if _, err = tx.Exec(ctx, `UPDATE btc_sweeps SET status='COMPLETED',confirmations=GREATEST(confirmations,$2),block_height=$3,updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND status IN ('BROADCASTED','CONFIRMING')`, id, confirmations, blockHeight); err != nil {
+	if status == BTCSweepCompleted {
+		return tx.Commit(ctx)
+	}
+	if status != BTCSweepBroadcasted && status != BTCSweepConfirming {
+		return ErrInvalidState
+	}
+	if _, err = tx.Exec(ctx, `UPDATE btc_sweeps SET status='COMPLETED', confirmations=GREATEST(confirmations,$2), block_height=$3, updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND status IN ('BROADCASTED','CONFIRMING')`, id, confirmations, blockHeight); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='SPENT',spend_txid=(SELECT txid FROM btc_sweeps WHERE id=$1),updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND status='LOCKED'`, id, utxoID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='SPENT', spend_txid=(SELECT txid FROM btc_sweeps WHERE id=$1), locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND status='LOCKED'`, id, utxoID); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO btc_utxos(deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) SELECT NULL,s.to_address_id,$2,s.txid,0,s.output_value_sats,a.script_pub_key,$3,'UNSPENT' FROM btc_sweeps s JOIN btc_addresses a ON a.id=s.to_address_id WHERE s.id=$1 ON CONFLICT(network,txid,vout) DO NOTHING`, id, NetworkBitcoinSignet, blockHeight); err != nil {
@@ -417,7 +465,7 @@ func (s *Store) RecordBTCDepositsAndCheckpoint(ctx context.Context, observations
 	return created, nil
 }
 
-// CreditBTCDeposit 确认 BTC 充值并幂等增加 BTC 可用余额。
+// CreditBTCDeposit 确认 BTC 充值，幂等增加可用余额并将充值 UTXO 独占锁定给归集任务。
 func (s *Store) CreditBTCDeposit(ctx context.Context, depositID, confirmations int64) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -445,17 +493,7 @@ func (s *Store) CreditBTCDeposit(ctx context.Context, depositID, confirmations i
 	if _, err = tx.Exec(ctx, `INSERT INTO balance_entries(user_id,asset_id,asset,entry_type,amount_wei,reference_type,reference_id) VALUES($1,$2,'BTC','DEPOSIT_CREDIT',$3,'BTC_DEPOSIT',$4) ON CONFLICT DO NOTHING`, userID, assetID, amount, depositID); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='UNSPENT',updated_at=CURRENT_TIMESTAMP WHERE deposit_id=$1 AND status='UNCONFIRMED'`, depositID); err != nil {
-		return err
-	}
-	var utxoID, addressID, value, targetID int64
-	if err = tx.QueryRow(ctx, `SELECT id,address_id,value_sats FROM btc_utxos WHERE deposit_id=$1 FOR UPDATE`, depositID).Scan(&utxoID, &addressID, &value); err != nil {
-		return err
-	}
-	if err = tx.QueryRow(ctx, `SELECT id FROM btc_addresses WHERE network=$1 AND purpose='PLATFORM_CHANGE'`, NetworkBitcoinSignet).Scan(&targetID); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO btc_sweeps(deposit_id,utxo_id,from_address_id,to_address_id,input_value_sats,status) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(deposit_id) DO NOTHING`, depositID, utxoID, addressID, targetID, value, BTCSweepCreated); err != nil {
+	if err = lockDepositUTXOAndCreateSweepInTx(ctx, tx, depositID); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE btc_deposits SET status='CREDITED',confirmations=GREATEST(confirmations,$2),updated_at=CURRENT_TIMESTAMP WHERE id=$1`, depositID, confirmations); err != nil {
@@ -471,77 +509,47 @@ func (s *Store) CreateBTCSweepForDeposit(ctx context.Context, depositID int64) e
 		return err
 	}
 	defer tx.Rollback(context.Background())
-	var utxoID, addressID, value int64
-	var status string
-	if err = tx.QueryRow(ctx, `SELECT id,address_id,value_sats,status FROM btc_utxos WHERE deposit_id=$1 FOR UPDATE`, depositID).Scan(&utxoID, &addressID, &value, &status); err != nil {
-		return mapNotFound(err)
-	}
-	if status == "LOCKED" || status == "SPENT" {
-		return tx.Commit(ctx)
-	}
-	if status != "UNCONFIRMED" && status != "UNSPENT" {
-		return ErrInvalidState
-	}
-	var targetID int64
-	if err = tx.QueryRow(ctx, `SELECT id FROM btc_addresses WHERE network=$1 AND purpose='PLATFORM_CHANGE'`, NetworkBitcoinSignet).Scan(&targetID); err != nil {
-		return mapNotFound(err)
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO btc_sweeps(deposit_id,utxo_id,from_address_id,to_address_id,input_value_sats,status) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(deposit_id) DO NOTHING`, depositID, utxoID, addressID, targetID, value, BTCSweepCreated); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='LOCKED',locked_by='btc-sweep',locked_until=CURRENT_TIMESTAMP+INTERVAL '10 minutes',updated_at=CURRENT_TIMESTAMP WHERE id=$1`, utxoID); err != nil {
+	if err = lockDepositUTXOAndCreateSweepInTx(ctx, tx, depositID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-// ReleaseExpiredBTCUTXOLocks 释放未广播且已过期的 UTXO 租约。
-func (s *Store) ReleaseExpiredBTCUTXOLocks(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `UPDATE btc_utxos SET status='UNSPENT',locked_by=NULL,locked_until=NULL,updated_at=CURRENT_TIMESTAMP WHERE status='LOCKED' AND locked_until<CURRENT_TIMESTAMP AND id IN (SELECT utxo_id FROM btc_sweeps WHERE status IN ('CREATED','FAILED'))`)
-	return err
+// lockDepositUTXOAndCreateSweepInTx 在既有事务中独占锁定充值 UTXO 给归集任务并幂等插入 btc_sweeps。
+func lockDepositUTXOAndCreateSweepInTx(ctx context.Context, tx pgx.Tx, depositID int64) error {
+	var utxoID, addressID, value int64
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT id,address_id,value_sats,status FROM btc_utxos WHERE deposit_id=$1 FOR UPDATE`, depositID).Scan(&utxoID, &addressID, &value, &status); err != nil {
+		return mapNotFound(err)
+	}
+	if status == btc.UTXOStatusLocked || status == btc.UTXOStatusSpent {
+		return nil
+	}
+	if status != btc.UTXOStatusUnconfirmed && status != btc.UTXOStatusUnspent {
+		return ErrInvalidState
+	}
+	var targetID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM btc_addresses WHERE network=$1 AND purpose=$2 AND enabled ORDER BY derivation_index LIMIT 1`, NetworkBitcoinSignet, btc.AddressPurposePlatformChange).Scan(&targetID); err != nil {
+		return mapNotFound(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO btc_sweeps(deposit_id,utxo_id,from_address_id,to_address_id,input_value_sats,status) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(deposit_id) DO NOTHING`, depositID, utxoID, addressID, targetID, value, BTCSweepCreated); err != nil {
+		return err
+	}
+	// 归集锁不参与租约超时释放，设置远期时间满足表级 NOT NULL 约束。
+	if _, err := tx.Exec(ctx, `UPDATE btc_utxos SET status='LOCKED',locked_by=$2,locked_until=CURRENT_TIMESTAMP+INTERVAL '36500 days',updated_at=CURRENT_TIMESTAMP WHERE id=$1`, utxoID, btc.SweepLockBy); err != nil {
+		return err
+	}
+	return nil
 }
 
-// LockBTCUTXOs 按租约原子锁定可用 UTXO，使用 SKIP LOCKED 避免并发 worker 互相等待。
-func (s *Store) LockBTCUTXOs(ctx context.Context, targetSats, feeRateSatVB int64, locker string) ([]btc.UTXO, int64, error) {
-	if targetSats <= 0 || feeRateSatVB <= 0 || strings.TrimSpace(locker) == "" {
-		return nil, 0, errors.New("BTC UTXO 锁定参数无效")
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer tx.Rollback(context.Background())
-	rows, err := tx.Query(ctx, `SELECT id,txid,vout,value_sats,script_pub_key,block_height,address_id FROM btc_utxos WHERE network=$1 AND status='UNSPENT' ORDER BY block_height,id FOR UPDATE SKIP LOCKED`, NetworkBitcoinSignet)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-	items := make([]btc.UTXO, 0)
-	for rows.Next() {
-		var item btc.UTXO
-		var script string
-		if err = rows.Scan(&item.ID, &item.TxID, &item.Vout, &item.ValueSats, &script, &item.BlockHeight, &item.AddressID); err != nil {
-			return nil, 0, err
-		}
-		item.ScriptPubKey, err = hex.DecodeString(script)
-		if err != nil {
-			return nil, 0, err
-		}
-		items = append(items, item)
-		chosen, fee, selectErr := btc.SelectUTXOs(items, targetSats, feeRateSatVB)
-		if selectErr == nil {
-			for _, u := range chosen {
-				if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='LOCKED',locked_by=$2,locked_until=CURRENT_TIMESTAMP+INTERVAL '10 minutes',updated_at=CURRENT_TIMESTAMP WHERE id=$1`, u.ID, locker); err != nil {
-					return nil, 0, err
-				}
-			}
-			if err = tx.Commit(ctx); err != nil {
-				return nil, 0, err
-			}
-			return chosen, fee, nil
-		}
-	}
-	return nil, 0, errors.New("BTC 可用 UTXO 不足")
+// ReleaseExpiredBTCUTXOLocks 仅释放提币租约超时的 UTXO 锁，绝不释放归集锁。
+func (s *Store) ReleaseExpiredBTCUTXOLocks(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE btc_utxos
+		SET status='UNSPENT', locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP
+		WHERE status='LOCKED' AND locked_until<CURRENT_TIMESTAMP AND locked_by<>$1 AND locked_by LIKE $2`,
+		btc.SweepLockBy, btc.WithdrawalLockPrefix+"%")
+	return err
 }
 
 // CreateBTCWithdrawal 幂等创建提币并在用户余额行锁下占用金额。

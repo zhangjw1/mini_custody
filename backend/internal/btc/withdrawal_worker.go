@@ -1,13 +1,15 @@
 package btc
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
+	"strings"
 	"log/slog"
 	"time"
 
+	"github.com/btcsuite/btcd/wire"
 	"github.com/xiaoqi/mini-custody/backend/internal/chain/bitcoin"
 	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 )
@@ -27,6 +29,7 @@ type WithdrawalWorkerStore interface {
 	SaveBTCWithdrawalSigned(context.Context, int64, []byte, int64, int64) (Withdrawal, error)
 	MarkBTCWithdrawalBroadcastUnknown(context.Context, int64, string) error
 	MarkBTCWithdrawalBroadcasted(context.Context, int64, string) error
+	MarkBTCWithdrawalManualReview(context.Context, int64, string, string) error
 	CompleteBTCWithdrawal(context.Context, int64, int64, int64) error
 	FailBTCWithdrawal(context.Context, int64, string, string) error
 }
@@ -70,7 +73,7 @@ func (w *WithdrawalWorker) Run(ctx context.Context) error {
 
 // RunOnce 逐条推进 BTC 提币任务。
 func (w *WithdrawalWorker) RunOnce(ctx context.Context) error {
-	items, err := w.store.ListProcessableBTCWithdrawals(ctx, 100)
+	items, err := w.store.ListProcessableBTCWithdrawals(ctx, DefaultProcessBatch)
 	if err != nil {
 		return err
 	}
@@ -85,8 +88,8 @@ func (w *WithdrawalWorker) RunOnce(ctx context.Context) error {
 // Process 恢复并推进一笔 BTC 提币任务。
 func (w *WithdrawalWorker) Process(ctx context.Context, item Withdrawal) error {
 	switch item.Status {
-	case "CREATED":
-		inputs, addresses, targetScript, changeScript, err := w.store.LockWithdrawalInputs(ctx, item.ID, item.AmountSats, "withdrawal-"+fmt.Sprint(item.ID))
+	case WithdrawalCreated, WithdrawalInputsLocked:
+		inputs, addresses, targetScript, changeScript, err := w.store.LockWithdrawalInputs(ctx, item.ID, item.AmountSats, WithdrawalLocker(item.ID))
 		if err != nil {
 			return err
 		}
@@ -99,9 +102,9 @@ func (w *WithdrawalWorker) Process(ctx context.Context, item Withdrawal) error {
 			return err
 		}
 		fallthrough
-	case "SIGNED", "BROADCAST_UNKNOWN":
+	case WithdrawalSigned, WithdrawalBroadcastUnknown:
 		return w.broadcast(ctx, item)
-	case "BROADCASTED", "CONFIRMING":
+	case WithdrawalBroadcasted, WithdrawalConfirming:
 		if item.TxID == "" {
 			return errors.New("BTC 提币缺少 txid")
 		}
@@ -109,7 +112,7 @@ func (w *WithdrawalWorker) Process(ctx context.Context, item Withdrawal) error {
 		if err != nil {
 			return err
 		}
-		if tx.Confirmations < int64(w.confirmations) {
+		if tx.Confirmations < w.confirmations {
 			return nil
 		}
 		block, err := w.chain.Block(ctx, tx.BlockHash)
@@ -117,32 +120,79 @@ func (w *WithdrawalWorker) Process(ctx context.Context, item Withdrawal) error {
 			return err
 		}
 		return w.store.CompleteBTCWithdrawal(ctx, item.ID, tx.Confirmations, block.Height)
-	case "COMPLETED":
+	case WithdrawalCompleted, WithdrawalManualReview:
 		return nil
 	default:
 		return errors.New("BTC 提币状态不可恢复")
 	}
 }
 
-// broadcast 对已签名提币执行 mempool 检查和广播。
+// broadcast 在广播前先按 txid 检查链与内存池状态，避免崩溃重启造成重复出款。
 func (w *WithdrawalWorker) broadcast(ctx context.Context, item Withdrawal) error {
 	if len(item.RawTx) == 0 {
 		return errors.New("BTC 提币缺少已签名 raw_tx")
 	}
+	txid := strings.ToLower(strings.TrimSpace(item.TxID))
+	if txid == "" {
+		computed, err := txHashFromRaw(item.RawTx)
+		if err != nil {
+			return err
+		}
+		txid = computed
+	}
+	if _, err := w.chain.RawTransaction(ctx, txid); err == nil {
+		return w.store.MarkBTCWithdrawalBroadcasted(ctx, item.ID, txid)
+	} else if !isBitcoinTxNotFound(err) {
+		return err
+	}
+
 	rawHex := hex.EncodeToString(item.RawTx)
-	if item.Status == "SIGNED" {
+	if item.Status == WithdrawalSigned {
 		check, err := w.chain.TestMempoolAccept(ctx, rawHex)
 		if err != nil {
 			return err
 		}
 		if !check.Allowed {
-			return w.store.FailBTCWithdrawal(ctx, item.ID, "MEMPOOL_REJECTED", check.RejectReason)
+			if _, txErr := w.chain.RawTransaction(ctx, txid); txErr == nil {
+				return w.store.MarkBTCWithdrawalBroadcasted(ctx, item.ID, txid)
+			} else if !isBitcoinTxNotFound(txErr) {
+				return txErr
+			}
+			return w.store.MarkBTCWithdrawalManualReview(ctx, item.ID, "MEMPOOL_REJECTED", check.RejectReason)
 		}
 	}
-	txid, err := w.chain.SendRawTransaction(ctx, rawHex)
+	sentTxID, err := w.chain.SendRawTransaction(ctx, rawHex)
 	if err != nil {
-		_ = w.store.MarkBTCWithdrawalBroadcastUnknown(ctx, item.ID, err.Error())
+		if markErr := w.store.MarkBTCWithdrawalBroadcastUnknown(ctx, item.ID, err.Error()); markErr != nil {
+			return errors.Join(err, markErr)
+		}
 		return err
 	}
-	return w.store.MarkBTCWithdrawalBroadcasted(ctx, item.ID, txid)
+	if sentTxID == "" {
+		sentTxID = txid
+	}
+	return w.store.MarkBTCWithdrawalBroadcasted(ctx, item.ID, sentTxID)
+}
+
+// txHashFromRaw 从序列化 Bitcoin 原始交易计算规范化小写 txid。
+func txHashFromRaw(raw []byte) (string, error) {
+	tx := wire.NewMsgTx(2)
+	if err := tx.Deserialize(bytes.NewReader(raw)); err != nil {
+		return "", errors.New("解析已签名 BTC 原始交易失败")
+	}
+	return strings.ToLower(tx.TxHash().String()), nil
+}
+
+// isBitcoinTxNotFound 判断 Bitcoin RPC 错误是否明确表示交易未出现在内存池和区块链上。
+func isBitcoinTxNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rpcErr *bitcoin.RPCError
+	if errors.As(err, &rpcErr) && rpcErr.Code == -5 {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "no such mempool or blockchain transaction") ||
+		strings.Contains(lower, "not found")
 }

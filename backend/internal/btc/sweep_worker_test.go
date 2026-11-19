@@ -9,7 +9,11 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 )
 
-type fakeSweepChain struct{ calls, mempoolCalls int }
+type fakeSweepChain struct {
+	calls, mempoolCalls int
+	onChain             map[string]bitcoin.RawTransaction
+	mempoolRejected     bool
+}
 
 // SendRawTransaction 模拟交易广播。
 func (f *fakeSweepChain) SendRawTransaction(context.Context, string) (string, error) {
@@ -17,9 +21,14 @@ func (f *fakeSweepChain) SendRawTransaction(context.Context, string) (string, er
 	return "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nil
 }
 
-// RawTransaction 返回测试确认信息。
-func (f *fakeSweepChain) RawTransaction(context.Context, string) (bitcoin.RawTransaction, error) {
-	return bitcoin.RawTransaction{Confirmations: 3, BlockHash: "cc"}, nil
+// RawTransaction 返回测试确认信息，未知交易返回 Bitcoin Core -5 错误。
+func (f *fakeSweepChain) RawTransaction(_ context.Context, txid string) (bitcoin.RawTransaction, error) {
+	if f.onChain != nil {
+		if tx, ok := f.onChain[txid]; ok {
+			return tx, nil
+		}
+	}
+	return bitcoin.RawTransaction{}, &bitcoin.RPCError{Code: -5, Message: "No such mempool or blockchain transaction"}
 }
 
 // Block 返回测试归集确认区块。
@@ -27,15 +36,18 @@ func (f *fakeSweepChain) Block(context.Context, string) (bitcoin.Block, error) {
 	return bitcoin.Block{Height: 99}, nil
 }
 
-// TestMempoolAccept 返回测试通过结果。
+// TestMempoolAccept 返回测试通过或拒绝结果。
 func (f *fakeSweepChain) TestMempoolAccept(context.Context, string) (bitcoin.MempoolAcceptResult, error) {
 	f.mempoolCalls++
+	if f.mempoolRejected {
+		return bitcoin.MempoolAcceptResult{Allowed: false, RejectReason: "txn-mempool-conflict"}, nil
+	}
 	return bitcoin.MempoolAcceptResult{Allowed: true}, nil
 }
 
 type fakeSweepStore struct {
-	saved, broadcasted int
-	item               Sweep
+	saved, broadcasted, manualReview, failed int
+	item                                     Sweep
 }
 
 // ListProcessableBTCSweeps 返回测试归集任务。
@@ -75,8 +87,18 @@ func (f *fakeSweepStore) MarkBTCSweepBroadcastUnknown(context.Context, int64, st
 	return nil
 }
 
+// MarkBTCSweepManualReview 标记归集进入人工审核。
+func (f *fakeSweepStore) MarkBTCSweepManualReview(_ context.Context, _ int64, _, _ string) error {
+	f.manualReview++
+	f.item.Status = SweepManualReview
+	return nil
+}
+
 // FailBTCSweep 记录测试失败状态。
-func (f *fakeSweepStore) FailBTCSweep(context.Context, int64, string, string) error { return nil }
+func (f *fakeSweepStore) FailBTCSweep(context.Context, int64, string, string) error {
+	f.failed++
+	return nil
+}
 
 // TestSweepWorkerReplaysPersistedSignedTransaction 验证重启后只重播已持久化交易。
 func TestSweepWorkerReplaysPersistedSignedTransaction(t *testing.T) {
@@ -99,13 +121,44 @@ func TestSweepWorkerReplaysPersistedSignedTransaction(t *testing.T) {
 func TestSweepWorkerRecoversBroadcastUnknownWithoutRebuild(t *testing.T) {
 	provider, _ := wallet.NewMnemonicKeyProvider(sweepTestMnemonic)
 	chain := &fakeSweepChain{}
-	store := &fakeSweepStore{item: Sweep{ID: 5, Status: "BROADCAST_UNKNOWN", RawTx: []byte{4, 5, 6}, TxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+	store := &fakeSweepStore{item: Sweep{ID: 5, Status: SweepBroadcastUnknown, RawTx: []byte{4, 5, 6}, TxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 	worker, _ := NewSweepWorker(chain, store, provider, time.Second, 2, 3, nil)
 	if err := worker.Process(context.Background(), store.item); err != nil {
 		t.Fatal(err)
 	}
 	if chain.calls != 1 || chain.mempoolCalls != 0 || store.saved != 0 {
 		t.Fatalf("calls=%d mempool=%d saved=%d", chain.calls, chain.mempoolCalls, store.saved)
+	}
+}
+
+// TestSweepWorkerRecoversAlreadyBroadcastedSigned 验证已上链但状态为 SIGNED 时直接推进到 BROADCASTED。
+func TestSweepWorkerRecoversAlreadyBroadcastedSigned(t *testing.T) {
+	provider, _ := wallet.NewMnemonicKeyProvider(sweepTestMnemonic)
+	txid := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	chain := &fakeSweepChain{
+		onChain: map[string]bitcoin.RawTransaction{txid: {TxID: txid, Confirmations: 1}},
+	}
+	store := &fakeSweepStore{item: Sweep{ID: 7, Status: SweepSigned, RawTx: []byte{4, 5, 6}, TxID: txid}}
+	worker, _ := NewSweepWorker(chain, store, provider, time.Second, 2, 3, nil)
+	if err := worker.Process(context.Background(), store.item); err != nil {
+		t.Fatal(err)
+	}
+	if chain.calls != 0 || chain.mempoolCalls != 0 || store.broadcasted != 1 {
+		t.Fatalf("calls=%d mempool=%d broadcasted=%d", chain.calls, chain.mempoolCalls, store.broadcasted)
+	}
+}
+
+// TestSweepWorkerMovesRejectedSignedToManualReview 验证 SIGNED 被 mempool 拒绝且链上无记录时转入人工审核而不是自动失败。
+func TestSweepWorkerMovesRejectedSignedToManualReview(t *testing.T) {
+	provider, _ := wallet.NewMnemonicKeyProvider(sweepTestMnemonic)
+	chain := &fakeSweepChain{mempoolRejected: true}
+	store := &fakeSweepStore{item: Sweep{ID: 8, Status: SweepSigned, RawTx: []byte{4, 5, 6}, TxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+	worker, _ := NewSweepWorker(chain, store, provider, time.Second, 2, 3, nil)
+	if err := worker.Process(context.Background(), store.item); err != nil {
+		t.Fatal(err)
+	}
+	if store.manualReview != 1 || store.failed != 0 {
+		t.Fatalf("manualReview=%d failed=%d", store.manualReview, store.failed)
 	}
 }
 

@@ -117,3 +117,21 @@ func TestBitcoinMigrationContainsCriticalConstraints(t *testing.T) {
 		}
 	}
 }
+
+// TestBitcoinFixesMigrationContainsRawTxAndManualReview 验证 000004 迁移补全了 raw_tx 列与 MANUAL_REVIEW 约束。
+func TestBitcoinFixesMigrationContainsRawTxAndManualReview(t *testing.T) {
+	sqlBytes, err := migrationFiles.ReadFile("000004_btc_fixes.up.sql")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	sql := string(sqlBytes)
+	for _, fragment := range []string{
+		"ADD COLUMN raw_tx BYTEA",
+		"COMMENT ON COLUMN btc_withdrawals.raw_tx IS",
+		"MANUAL_REVIEW",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Errorf("BTC fixes migration fragment %q is missing", fragment)
+		}
+	}
+}

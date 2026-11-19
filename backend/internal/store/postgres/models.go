@@ -50,6 +50,7 @@ const (
 	BTCSweepConfirming       = "CONFIRMING"
 	BTCSweepCompleted        = "COMPLETED"
 	BTCSweepFailed           = "FAILED"
+	BTCSweepManualReview     = "MANUAL_REVIEW"
 )
 
 const (

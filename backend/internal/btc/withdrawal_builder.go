@@ -12,13 +12,18 @@ import (
 
 // BuildWithdrawal 构建并签署多输入 P2WPKH 提币交易，找零发送到平台地址。
 func BuildWithdrawal(provider *wallet.MnemonicKeyProvider, inputs []UTXO, inputAddresses []Address, targetScript, changeScript []byte, amountSats, feeRateSatVB int64) ([]byte, int64, int64, error) {
-	if provider == nil || len(inputs) == 0 || len(inputs) != len(inputAddresses) || len(targetScript) == 0 || len(changeScript) == 0 || amountSats <= 0 || feeRateSatVB <= 0 {
+	if provider == nil || len(inputs) == 0 || len(inputs) != len(inputAddresses) || len(targetScript) == 0 || len(changeScript) == 0 || amountSats < DustThresholdSats || feeRateSatVB <= 0 {
 		return nil, 0, 0, errors.New("BTC 提币构建参数无效")
 	}
-	if feeRateSatVB > math.MaxInt64/int64(10+68*len(inputs)+31+31) {
-		return nil, 0, 0, errors.New("BTC 提币费率超出范围")
+	feeNoChange, err := EstimateFee(len(inputs), 1, feeRateSatVB)
+	if err != nil {
+		return nil, 0, 0, err
 	}
-	fee := feeRateSatVB * int64(10+68*len(inputs)+31+31)
+	feeWithChange, err := EstimateFee(len(inputs), 2, feeRateSatVB)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
 	total := int64(0)
 	tx := wire.NewMsgTx(2)
 	for _, item := range inputs {
@@ -32,16 +37,14 @@ func BuildWithdrawal(provider *wallet.MnemonicKeyProvider, inputs []UTXO, inputA
 		}
 		total += item.ValueSats
 	}
-	if total < amountSats+fee {
+	if total < amountSats+feeNoChange {
 		return nil, 0, 0, errors.New("BTC 提币余额不足")
 	}
-	change := total - amountSats - fee
+
+	fee, change := resolvedSelectionFee(total, amountSats, feeNoChange, feeWithChange)
 	tx.AddTxOut(wire.NewTxOut(amountSats, targetScript))
 	if change >= DustThresholdSats {
 		tx.AddTxOut(wire.NewTxOut(change, changeScript))
-	} else {
-		fee += change
-		change = 0
 	}
 	for i, item := range inputs {
 		raw, err := provider.SignBitcoinInput(nil, inputAddresses[i].Path, tx, i, item.ValueSats, item.ScriptPubKey)
