@@ -1,13 +1,16 @@
 import { createContext, useContext } from 'react'
-import type { Asset, User } from './types'
+import type { Asset, ChainCapabilities, User } from './types'
 
 type AppContextValue = {
   users: User[]
   userId: number
   setUserId: (userId: number) => void
+  currentUser?: User
   assets: Asset[]
   asset: Asset
   setAssetSymbol: (symbol: string) => void
+  capabilities?: ChainCapabilities
+  openCreateUserModal: () => void
 }
 
 export const AppContext = createContext<AppContextValue | null>(null)

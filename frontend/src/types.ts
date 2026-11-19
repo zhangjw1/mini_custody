@@ -1,8 +1,43 @@
+export type UserStatus = 'ACTIVE' | 'DISABLED'
+
 export type User = {
   id: number
   code: string
   display_name: string
+  status: UserStatus
+  note?: string
   created_at: string
+}
+
+export type CreateUserInput = {
+  code: string
+  display_name: string
+  note?: string
+}
+
+export type CreateUserResponse = {
+  user: User
+  address: string
+}
+
+export type UpdateUserInput = {
+  display_name: string
+  note?: string
+  status: UserStatus
+}
+
+export type AdminUser = {
+  id: number
+  username: string
+  display_name: string
+  role: string
+  last_login_at?: string
+}
+
+export type LoginResponse = {
+  token: string
+  expires_at: string
+  admin: AdminUser
 }
 
 export type Asset = {
@@ -51,9 +86,9 @@ export type Wallet = {
 }
 
 export type BitcoinWallet = { network: string; address: string; address_type: 'P2WPKH' }
-export type BitcoinSweep = { id:number; source_address:string; destination_address:string; input_sats:number; output_sats:number; fee_sats:number; fee_rate_sat_vb:number; txid?:string; status:string }
-export type BitcoinDeposit = { id:number; txid:string; vout:number; block_height:number; amount_sats:number; confirmations:number; status:string }
-export type BitcoinWithdrawal = { id:number; user_id?:number; to_address:string; amount_sats:number; fee_rate_sat_vb:number; status:string; txid?:string; created?:boolean }
+export type BitcoinSweep = { id: number; source_address: string; destination_address: string; input_sats: number; output_sats: number; fee_sats: number; fee_rate_sat_vb: number; txid?: string; status: string }
+export type BitcoinDeposit = { id: number; txid: string; vout: number; block_height: number; amount_sats: number; confirmations: number; status: string }
+export type BitcoinWithdrawal = { id: number; user_id?: number; to_address: string; amount_sats: number; fee_rate_sat_vb: number; status: string; txid?: string; created?: boolean }
 
 export type Deposit = {
   id: number
@@ -233,6 +268,12 @@ export type PlatformWallet = {
   last_error?: string
 }
 
+export type ChainCapabilities = {
+  erc20_enabled: boolean
+  bitcoin_enabled: boolean
+  bitcoin_network?: string
+}
+
 export type ChainStatus = {
   network: string
   status: string
@@ -243,6 +284,7 @@ export type ChainStatus = {
   lag: number
   last_error?: string
   checked_at: string
+  capabilities?: ChainCapabilities
   token_scanner?: {
     status: string
     network_height: number
@@ -251,24 +293,24 @@ export type ChainStatus = {
     last_error?: string
     checked_at: string
   }
-	gas_station?: {
-		status: string
-		address: string
-		balance_wei: string
-		balance_eth: string
-		minimum_wei: string
-		minimum_eth: string
-		last_error?: string
-		checked_at: string
-	}
-	token_inventory?: {
-		status: string
-		symbol: string
-		address: string
-		balance_units: string
-		last_error?: string
-		checked_at: string
-	}
+  gas_station?: {
+    status: string
+    address: string
+    balance_wei: string
+    balance_eth: string
+    minimum_wei: string
+    minimum_eth: string
+    last_error?: string
+    checked_at: string
+  }
+  token_inventory?: {
+    status: string
+    symbol: string
+    address: string
+    balance_units: string
+    last_error?: string
+    checked_at: string
+  }
 }
 
 export type WorkerError = {
