@@ -72,7 +72,7 @@ type ScanResult struct {
 	TotalAmount BTCAmount       `json:"total_amount"`
 }
 
-// BTCAmount decodes a JSON BTC decimal into exact satoshis.
+// BTCAmount 自定义数据类型，BTC数量反序列化为不带小数的 satoshis.
 type BTCAmount int64
 
 // UnmarshalJSON 将 Bitcoin JSON 小数精确转换为 satoshi。

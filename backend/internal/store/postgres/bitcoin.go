@@ -377,9 +377,11 @@ func (s *Store) RecordBTCDepositsAndCheckpoint(ctx context.Context, observations
 	if err != nil {
 		return 0, fmt.Errorf("开启 BTC 扫描事务失败：%w", err)
 	}
+	// 一旦for循环异常退出，或者正常退出但未提交事务，事务将回滚
 	defer tx.Rollback(context.Background())
 	created := 0
 	for _, item := range observations {
+		// for循环里面，一旦return error即直接程序结束，不会再执行for循环里面的内容，并回滚事务
 		if item.UserID <= 0 || item.AddressID <= 0 || item.AmountSats <= 0 || item.BlockHeight < 0 || len(item.TxID) != 64 {
 			return 0, errors.New("BTC 充值观察值无效")
 		}

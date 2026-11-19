@@ -65,6 +65,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	if logger == nil {
 		return nil, errors.New("必须提供日志记录器")
 	}
+	// 初始化数据库连接池。
 	pool, err := postgres.Open(ctx, cfg.DatabaseURL, cfg.Timezone)
 	if err != nil {
 		return nil, err
@@ -79,6 +80,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	if err := migrations.NewRunner(pool).Up(ctx); err != nil {
 		return nil, fmt.Errorf("执行数据库迁移失败：%w", err)
 	}
+	// 初始化 EVM 客户端。
 	chainClient, err := evm.NewFromConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("初始化 Sepolia RPC 失败：%w", err)
@@ -89,6 +91,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 			chainClient.Close()
 		}
 	}()
+	// 初始化 ERC-20 合约适配器。
 	var tokenContract *erc20.Contract
 	if cfg.ERC20.Enabled {
 		tokenContract, err = erc20.NewContract(chainClient, common.HexToAddress(cfg.ERC20.ContractAddress))
@@ -99,6 +102,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 			return nil, fmt.Errorf("校验 ERC-20 合约失败：%w", err)
 		}
 	}
+	// 初始化 HD钱包适配器
 	provider, err := wallet.LoadProvider(cfg.CustodyKeyStoreFile, cfg.CustodyPassword)
 	if err != nil {
 		return nil, fmt.Errorf("加载托管密钥提供器失败：%w", err)
@@ -382,18 +386,23 @@ func (a *App) Run(ctx context.Context) error {
 	results := make(chan componentResult, len(components))
 	for _, item := range components {
 		item := item
+		// 前面components只是定义了组件，后面go func()中才是真正的启动组件
 		go func() { results <- componentResult{name: item.name, err: item.run()} }()
 	}
-
+	// 主线程被阻塞，等待所有组件启动完成或者关闭。
 	select {
+	// result是channel里拿到的第一个事件
 	case result := <-results:
 		cancel()
+		// web组件是特殊的，不监听 runCtx，不受cancel方法控制，需要主动 shutdownServer() 关它
 		if result.name != "web" {
 			if shutdownErr := a.shutdownServer(); shutdownErr != nil {
 				return shutdownErr
 			}
 		}
+		// 循环所有的worker，从channel里取出来，并判断是哪个组件停止了
 		for index := 1; index < len(components); index++ {
+			// 每次只从channel里取一个出来
 			other := <-results
 			if result.err == nil && other.err != nil {
 				result = other

@@ -69,24 +69,34 @@ func runInit(args []string) error {
 }
 
 // runVerify 验证加密根密钥并派生指定索引的地址。
+// args 已去掉子命令名，例如完整命令 walletgen verify -file=x -index=0 时，此处为 ["-file=x", "-index=0"]。
 func runVerify(args []string) error {
+	// NewFlagSet：为子命令单独建一套 flag；ContinueOnError 表示解析失败返回 error，而不是直接 os.Exit
 	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
+	// String/Uint 三个参数：name（命令行名）、value（默认值）、usage（-h 帮助文案）
+	// 返回值是指针（*string / *uint），必须等下面 Parse 之后再解引用取值
 	input := flags.String("file", "../secrets/custody-root.age", "加密托管根密钥路径")
 	index := flags.Uint("index", 0, "Ethereum 外部地址索引")
+	// Parse 把 args 里的 -file/-index 写入 *input / *index
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	// *index：解引用指针得到 uint 值
+	// ^uint32(0)：按位取反，得到 uint32 最大值（全 1）；再转 uint64 做安全比较，避免强转截断
 	if uint64(*index) > uint64(^uint32(0)) {
 		return errors.New("地址索引超出 uint32 范围")
 	}
+	// 密码只从环境变量读取，避免出现在命令行历史中
 	password, err := passwordFromEnvironment()
 	if err != nil {
 		return err
 	}
+	// *input：解引用得到密钥文件路径字符串
 	provider, err := wallet.LoadProvider(*input, password)
 	if err != nil {
 		return err
 	}
+	// uint32(*index)：显式类型转换后按 BIP44 用户路径派生地址
 	path := wallet.UserPath(uint32(*index))
 	address, err := provider.Address(context.Background(), path)
 	if err != nil {

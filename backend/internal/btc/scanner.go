@@ -22,14 +22,17 @@ func ScanBlock(block bitcoin.Block, addresses map[string]Address) ([]DepositObse
 			return nil, fmt.Errorf("Bitcoin 交易 txid 无效: %s", id)
 		}
 		for _, output := range tx.Vout {
+			// output.Value是BTCAmount类型，底层是int64
 			if int64(output.Value) <= 0 {
 				continue
 			}
+			// output.ScriptPubKey.Hex是十六进制字符串，需要解码为字节数组
 			script, err := hex.DecodeString(strings.TrimSpace(output.ScriptPubKey.Hex))
 			if err != nil {
 				return nil, errors.New("Bitcoin 输出脚本无效")
 			}
 			for _, address := range addresses {
+				// 判断区块的输出脚本是否与客户地址的脚本匹配
 				if string(script) != string(address.ScriptPubKey) {
 					continue
 				}
