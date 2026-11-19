@@ -20,7 +20,10 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 )
 
-const workerBatchSize = 100
+const (
+	workerBatchSize      = 100
+	maxSigningRetryCount = 5
+)
 
 // Chain 定义 Token 归集费用、Nonce、广播和确认所需的 EVM 能力。
 type Chain interface {
@@ -86,14 +89,17 @@ type feeQuote struct {
 
 // Worker 负责用户地址 Token 自动归集、幂等广播和库存快照。
 type Worker struct {
-	chain    Chain
-	contract TokenContract
-	store    Store
-	keys     wallet.KeyProvider
-	logger   *slog.Logger
-	config   Config
-	healthMu sync.RWMutex
-	health   HealthSnapshot
+	chain           Chain
+	contract        TokenContract
+	store           Store
+	keys            wallet.KeyProvider
+	logger          *slog.Logger
+	config          Config
+	healthMu        sync.RWMutex
+	health          HealthSnapshot
+	signingMu       sync.Mutex
+	signingFailures map[int64]int
+	pausedSigning   map[int64]bool
 }
 
 // NewWorker 创建并校验 Token Sweep Worker。
@@ -109,7 +115,9 @@ func NewWorker(chain Chain, contract TokenContract, store Store, keys wallet.Key
 	cfg.ChainID = new(big.Int).Set(cfg.ChainID)
 	return &Worker{
 		chain: chain, contract: contract, store: store, keys: keys, logger: logger, config: cfg,
-		health: HealthSnapshot{Status: "CHECKING", Symbol: cfg.Symbol, BalanceUnits: new(big.Int)},
+		health:          HealthSnapshot{Status: "CHECKING", Symbol: cfg.Symbol, BalanceUnits: new(big.Int)},
+		signingFailures: make(map[int64]int),
+		pausedSigning:   make(map[int64]bool),
 	}, nil
 }
 
@@ -140,8 +148,13 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("查询待处理 Token 归集失败：%w", err)
 	}
 	for _, item := range items {
+		if w.isSigningPaused(item.ID) {
+			continue
+		}
 		if err := w.Process(ctx, item.ID); err != nil {
-			w.recordError(ctx, item.ID, "process", "TOKEN_SWEEP_PROCESS_FAILED", err)
+			if !w.isSigningPaused(item.ID) {
+				w.recordError(ctx, item.ID, "process", "TOKEN_SWEEP_PROCESS_FAILED", err)
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -222,42 +235,28 @@ func (w *Worker) prepare(ctx context.Context, item postgres.TokenSweep) error {
 	return w.sign(ctx, item)
 }
 
-// sign 复核余额和 calldata 后签署归集交易，并在广播前持久化原始交易。
+// sign 在已分配用户地址 Nonce 后直接估算费用、签名并持久化，不再因余额波动无限阻断。
 func (w *Worker) sign(ctx context.Context, item postgres.TokenSweep) error {
 	if item.Nonce == nil || !item.Nonce.IsUint64() || item.SweepAmountUnits == nil || item.SweepAmountUnits.Sign() <= 0 {
-		return errors.New("Token 归集 Nonce 或金额无效")
+		return w.handleSigningFailure(ctx, item.ID, errors.New("Token 归集 Nonce 或金额无效"))
 	}
 	address, platform, err := w.walletsFor(ctx, item)
 	if err != nil {
-		return err
+		return w.handleSigningFailure(ctx, item.ID, err)
 	}
 	from := common.HexToAddress(address.Address)
 	to := common.HexToAddress(platform.Address)
-	tokenBalance, err := w.contract.BalanceOf(ctx, from)
-	if err != nil {
-		return fmt.Errorf("签名前查询归集来源 Token 余额失败：%w", err)
-	}
-	if tokenBalance == nil || tokenBalance.Cmp(item.SweepAmountUnits) < 0 {
-		return errors.New("签名前归集来源 Token 余额不足")
-	}
 	gasLimit, err := w.contract.EstimateTransferGas(ctx, from, to, item.SweepAmountUnits)
 	if err != nil {
-		return fmt.Errorf("签名前估算 Token 归集 Gas 失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("签名前估算 Token 归集 Gas 失败：%w", err))
 	}
 	quote, err := w.quoteWithGasLimit(ctx, gasLimit)
 	if err != nil {
-		return err
-	}
-	ethBalance, err := w.chain.BalanceAt(ctx, from, nil)
-	if err != nil {
-		return fmt.Errorf("签名前查询归集来源 ETH 余额失败：%w", err)
-	}
-	if ethBalance == nil || ethBalance.Cmp(quote.ReservedFeeWei) < 0 {
-		return errors.New("签名前归集来源 ETH 余额不足")
+		return w.handleSigningFailure(ctx, item.ID, err)
 	}
 	calldata, err := w.contract.EncodeTransfer(to, item.SweepAmountUnits)
 	if err != nil {
-		return fmt.Errorf("编码 Token 归集 calldata 失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("编码 Token 归集 calldata 失败：%w", err))
 	}
 	contractAddress := w.contract.Address()
 	transaction := types.NewTx(&types.DynamicFeeTx{
@@ -266,19 +265,19 @@ func (w *Worker) sign(ctx context.Context, item postgres.TokenSweep) error {
 		Gas: quote.GasLimit, To: &contractAddress, Value: new(big.Int), Data: calldata,
 	})
 	if err := w.validateTransaction(transaction, to, item.SweepAmountUnits); err != nil {
-		return err
+		return w.handleSigningFailure(ctx, item.ID, err)
 	}
 	signed, err := w.keys.SignTx(ctx, address.DerivationPath, transaction, w.config.ChainID)
 	if err != nil {
-		return fmt.Errorf("签署 Token 归集交易失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("签署 Token 归集交易失败：%w", err))
 	}
 	sender, err := types.Sender(types.LatestSignerForChainID(w.config.ChainID), signed)
 	if err != nil || sender != from {
-		return errors.New("已签名 Token 归集交易发送地址与托管地址不一致")
+		return w.handleSigningFailure(ctx, item.ID, errors.New("已签名 Token 归集交易发送地址与托管地址不一致"))
 	}
 	raw, err := signed.MarshalBinary()
 	if err != nil {
-		return fmt.Errorf("编码已签名 Token 归集交易失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("编码已签名 Token 归集交易失败：%w", err))
 	}
 	item, _, err = w.store.SaveSignedTokenSweep(ctx, postgres.SignedTokenSweep{
 		SweepID: item.ID, GasLimit: quote.GasLimit, MaxFeePerGasWei: quote.MaxFeePerGasWei,
@@ -286,9 +285,41 @@ func (w *Worker) sign(ctx context.Context, item postgres.TokenSweep) error {
 		TxHash: strings.ToLower(signed.Hash().Hex()),
 	})
 	if err != nil {
-		return fmt.Errorf("持久化已签名 Token 归集失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("持久化已签名 Token 归集失败：%w", err))
 	}
+	w.clearSigningFailure(item.ID)
 	return w.broadcast(ctx, item)
+}
+
+// isSigningPaused 判断指定 Token 归集任务是否因连续签名失败暂停重试。
+func (w *Worker) isSigningPaused(id int64) bool {
+	w.signingMu.Lock()
+	defer w.signingMu.Unlock()
+	return w.pausedSigning[id]
+}
+
+// clearSigningFailure 清理已成功签名的 Token 归集失败计数。
+func (w *Worker) clearSigningFailure(id int64) {
+	w.signingMu.Lock()
+	delete(w.signingFailures, id)
+	delete(w.pausedSigning, id)
+	w.signingMu.Unlock()
+}
+
+// handleSigningFailure 统计分配 Nonce 后的连续签名失败次数，超限后记入人工介入错误并暂停自动重复写入。
+func (w *Worker) handleSigningFailure(ctx context.Context, id int64, err error) error {
+	w.signingMu.Lock()
+	w.signingFailures[id]++
+	count := w.signingFailures[id]
+	alreadyPaused := w.pausedSigning[id]
+	if count >= maxSigningRetryCount {
+		w.pausedSigning[id] = true
+	}
+	w.signingMu.Unlock()
+	if count >= maxSigningRetryCount && !alreadyPaused {
+		w.recordError(ctx, id, "signing", "TOKEN_SWEEP_SIGNING_MANUAL_INTERVENTION", err)
+	}
+	return err
 }
 
 // validateTransaction 解码并复核合约地址、热钱包目标、归集金额和零 ETH Value。

@@ -2,7 +2,6 @@ package bitcoin
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 

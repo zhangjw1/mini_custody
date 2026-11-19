@@ -351,6 +351,40 @@ func TestAlreadyKnownInspectsWrappedErrors(t *testing.T) {
 	}
 }
 
+// TestWorkerReleasesBeforeAllocatingNonceWhenChainBalanceInsufficient 验证链上余额不足在分配 Nonce 前释放，绝不产生 Nonce 空洞。
+func TestWorkerReleasesBeforeAllocatingNonceWhenChainBalanceInsufficient(t *testing.T) {
+	chain := defaultFakeChain()
+	chain.balance = big.NewInt(100)
+	store := defaultFakeStore(t, postgres.WithdrawalCreated)
+	worker := newTestWorker(t, chain, store)
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if store.item.Status != postgres.WithdrawalFailed || store.item.Nonce != nil {
+		t.Fatalf("status=%s nonce=%v, want FAILED and nil nonce", store.item.Status, store.item.Nonce)
+	}
+}
+
+// TestWorkerStopsRepeatedErrorWritesAfterSigningFailureThreshold 验证分配 Nonce 后连续签名失败达到阈值后停止无限刷错。
+func TestWorkerStopsRepeatedErrorWritesAfterSigningFailureThreshold(t *testing.T) {
+	chain := defaultFakeChain()
+	chain.header = nil
+	store := defaultFakeStore(t, postgres.WithdrawalSigning)
+	store.item.Nonce = big.NewInt(7)
+	worker := newTestWorker(t, chain, store)
+
+	for i := 0; i < 8; i++ {
+		_ = worker.RunOnce(context.Background())
+	}
+	if store.item.Status != postgres.WithdrawalSigning {
+		t.Fatalf("status=%s, must never release signed/signing nonce", store.item.Status)
+	}
+	if len(store.errors) != 5 {
+		t.Fatalf("error records=%d, want 5 (4 process + 1 manual intervention)", len(store.errors))
+	}
+}
+
 // creationStore 记录创建服务提交的余额占用请求。
 type creationStore struct {
 	address  postgres.WalletAddress

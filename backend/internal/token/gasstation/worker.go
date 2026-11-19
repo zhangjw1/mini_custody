@@ -19,7 +19,10 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 )
 
-const workerBatchSize = 100
+const (
+	workerBatchSize      = 100
+	maxSigningRetryCount = 5
+)
 
 var (
 	ErrTopupLimitExceeded = errors.New("Gas 补充金额超过单次安全上限")
@@ -89,14 +92,17 @@ type feeQuote struct {
 
 // Worker 负责最小必要 Gas 计算、内部 ETH 转账和崩溃恢复。
 type Worker struct {
-	chain    Chain
-	contract TokenContract
-	store    Store
-	keys     wallet.KeyProvider
-	logger   *slog.Logger
-	config   Config
-	healthMu sync.RWMutex
-	health   HealthSnapshot
+	chain           Chain
+	contract        TokenContract
+	store           Store
+	keys            wallet.KeyProvider
+	logger          *slog.Logger
+	config          Config
+	healthMu        sync.RWMutex
+	health          HealthSnapshot
+	signingMu       sync.Mutex
+	signingFailures map[int64]int
+	pausedSigning   map[int64]bool
 }
 
 // NewWorker 创建并校验 Gas Station Worker。
@@ -115,7 +121,9 @@ func NewWorker(chain Chain, contract TokenContract, store Store, keys wallet.Key
 	cfg.PlatformMinBalanceWei = new(big.Int).Set(cfg.PlatformMinBalanceWei)
 	return &Worker{
 		chain: chain, contract: contract, store: store, keys: keys, logger: logger, config: cfg,
-		health: HealthSnapshot{Status: "CHECKING", BalanceWei: new(big.Int), MinBalanceWei: new(big.Int).Set(cfg.PlatformMinBalanceWei)},
+		health:          HealthSnapshot{Status: "CHECKING", BalanceWei: new(big.Int), MinBalanceWei: new(big.Int).Set(cfg.PlatformMinBalanceWei)},
+		signingFailures: make(map[int64]int),
+		pausedSigning:   make(map[int64]bool),
 	}, nil
 }
 
@@ -146,8 +154,13 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("查询 Gas Station 任务失败：%w", err)
 	}
 	for _, item := range items {
+		if w.isSigningPaused(item.ID) {
+			continue
+		}
 		if err := w.Process(ctx, item.ID); err != nil {
-			w.recordError(ctx, item.ID, "process", "GAS_TOPUP_PROCESS_FAILED", err)
+			if !w.isSigningPaused(item.ID) {
+				w.recordError(ctx, item.ID, "process", "GAS_TOPUP_PROCESS_FAILED", err)
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -251,31 +264,23 @@ func (w *Worker) processTransfer(ctx context.Context, transfer postgres.Internal
 	}
 }
 
-// sign 构建 EIP-1559 ETH 转账，并在广播前保存相同 raw_tx 和 tx_hash。
+// sign 在已分配平台 Nonce 后直接构建 EIP-1559 补气交易并持久化，不再因余额波动无限阻断。
 func (w *Worker) sign(ctx context.Context, transfer postgres.InternalTransfer) error {
 	if transfer.Nonce == nil || !transfer.Nonce.IsUint64() {
-		return errors.New("Gas 补充 Nonce 无效")
+		return w.handleSigningFailure(ctx, transfer.SweepID, errors.New("Gas 补充 Nonce 无效"))
 	}
 	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
 	if err != nil {
-		return fmt.Errorf("查询平台热钱包失败：%w", err)
+		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("查询平台热钱包失败：%w", err))
 	}
 	if platform.ID != transfer.PlatformWalletID || platform.Address != transfer.FromAddress {
-		return postgres.ErrWalletKeyMismatch
+		return w.handleSigningFailure(ctx, transfer.SweepID, postgres.ErrWalletKeyMismatch)
 	}
 	from := common.HexToAddress(transfer.FromAddress)
 	to := common.HexToAddress(transfer.ToAddress)
 	quote, err := w.quoteTransfer(ctx, from, to, transfer.AmountWei)
 	if err != nil {
-		return err
-	}
-	balance, err := w.chain.BalanceAt(ctx, from, nil)
-	if err != nil {
-		return fmt.Errorf("签名前查询平台热钱包 ETH 余额失败：%w", err)
-	}
-	required := new(big.Int).Add(transfer.AmountWei, quote.ReservedFeeWei)
-	if balance == nil || balance.Cmp(required) < 0 {
-		return errors.New("平台热钱包 ETH 余额不足以支付补气金额和最大网络费")
+		return w.handleSigningFailure(ctx, transfer.SweepID, err)
 	}
 	transaction := types.NewTx(&types.DynamicFeeTx{
 		ChainID: new(big.Int).Set(w.config.ChainID), Nonce: transfer.Nonce.Uint64(),
@@ -284,11 +289,11 @@ func (w *Worker) sign(ctx context.Context, transfer postgres.InternalTransfer) e
 	})
 	signed, err := w.keys.SignTx(ctx, platform.DerivationPath, transaction, w.config.ChainID)
 	if err != nil {
-		return fmt.Errorf("签署 Gas 补充交易失败：%w", err)
+		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("签署 Gas 补充交易失败：%w", err))
 	}
 	raw, err := signed.MarshalBinary()
 	if err != nil {
-		return fmt.Errorf("编码已签名 Gas 补充交易失败：%w", err)
+		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("编码已签名 Gas 补充交易失败：%w", err))
 	}
 	transfer, _, err = w.store.SaveSignedInternalTransfer(ctx, postgres.SignedInternalTransfer{
 		TransferID: transfer.ID, GasLimit: quote.GasLimit, MaxFeePerGasWei: quote.MaxFeePerGasWei,
@@ -296,9 +301,41 @@ func (w *Worker) sign(ctx context.Context, transfer postgres.InternalTransfer) e
 		TxHash: strings.ToLower(signed.Hash().Hex()),
 	})
 	if err != nil {
-		return fmt.Errorf("持久化已签名 Gas 补充交易失败：%w", err)
+		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("持久化已签名 Gas 补充交易失败：%w", err))
 	}
+	w.clearSigningFailure(transfer.SweepID)
 	return w.broadcast(ctx, transfer)
+}
+
+// isSigningPaused 判断指定归集关联的补气任务是否暂停自动重试。
+func (w *Worker) isSigningPaused(sweepID int64) bool {
+	w.signingMu.Lock()
+	defer w.signingMu.Unlock()
+	return w.pausedSigning[sweepID]
+}
+
+// clearSigningFailure 清理已成功签名的补气任务失败计数。
+func (w *Worker) clearSigningFailure(sweepID int64) {
+	w.signingMu.Lock()
+	delete(w.signingFailures, sweepID)
+	delete(w.pausedSigning, sweepID)
+	w.signingMu.Unlock()
+}
+
+// handleSigningFailure 统计分配 Nonce 后的连续签名失败次数，超限后记入人工介入错误并暂停自动重复写入。
+func (w *Worker) handleSigningFailure(ctx context.Context, sweepID int64, err error) error {
+	w.signingMu.Lock()
+	w.signingFailures[sweepID]++
+	count := w.signingFailures[sweepID]
+	alreadyPaused := w.pausedSigning[sweepID]
+	if count >= maxSigningRetryCount {
+		w.pausedSigning[sweepID] = true
+	}
+	w.signingMu.Unlock()
+	if count >= maxSigningRetryCount && !alreadyPaused {
+		w.recordError(ctx, sweepID, "signing", "GAS_TOPUP_SIGNING_MANUAL_INTERVENTION", err)
+	}
+	return err
 }
 
 // broadcast 优先查询原交易 Receipt，并始终重播数据库中的同一份 raw_tx。

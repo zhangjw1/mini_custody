@@ -344,7 +344,6 @@ func newMockRPC(t *testing.T) *mockRPC {
 		blockNumber: "0x2a",
 	}
 	mock.server = httptest.NewServer(http.HandlerFunc(mock.handler))
-	mock.server.Start()
 	t.Cleanup(mock.server.Close)
 	return mock
 }
@@ -482,5 +481,57 @@ func mockResult(method, chainID, blockNumberValue string) any {
 		return result
 	default:
 		return nil
+	}
+}
+
+// TestClientSwitchesEndpointOnConnectionRefused 验证主端点返回 connection refused 时自动切换备用端点。
+func TestClientSwitchesEndpointOnConnectionRefused(t *testing.T) {
+	primary := newMockRPC(t)
+	fallback := newMockRPC(t)
+	client := newTestClientWithPolicy(t, primary.URL(), fallback.URL(), RetryPolicy{MaxAttempts: 2})
+	defer client.Close()
+
+	if _, err := client.BlockNumber(context.Background()); err != nil {
+		t.Fatalf("initial BlockNumber() error = %v", err)
+	}
+	primary.server.Close()
+
+	height, err := client.BlockNumber(context.Background())
+	if err != nil || height != 42 {
+		t.Fatalf("BlockNumber() after primary down = %d, error = %v", height, err)
+	}
+	if got := client.ActiveEndpoint(); got != "fallback" {
+		t.Fatalf("ActiveEndpoint() = %q, want fallback", got)
+	}
+}
+
+// TestClientDoesNotDegradeOnNotFoundOrBusinessRevert 验证 NotFound 与业务 revert 不改变健康状态也不切换端点。
+func TestClientDoesNotDegradeOnNotFoundOrBusinessRevert(t *testing.T) {
+	primary := newMockRPC(t)
+	fallback := newMockRPC(t)
+	client := newTestClientWithPolicy(t, primary.URL(), fallback.URL(), RetryPolicy{MaxAttempts: 2})
+	defer client.Close()
+
+	primary.results["eth_getTransactionReceipt"] = nil
+	_, err := client.TransactionReceipt(context.Background(), common.Hash{})
+	if !errors.Is(err, ethereum.NotFound) {
+		t.Fatalf("TransactionReceipt() err = %v, want ethereum.NotFound", err)
+	}
+	if snap := client.Snapshot(); snap.Status != "HEALTHY" || snap.LastError != "" {
+		t.Fatalf("Snapshot after NotFound = %+v, want HEALTHY", snap)
+	}
+	if fallback.calls("eth_getTransactionReceipt") != 0 {
+		t.Fatalf("fallback should not be called on NotFound, got %d", fallback.calls("eth_getTransactionReceipt"))
+	}
+
+	primary.failRPC("eth_estimateGas", -32000, "execution reverted", 1)
+	if _, err := client.EstimateGas(context.Background(), ethereum.CallMsg{}); err == nil {
+		t.Fatal("expected execution reverted error")
+	}
+	if snap := client.Snapshot(); snap.Status != "HEALTHY" || snap.LastError != "" {
+		t.Fatalf("Snapshot after business revert = %+v, want HEALTHY", snap)
+	}
+	if fallback.calls("eth_estimateGas") != 0 {
+		t.Fatalf("fallback should not be called on business revert, got %d", fallback.calls("eth_estimateGas"))
 	}
 }

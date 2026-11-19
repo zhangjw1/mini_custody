@@ -405,7 +405,7 @@ func (c *Client) ActiveEndpoint() string {
 	return c.endpoints[c.active].alias
 }
 
-// invoke 对单个 EVM RPC 操作执行重试和主备切换。
+// invoke 对单个 EVM RPC 操作执行错误分类、同端点重试和主备切换。
 func (c *Client) invoke(ctx context.Context, call func(*ethclient.Client) error) error {
 	if c == nil || len(c.endpoints) == 0 {
 		return errors.New("没有可用的 RPC 端点")
@@ -415,6 +415,7 @@ func (c *Client) invoke(ctx context.Context, call func(*ethclient.Client) error)
 	for _, index := range order {
 		if err := c.validateEndpoint(ctx, index); err != nil {
 			lastErr = err
+			c.markFailure(err)
 			continue
 		}
 		for attempt := 1; attempt <= c.retry.MaxAttempts; attempt++ {
@@ -423,10 +424,16 @@ func (c *Client) invoke(ctx context.Context, call func(*ethclient.Client) error)
 				c.markSuccess(index)
 				return nil
 			}
+			if isBusinessError(err) {
+				return err
+			}
+			if isLogRangeTooLarge(err) {
+				return c.wrapError(index, err)
+			}
 			lastErr = c.wrapError(index, err)
 			c.markFailure(lastErr)
-			if !retryable(err) {
-				return lastErr
+			if !retryableOnSameEndpoint(err) {
+				break
 			}
 			if attempt == c.retry.MaxAttempts {
 				break
@@ -584,16 +591,49 @@ func (c *Client) snapshotLocked() HealthSnapshot {
 	}
 }
 
-// retryable 判断错误是否属于可安全重试的临时故障。
-func retryable(err error) bool {
-	if errors.Is(err, context.Canceled) {
+// isBusinessError 判断错误是否为链上业务结果（如 NotFound、revert、nonce 冲突），不应切换端点或标为 DEGRADED。
+func isBusinessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ethereum.NotFound) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var httpErr rpc.HTTPError
+	if errors.As(err, &httpErr) {
+		return false
+	}
+	var pointerHTTPError *rpc.HTTPError
+	if errors.As(err, &pointerHTTPError) && pointerHTTPError != nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return false
+	}
+	var rpcErr rpc.Error
+	if errors.As(err, &rpcErr) {
+		if rpcErr.ErrorCode() == -32002 || rpcErr.ErrorCode() == -32005 {
+			return false
+		}
+		msg := strings.ToLower(rpcErr.Error())
+		for _, infraFragment := range []string{"rate limit", "too many requests", "timeout", "timed out", "try again", "overloaded", "unavailable"} {
+			if strings.Contains(msg, infraFragment) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// retryableOnSameEndpoint 判断端点故障是否适合在当前端点退避重试（否则直接切换备用端点）。
+func retryableOnSameEndpoint(err error) bool {
+	if errors.Is(err, context.Canceled) || isLogRangeTooLarge(err) || isBusinessError(err) {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
-	}
-	if isLogRangeTooLarge(err) {
-		return false
 	}
 	var httpErr rpc.HTTPError
 	if errors.As(err, &httpErr) {

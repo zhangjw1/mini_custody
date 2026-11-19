@@ -648,7 +648,7 @@ func (s *Store) ReleaseWithdrawal(ctx context.Context, withdrawalID int64, error
 		}
 		return item, false, nil
 	}
-	if item.Status != WithdrawalCreated && item.Status != WithdrawalSigning {
+	if item.Nonce != nil || item.Status != WithdrawalCreated {
 		return Withdrawal{}, false, ErrUnsafeRelease
 	}
 	total := new(big.Int).Add(item.AmountWei, item.ReservedFeeWei)

@@ -293,3 +293,71 @@ D1 先在 docs/development/backend-remediation-plan.md 的 D1 小节写下采用
 只做等价重构，不改变任何行为。每完成一组抽取就运行一次全部测试。
 每个重构单独提交，方便回滚。
 ```
+
+---
+
+## 8. B2 设计：EVM 卡单检测、重播与 Gas 加价替换
+
+> 本设计覆盖 4 条 EVM 出款/运维链路：`withdrawals`（ETH 提币）、`token_withdrawals`（ERC-20 提币）、`token_sweeps`（Token 归集）、`internal_transfers`（Gas Station 补气）。
+
+### 8.1 目标与约束
+- 同一个 `nonce` 允许生成多笔替换交易（RBF / EIP-1559 Replacement），所有候选 `tx_hash` 都必须持久化在数据库，确认时只要任一候选交易上链打包即完成结算并按**实际成交的那笔交易**结算 `actual_fee_wei`。
+- 严禁更换 `nonce` 重发（会造成双花或卡单永久锁死），严禁在未确认所有候选 `tx_hash` 均未上链前释放余额。
+- 当链上 `PendingNonce / LatestNonce` 已越过本单 `nonce`，且所有候选 `tx_hash` 均未拿到成功 Receipt 时，必须转入 `MANUAL_REVIEW` 人工核查状态。
+
+### 8.2 状态机设计
+
+```text
+SIGNED ──(首次广播)──> BROADCASTED ──(拿到 Receipt)──> CONFIRMING ──> COMPLETED / FAILED
+  │                        │
+  │ (超时无 Receipt)       │ (超过阈值 B2_REBROADCAST_AFTER)
+  ▼                        ▼
+BROADCAST_UNKNOWN ──> 重播原 raw_tx（保持相同 tx_hash）
+                           │
+                           │ (再次超过阈值 B2_BUMP_AFTER，且未达最大替换次数 B2_MAX_BUMPS)
+                           ▼
+                      以同一 nonce 重新签名：
+                      tip = max(prevTip * 1.15, suggestTip)
+                      feeCap = max(prevFeeCap * 1.15, 2*baseFee + tip)
+                      （不超过 B2_MAX_FEE_CAP_WEI / 预留额度限制）
+                      追加写入候选 tx_hash 表，更新主表最新 raw_tx/tx_hash -> 继续 BROADCASTED 轮询
+                           │
+                           │ (若 chain LatestNonce > item.Nonce 且所有候选 tx_hash Receipt 均 NotFound)
+                           ▼
+                      MANUAL_REVIEW（写 worker_errors，停止自动重发与释放，等待人工处理）
+```
+
+### 8.3 数据库表结构变更（预留迁移号 `000007_evm_tx_replacement`，注意连续递增）
+1. 为 4 张业务表增加列：
+   - `broadcasted_at TIMESTAMPTZ`（首次广播时间戳，重播与加价计时起点）
+   - `last_broadcast_at TIMESTAMPTZ`（最近一次广播/重播时间）
+   - `bump_count INTEGER NOT NULL DEFAULT 0`（已执行加价替换次数）
+   - 将 4 张表的 `status` CHECK 约束补充 `'MANUAL_REVIEW'`。
+2. 新增候选交易历史表 `evm_tx_attempts`（统一记录 4 类业务发送过的全部版本签名交易，避免原 `tx_hash` 被覆盖后丢失）：
+   - `id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY`
+   - `business_type TEXT NOT NULL`（`'WITHDRAWAL' | 'TOKEN_WITHDRAWAL' | 'TOKEN_SWEEP' | 'INTERNAL_TRANSFER'`）
+   - `business_id BIGINT NOT NULL`
+   - `from_address TEXT NOT NULL`
+   - `nonce NUMERIC(20, 0) NOT NULL`
+   - `attempt_no INTEGER NOT NULL`
+   - `tx_hash TEXT NOT NULL`
+   - `raw_tx BYTEA NOT NULL`
+   - `max_fee_per_gas_wei NUMERIC(78, 0) NOT NULL`
+   - `max_priority_fee_per_gas_wei NUMERIC(78, 0) NOT NULL`
+   - `gas_limit BIGINT NOT NULL`
+   - `created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`
+   - 约束：`UNIQUE (business_type, business_id, attempt_no)`、`UNIQUE (tx_hash)`。
+   - 同时为所有新表和新列添加中文注释，并把 `evm_tx_attempts` 加入 `migrations/verify.go`。
+
+### 8.4 配置项设计（`internal/config/config.go`）
+- `EVM_REBROADCAST_AFTER`（默认 `60s`）：`BROADCASTED` 无 Receipt 后触发原 `raw_tx` 重播的阈值。
+- `EVM_BUMP_AFTER`（默认 `180s`）：重播仍卡在 mempool 后触发加价替换的阈值。
+- `EVM_BUMP_PERCENT`（默认 `15`，校验 `>= 10` 满足节点 10% 最小替换门槛）。
+- `EVM_MAX_BUMPS`（默认 `3`）：单笔交易最大加价替换次数。
+- `EVM_MAX_FEE_CAP_GWEI`（默认 `100`）：加价后的硬顶上限，防止 Gas 异常飙升耗尽热钱包资金。
+
+### 8.5 费用与恢复流程要点
+1. **ETH 提币资金约束**：由于用户预留总扣款已在 `ReserveWithdrawal` 锁定为 `amount_wei + reserved_fee_wei`，加价后的 `gas_limit * new_max_fee_per_gas` 不得超过 `item.ReservedFeeWei`（除非在加价前先对 `asset_balances` 原子增加预留费，若用户可用余额不足则不再加价，仅继续重播或转人工）。
+2. **多候选 Hash 确认扫描**：`confirm()` 遍历该笔业务对应的全部 `evm_tx_attempts` 记录（倒序优先查最新加价交易），任一 `tx_hash` 查到 Receipt 即视为该交易最终上链，回写主表最终 `tx_hash` 并按其 `GasUsed * EffectiveGasPrice` 结算实际费用。
+3. **Nonce 越过检测**：发送或查询时若遇到 `nonce too low`，或者通过 `PendingNonceAt` / `NonceAt`（confirmed nonce）发现链上已确认 nonce `> item.Nonce`，先遍历检查全部 `evm_tx_attempts` 的 Receipt；若全部为 `ethereum.NotFound`，说明同 nonce 已被外部交易占用或丢失，立即迁移至 `MANUAL_REVIEW` 并写入 `worker_errors`。
+

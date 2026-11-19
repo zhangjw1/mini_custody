@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	ethereum "github.com/ethereum/go-ethereum"
@@ -19,7 +20,10 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 )
 
-const workerBatchSize = 100
+const (
+	workerBatchSize      = 100
+	maxSigningRetryCount = 5
+)
 
 var (
 	ErrHotWalletTokenInsufficient = errors.New("平台热钱包 Token 库存不足，任务保持等待并将在下轮重试")
@@ -67,12 +71,15 @@ type WorkerConfig struct {
 
 // Worker 负责平台热钱包 Token 提币签名、幂等广播、恢复和账本结算。
 type Worker struct {
-	chain    Chain
-	contract TokenContract
-	store    WorkerStore
-	keys     wallet.KeyProvider
-	logger   *slog.Logger
-	config   WorkerConfig
+	chain           Chain
+	contract        TokenContract
+	store           WorkerStore
+	keys            wallet.KeyProvider
+	logger          *slog.Logger
+	config          WorkerConfig
+	signingMu       sync.Mutex
+	signingFailures map[int64]int
+	pausedSigning   map[int64]bool
 }
 
 // NewWorker 创建并校验 Token 提币 Worker。
@@ -84,7 +91,11 @@ func NewWorker(chain Chain, contract TokenContract, store WorkerStore, keys wall
 		return nil, errors.New("Token 提币 Worker 配置无效")
 	}
 	cfg.ChainID = new(big.Int).Set(cfg.ChainID)
-	return &Worker{chain: chain, contract: contract, store: store, keys: keys, logger: logger, config: cfg}, nil
+	return &Worker{
+		chain: chain, contract: contract, store: store, keys: keys, logger: logger, config: cfg,
+		signingFailures: make(map[int64]int),
+		pausedSigning:   make(map[int64]bool),
+	}, nil
 }
 
 // Run 周期推进全部可恢复 Token 提币任务。
@@ -111,8 +122,13 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, item := range items {
+		if w.isSigningPaused(item.ID) {
+			continue
+		}
 		if err := w.Process(ctx, item.ID); err != nil {
-			w.recordError(ctx, item.ID, "process", "TOKEN_WITHDRAWAL_PROCESS_FAILED", err)
+			if !w.isSigningPaused(item.ID) {
+				w.recordError(ctx, item.ID, "process", "TOKEN_WITHDRAWAL_PROCESS_FAILED", err)
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -158,19 +174,24 @@ func (w *Worker) prepare(ctx context.Context, item postgres.TokenWithdrawal) err
 	return w.sign(ctx, item)
 }
 
-// sign 再次复核库存和 Gas，签署标准 transfer，并在广播前保存原始交易。
+// sign 在已分配平台 Nonce 后直接构建并持久化交易，不再因库存/余额波动无限阻断。
 func (w *Worker) sign(ctx context.Context, item postgres.TokenWithdrawal) error {
 	if item.Nonce == nil || !item.Nonce.IsUint64() || item.AmountUnits == nil || item.AmountUnits.Sign() <= 0 {
-		return errors.New("Token 提币 Nonce 或金额无效")
+		return w.handleSigningFailure(ctx, item.ID, errors.New("Token 提币 Nonce 或金额无效"))
 	}
-	platform, fee, err := w.checkBalancesAndQuote(ctx, item)
+	platform, err := w.platformFor(ctx, item)
 	if err != nil {
-		return err
+		return w.handleSigningFailure(ctx, item.ID, err)
 	}
+	from := common.HexToAddress(platform.Address)
 	to := common.HexToAddress(item.ToAddress)
+	fee, err := estimateFee(ctx, w.chain, w.contract, from, to, item.AmountUnits)
+	if err != nil {
+		return w.handleSigningFailure(ctx, item.ID, err)
+	}
 	calldata, err := w.contract.EncodeTransfer(to, item.AmountUnits)
 	if err != nil {
-		return fmt.Errorf("编码 Token 提币 calldata 失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("编码 Token 提币 calldata 失败：%w", err))
 	}
 	contractAddress := w.contract.Address()
 	transaction := types.NewTx(&types.DynamicFeeTx{
@@ -179,31 +200,63 @@ func (w *Worker) sign(ctx context.Context, item postgres.TokenWithdrawal) error 
 		Value: new(big.Int), Data: calldata,
 	})
 	if err := w.validateTransaction(transaction, item); err != nil {
-		return err
+		return w.handleSigningFailure(ctx, item.ID, err)
 	}
 	signed, err := w.keys.SignTx(ctx, platform.DerivationPath, transaction, w.config.ChainID)
 	if err != nil {
-		return fmt.Errorf("签署 Token 提币交易失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("签署 Token 提币交易失败：%w", err))
 	}
 	sender, err := types.Sender(types.LatestSignerForChainID(w.config.ChainID), signed)
-	if err != nil || sender != common.HexToAddress(platform.Address) {
-		return errors.New("Token 提币签名地址与平台热钱包不一致")
+	if err != nil || sender != from {
+		return w.handleSigningFailure(ctx, item.ID, errors.New("Token 提币签名地址与平台热钱包不一致"))
 	}
 	if err := w.validateTransaction(signed, item); err != nil {
-		return err
+		return w.handleSigningFailure(ctx, item.ID, err)
 	}
 	raw, err := signed.MarshalBinary()
 	if err != nil {
-		return fmt.Errorf("编码已签名 Token 提币交易失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("编码已签名 Token 提币交易失败：%w", err))
 	}
 	item, _, err = w.store.SaveSignedTokenWithdrawal(ctx, postgres.SignedTokenWithdrawal{
 		WithdrawalID: item.ID, GasLimit: fee.GasLimit, MaxFeePerGasWei: fee.MaxFeePerGasWei,
 		MaxPriorityFeePerGasWei: fee.MaxPriorityFeePerGasWei, RawTx: raw, TxHash: signed.Hash().Hex(),
 	})
 	if err != nil {
-		return fmt.Errorf("持久化已签名 Token 提币失败：%w", err)
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("持久化已签名 Token 提币失败：%w", err))
 	}
+	w.clearSigningFailure(item.ID)
 	return w.broadcast(ctx, item)
+}
+
+// isSigningPaused 判断指定 Token 提币在分配 Nonce 后是否暂停自动重试。
+func (w *Worker) isSigningPaused(id int64) bool {
+	w.signingMu.Lock()
+	defer w.signingMu.Unlock()
+	return w.pausedSigning[id]
+}
+
+// clearSigningFailure 清理已成功签名的 Token 提币失败计数。
+func (w *Worker) clearSigningFailure(id int64) {
+	w.signingMu.Lock()
+	delete(w.signingFailures, id)
+	delete(w.pausedSigning, id)
+	w.signingMu.Unlock()
+}
+
+// handleSigningFailure 统计分配 Nonce 后的连续签名失败次数，超限后写人工介入错误并暂停自动重复写入。
+func (w *Worker) handleSigningFailure(ctx context.Context, id int64, err error) error {
+	w.signingMu.Lock()
+	w.signingFailures[id]++
+	count := w.signingFailures[id]
+	alreadyPaused := w.pausedSigning[id]
+	if count >= maxSigningRetryCount {
+		w.pausedSigning[id] = true
+	}
+	w.signingMu.Unlock()
+	if count >= maxSigningRetryCount && !alreadyPaused {
+		w.recordError(ctx, id, "signing", "TOKEN_SIGNING_MANUAL_INTERVENTION", err)
+	}
+	return err
 }
 
 // broadcast 复核数据库原始交易并始终重播同一 tx_hash，避免重启后重复出款。

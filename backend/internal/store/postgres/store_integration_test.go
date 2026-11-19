@@ -426,6 +426,52 @@ func TestIntegrationManagedUserCreationAndDisable(t *testing.T) {
 	}
 }
 
+// TestIntegrationReleaseWithdrawalRejectsAllocatedNonce 验证 B1：已分配 Nonce 的提币调用 ReleaseWithdrawal 会被拒绝，并验证错误去重累加。
+func TestIntegrationReleaseWithdrawalRejectsAllocatedNonce(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	user, address := firstDemoWallet(t, store)
+	fundWallet(t, store, user.ID, address.ID, 600, 10_000)
+
+	item, _, err := store.ReserveWithdrawal(ctx, withdrawalRequest("b1-nonce-release", user.ID, address.ID, 2_000, 500))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocated, _, err := store.AllocateWithdrawalNonce(ctx, item.ID, 0)
+	if err != nil || allocated.Nonce == nil || allocated.Status != WithdrawalSigning {
+		t.Fatalf("AllocateWithdrawalNonce() = %+v, err=%v", allocated, err)
+	}
+	if _, _, err := store.ReleaseWithdrawal(ctx, item.ID, "TEST", "should fail"); !errors.Is(err, ErrUnsafeRelease) {
+		t.Fatalf("ReleaseWithdrawal() on allocated nonce err = %v, want ErrUnsafeRelease", err)
+	}
+	// 验证钱包 next_nonce 未回退。
+	addrAfter, err := store.WalletAddressByUser(ctx, user.ID)
+	if err != nil || addrAfter.NextNonce.Cmp(big.NewInt(1)) != 0 {
+		t.Fatalf("next_nonce = %v, err=%v, want 1", addrAfter.NextNonce, err)
+	}
+
+	// 验证 RecordWorkerError 合并累加同一错误而不生成重复行。
+	refID := item.ID
+	for i := 0; i < 3; i++ {
+		if _, err := store.RecordWorkerError(ctx, WorkerError{
+			Worker: "withdrawal-worker", Stage: "signing", ReferenceType: "WITHDRAWAL",
+			ReferenceID: &refID, ErrorCode: "SIGNING_MANUAL_INTERVENTION", ErrorMessage: "签名前异常",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rowCount, retryCount int
+	if err := store.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(retry_count), 0)
+		FROM worker_errors
+		WHERE reference_type = 'WITHDRAWAL' AND reference_id = $1 AND error_code = 'SIGNING_MANUAL_INTERVENTION'`,
+		item.ID,
+	).Scan(&rowCount, &retryCount); err != nil || rowCount != 1 || retryCount != 2 {
+		t.Fatalf("worker_errors rowCount=%d retryCount=%d err=%v, want 1 and 2", rowCount, retryCount, err)
+	}
+}
+
 // TestIntegrationDepositIsIdempotentAndCreditsOnce 验证充值发现和入账的数据库幂等性。
 func TestIntegrationDepositIsIdempotentAndCreditsOnce(t *testing.T) {
 	store, cleanup := integrationStore(t)

@@ -610,16 +610,45 @@ func advanceCheckpoint(ctx context.Context, tx pgx.Tx, checkpoint ChainCheckpoin
 	return nil
 }
 
-// RecordWorkerError 保存经过清洗的后台任务错误信息。
+// RecordWorkerError 合并或写入经过清洗的后台任务错误信息，避免同错误每轮重复堆积。
 func (s *Store) RecordWorkerError(ctx context.Context, item WorkerError) (int64, error) {
+	worker := strings.TrimSpace(item.Worker)
+	stage := strings.TrimSpace(item.Stage)
+	refType := strings.TrimSpace(item.ReferenceType)
+	errCode := strings.TrimSpace(item.ErrorCode)
+	errMsg := strings.TrimSpace(item.ErrorMessage)
+
 	var id int64
+	updateErr := s.pool.QueryRow(ctx, `
+		UPDATE worker_errors
+		SET error_message = $5,
+		    retry_count = retry_count + 1,
+		    last_occurred_at = CURRENT_TIMESTAMP
+		WHERE id = (
+			SELECT id FROM worker_errors
+			WHERE worker = $1 AND stage = $2
+			  AND COALESCE(reference_type, '') = $3
+			  AND COALESCE(reference_id, 0) = COALESCE($4, 0)
+			  AND error_code = $6
+			ORDER BY id DESC
+			LIMIT 1
+		)
+		RETURNING id`,
+		worker, stage, refType, item.ReferenceID, errMsg, errCode,
+	).Scan(&id)
+	if updateErr == nil {
+		return id, nil
+	}
+	if !errors.Is(updateErr, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("更新后台任务错误失败：%w", updateErr)
+	}
+
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO worker_errors (
 			worker, stage, reference_type, reference_id, error_code, error_message, retry_count
 		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7)
 		RETURNING id`,
-		strings.TrimSpace(item.Worker), strings.TrimSpace(item.Stage), strings.TrimSpace(item.ReferenceType),
-		item.ReferenceID, strings.TrimSpace(item.ErrorCode), strings.TrimSpace(item.ErrorMessage), item.RetryCount,
+		worker, stage, refType, item.ReferenceID, errCode, errMsg, item.RetryCount,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("记录后台任务错误失败：%w", err)
