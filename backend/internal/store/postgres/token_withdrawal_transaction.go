@@ -43,6 +43,7 @@ type TokenWithdrawalSettlement struct {
 	Confirmations int64
 	ErrorCode     string
 	ErrorMessage  string
+	TxHash        string
 }
 
 // ReserveTokenWithdrawal 幂等创建 Token 提币并原子占用用户 Token 可用余额。
@@ -237,6 +238,10 @@ func (s *Store) SaveSignedTokenWithdrawal(ctx context.Context, signed SignedToke
 	if item.Status != WithdrawalSigning || item.Nonce == nil {
 		return TokenWithdrawal{}, false, ErrInvalidState
 	}
+	var fromAddress string
+	if err := tx.QueryRow(ctx, `SELECT address FROM platform_wallets WHERE id = $1`, item.PlatformWalletID).Scan(&fromAddress); err != nil {
+		return TokenWithdrawal{}, false, fmt.Errorf("查询 Token 提币平台钱包地址失败：%w", mapNotFound(err))
+	}
 	item, err = s.scanTokenWithdrawal(tx.QueryRow(ctx, `
 		UPDATE token_withdrawals SET gas_limit = $2, max_fee_per_gas_wei = $3::numeric,
 			max_priority_fee_per_gas_wei = $4::numeric, raw_tx = $5, tx_hash = $6,
@@ -247,6 +252,20 @@ func (s *Store) SaveSignedTokenWithdrawal(ctx context.Context, signed SignedToke
 	))
 	if err != nil {
 		return TokenWithdrawal{}, false, fmt.Errorf("保存已签名 Token 提币失败：%w", err)
+	}
+	if err := insertEVMTxAttemptInTx(ctx, tx, EVMTxAttempt{
+		BusinessType:            EVMBusinessTokenWithdrawal,
+		BusinessID:              item.ID,
+		FromAddress:             fromAddress,
+		Nonce:                   item.Nonce,
+		AttemptNo:               1,
+		TxHash:                  signed.TxHash,
+		RawTx:                   signed.RawTx,
+		MaxFeePerGasWei:         signed.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: signed.MaxPriorityFeePerGasWei,
+		GasLimit:                int64(signed.GasLimit),
+	}); err != nil {
+		return TokenWithdrawal{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return TokenWithdrawal{}, false, fmt.Errorf("提交 Token 提币签名保存事务失败：%w", err)
@@ -275,14 +294,26 @@ func (s *Store) TransitionTokenWithdrawal(ctx context.Context, withdrawalID int6
 		return item, nil
 	}
 	allowed := (item.Status == WithdrawalSigned && target == WithdrawalBroadcasted) ||
-		(item.Status == WithdrawalBroadcasted && target == WithdrawalConfirming)
+		(item.Status == WithdrawalBroadcasted && target == WithdrawalConfirming) ||
+		((item.Status == WithdrawalSigned || item.Status == WithdrawalBroadcasted || item.Status == WithdrawalConfirming) && target == WithdrawalManualReview)
 	if !allowed {
 		return TokenWithdrawal{}, ErrInvalidState
 	}
-	item, err = s.scanTokenWithdrawal(tx.QueryRow(ctx, `
-		UPDATE token_withdrawals SET status = $2, updated_at = CURRENT_TIMESTAMP
-		WHERE id = $1 RETURNING `+tokenWithdrawalColumns, withdrawalID, target,
-	))
+	if target == WithdrawalBroadcasted {
+		item, err = s.scanTokenWithdrawal(tx.QueryRow(ctx, `
+			UPDATE token_withdrawals SET
+				status = $2,
+				broadcasted_at = COALESCE(broadcasted_at, CURRENT_TIMESTAMP),
+				last_broadcast_at = CURRENT_TIMESTAMP,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 RETURNING `+tokenWithdrawalColumns, withdrawalID, target,
+		))
+	} else {
+		item, err = s.scanTokenWithdrawal(tx.QueryRow(ctx, `
+			UPDATE token_withdrawals SET status = $2, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 RETURNING `+tokenWithdrawalColumns, withdrawalID, target,
+		))
+	}
 	if err != nil {
 		return TokenWithdrawal{}, fmt.Errorf("迁移 Token 提币状态失败：%w", err)
 	}
@@ -377,12 +408,15 @@ func (s *Store) FinalizeTokenWithdrawal(ctx context.Context, settlement TokenWit
 	); err != nil {
 		return TokenWithdrawal{}, false, fmt.Errorf("写入 Token 提币结算流水失败：%w", err)
 	}
+	matchedTxHash := strings.ToLower(strings.TrimSpace(settlement.TxHash))
 	item, err = s.scanTokenWithdrawal(tx.QueryRow(ctx, `
 		UPDATE token_withdrawals SET actual_fee_wei = $2::numeric, block_number = $3,
 			confirmations = $4, status = $5, error_code = NULLIF($6, ''),
-			error_message = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP
+			error_message = NULLIF($7, ''),
+			tx_hash = COALESCE(NULLIF($8, ''), tx_hash),
+			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+tokenWithdrawalColumns, item.ID, settlement.ActualFeeWei.String(),
-		settlement.BlockNumber, settlement.Confirmations, status, errorCode, errorMessage,
+		settlement.BlockNumber, settlement.Confirmations, status, errorCode, errorMessage, matchedTxHash,
 	))
 	if err != nil {
 		return TokenWithdrawal{}, false, fmt.Errorf("保存 Token 提币结算结果失败：%w", err)

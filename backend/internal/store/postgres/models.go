@@ -42,6 +42,7 @@ const (
 	TokenSweepConfirming     = "CONFIRMING"
 	TokenSweepCompleted      = "COMPLETED"
 	TokenSweepFailed         = "FAILED"
+	TokenSweepManualReview   = "MANUAL_REVIEW"
 	BTCSweepCreated          = "CREATED"
 	BTCSweepSigning          = "SIGNING"
 	BTCSweepSigned           = "SIGNED"
@@ -54,14 +55,15 @@ const (
 )
 
 const (
-	InternalTransferGasTopup = "GAS_TOPUP"
-	InternalTransferCreated  = "CREATED"
-	InternalTransferSigning  = "SIGNING"
-	InternalTransferSigned   = "SIGNED"
-	InternalTransferSent     = "BROADCASTED"
-	InternalTransferChecking = "CONFIRMING"
-	InternalTransferDone     = "COMPLETED"
-	InternalTransferFailed   = "FAILED"
+	InternalTransferGasTopup     = "GAS_TOPUP"
+	InternalTransferCreated      = "CREATED"
+	InternalTransferSigning      = "SIGNING"
+	InternalTransferSigned       = "SIGNED"
+	InternalTransferSent         = "BROADCASTED"
+	InternalTransferChecking     = "CONFIRMING"
+	InternalTransferDone         = "COMPLETED"
+	InternalTransferFailed       = "FAILED"
+	InternalTransferManualReview = "MANUAL_REVIEW"
 )
 
 const (
@@ -74,6 +76,14 @@ const (
 	WithdrawalConfirming       = "CONFIRMING"
 	WithdrawalCompleted        = "COMPLETED"
 	WithdrawalFailed           = "FAILED"
+	WithdrawalManualReview     = "MANUAL_REVIEW"
+)
+
+const (
+	EVMBusinessWithdrawal       = "WITHDRAWAL"
+	EVMBusinessTokenWithdrawal  = "TOKEN_WITHDRAWAL"
+	EVMBusinessTokenSweep       = "TOKEN_SWEEP"
+	EVMBusinessInternalTransfer = "INTERNAL_TRANSFER"
 )
 
 var (
@@ -204,6 +214,9 @@ type Withdrawal struct {
 	Status                  string
 	ErrorCode               string
 	ErrorMessage            string
+	BroadcastedAt           *time.Time
+	LastBroadcastAt         *time.Time
+	BumpCount               int32
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -280,6 +293,9 @@ type TokenSweep struct {
 	Status                  string
 	ErrorCode               string
 	ErrorMessage            string
+	BroadcastedAt           *time.Time
+	LastBroadcastAt         *time.Time
+	BumpCount               int32
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -333,6 +349,9 @@ type InternalTransfer struct {
 	Status                  string
 	ErrorCode               string
 	ErrorMessage            string
+	BroadcastedAt           *time.Time
+	LastBroadcastAt         *time.Time
+	BumpCount               int32
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -357,6 +376,9 @@ type TokenWithdrawal struct {
 	Status                  string
 	ErrorCode               string
 	ErrorMessage            string
+	BroadcastedAt           *time.Time
+	LastBroadcastAt         *time.Time
+	BumpCount               int32
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -374,4 +396,20 @@ type TransactionRecord struct {
 	Status        string
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+}
+
+// EVMTxAttempt 描述同一笔 EVM 业务交易在相同 Nonce 下的历史广播与替换版本。
+type EVMTxAttempt struct {
+	ID                      int64
+	BusinessType            string
+	BusinessID              int64
+	FromAddress             string
+	Nonce                   *big.Int
+	AttemptNo               int32
+	TxHash                  string
+	RawTx                   []byte
+	MaxFeePerGasWei         *big.Int
+	MaxPriorityFeePerGasWei *big.Int
+	GasLimit                int64
+	CreatedAt               time.Time
 }

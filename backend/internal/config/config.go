@@ -84,6 +84,15 @@ type HTTPConfig struct {
 	IdleTimeout  time.Duration
 }
 
+// EVMReplacementConfig 描述 EVM 卡单重播与 Gas 加价替换策略参数。
+type EVMReplacementConfig struct {
+	RebroadcastAfter time.Duration
+	BumpAfter        time.Duration
+	BumpPercent      uint64
+	MaxBumps         int
+	MaxFeeCapWei     *big.Int
+}
+
 type Config struct {
 	AppEnv                 string
 	HTTPAddr               string
@@ -104,6 +113,7 @@ type Config struct {
 	SepoliaScanInterval    time.Duration
 	SepoliaScanBatchSize   uint64
 	SepoliaExplorerBaseURL string
+	EVMReplacement         EVMReplacementConfig
 	ERC20                  ERC20Config
 	PlatformWallet         PlatformWalletConfig
 	Bitcoin                BitcoinConfig
@@ -175,6 +185,15 @@ func load(requireCustody bool) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	evmMaxBumps, err := nonNegativeIntOrDefault("EVM_MAX_BUMPS", 3)
+	if err != nil {
+		return Config{}, err
+	}
+	evmMaxFeeCapGwei := bigIntOrDefault("EVM_MAX_FEE_CAP_GWEI", "100")
+	var evmMaxFeeCapWei *big.Int
+	if evmMaxFeeCapGwei != nil && evmMaxFeeCapGwei.Sign() > 0 {
+		evmMaxFeeCapWei = new(big.Int).Mul(evmMaxFeeCapGwei, big.NewInt(1_000_000_000))
+	}
 
 	cfg := Config{
 		AppEnv:   envOrDefault("APP_ENV", "development"),
@@ -207,6 +226,13 @@ func load(requireCustody bool) (Config, error) {
 		SepoliaScanInterval:    durationOrDefault("SEPOLIA_SCAN_INTERVAL", 12*time.Second),
 		SepoliaScanBatchSize:   uint64OrDefault("SEPOLIA_SCAN_BATCH_SIZE", 20),
 		SepoliaExplorerBaseURL: strings.TrimRight(envOrDefault("SEPOLIA_EXPLORER_BASE_URL", "https://sepolia.etherscan.io"), "/"),
+		EVMReplacement: EVMReplacementConfig{
+			RebroadcastAfter: durationOrDefault("EVM_REBROADCAST_AFTER", 60*time.Second),
+			BumpAfter:        durationOrDefault("EVM_BUMP_AFTER", 180*time.Second),
+			BumpPercent:      uint64OrDefault("EVM_BUMP_PERCENT", 15),
+			MaxBumps:         evmMaxBumps,
+			MaxFeeCapWei:     evmMaxFeeCapWei,
+		},
 		ERC20: ERC20Config{
 			Enabled:         erc20Enabled,
 			ContractAddress: strings.TrimSpace(envOrDefault("ERC20_CONTRACT_ADDRESS", defaultERC20Contract)),
@@ -294,6 +320,11 @@ func (c Config) validate(requireCustody bool) error {
 	}
 	if c.SepoliaConfirmations == 0 || c.SepoliaScanInterval <= 0 || c.SepoliaScanBatchSize == 0 || c.SepoliaScanBatchSize > 100 {
 		return errors.New("Sepolia 充值扫描配置无效")
+	}
+	if c.EVMReplacement.RebroadcastAfter <= 0 || c.EVMReplacement.BumpAfter <= 0 ||
+		c.EVMReplacement.BumpPercent < 10 || c.EVMReplacement.MaxBumps < 0 ||
+		c.EVMReplacement.MaxFeeCapWei == nil || c.EVMReplacement.MaxFeeCapWei.Sign() <= 0 {
+		return errors.New("EVM 卡单重播与 Gas 加价配置无效")
 	}
 	if c.Bitcoin.Enabled {
 		if c.Bitcoin.Network != "signet" && c.Bitcoin.Network != "testnet4" {
@@ -492,4 +523,17 @@ func optionalUint64(key string) (*uint64, error) {
 		return nil, fmt.Errorf("%s 配置必须是非负整数", key)
 	}
 	return &parsed, nil
+}
+
+// nonNegativeIntOrDefault 读取非负整数配置，格式错误或负数时返回中文错误。
+func nonNegativeIntOrDefault(key string, fallback int) (int, error) {
+	value := strings.TrimSpace(settings.GetString(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s 配置必须是非负整数", key)
+	}
+	return parsed, nil
 }

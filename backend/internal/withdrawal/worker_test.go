@@ -21,16 +21,19 @@ const withdrawalTestMnemonic = "tag volcano eight thank tide danger coast health
 
 // fakeChain 提供确定性的 EIP-1559 费用、Nonce、广播和 Receipt 行为。
 type fakeChain struct {
-	header     *types.Header
-	tip        *big.Int
-	gas        uint64
-	balance    *big.Int
-	nonce      uint64
-	latest     uint64
-	receipt    *types.Receipt
-	receiptErr error
-	sendErrors []error
-	sentHashes []common.Hash
+	header         *types.Header
+	tip            *big.Int
+	gas            uint64
+	balance        *big.Int
+	nonce          uint64
+	confirmedNonce uint64
+	latest         uint64
+	receipt        *types.Receipt
+	receiptsByHash map[common.Hash]*types.Receipt
+	receiptErr     error
+	sendErrors     []error
+	sentHashes     []common.Hash
+	sentRaw        [][]byte
 }
 
 // BlockNumber 返回测试最新高度。
@@ -51,6 +54,11 @@ func (f *fakeChain) PendingNonceAt(context.Context, common.Address) (uint64, err
 	return f.nonce, nil
 }
 
+// NonceAt 返回测试链上最新已确认 Nonce。
+func (f *fakeChain) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	return f.confirmedNonce, nil
+}
+
 // SuggestGasTipCap 返回测试建议优先费。
 func (f *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) {
 	return new(big.Int).Set(f.tip), nil
@@ -62,6 +70,8 @@ func (f *fakeChain) EstimateGas(context.Context, ethereum.CallMsg) (uint64, erro
 // SendTransaction 记录广播交易哈希并按顺序返回测试错误。
 func (f *fakeChain) SendTransaction(_ context.Context, transaction *types.Transaction) error {
 	f.sentHashes = append(f.sentHashes, transaction.Hash())
+	raw, _ := transaction.MarshalBinary()
+	f.sentRaw = append(f.sentRaw, raw)
 	if len(f.sendErrors) == 0 {
 		return nil
 	}
@@ -71,7 +81,13 @@ func (f *fakeChain) SendTransaction(_ context.Context, transaction *types.Transa
 }
 
 // TransactionReceipt 返回测试 Receipt 或未找到错误。
-func (f *fakeChain) TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error) {
+func (f *fakeChain) TransactionReceipt(_ context.Context, hash common.Hash) (*types.Receipt, error) {
+	if f.receiptsByHash != nil {
+		if receipt, ok := f.receiptsByHash[hash]; ok && receipt != nil {
+			return receipt, nil
+		}
+		return nil, ethereum.NotFound
+	}
 	return f.receipt, f.receiptErr
 }
 
@@ -79,6 +95,7 @@ func (f *fakeChain) TransactionReceipt(context.Context, common.Hash) (*types.Rec
 type fakeStore struct {
 	item       postgres.Withdrawal
 	address    postgres.WalletAddress
+	attempts   []postgres.EVMTxAttempt
 	settlement *postgres.WithdrawalSettlement
 	errors     []postgres.WorkerError
 }
@@ -125,12 +142,82 @@ func (f *fakeStore) SaveSignedWithdrawal(_ context.Context, signed postgres.Sign
 	f.item.RawTx = append([]byte(nil), signed.RawTx...)
 	f.item.TxHash = signed.TxHash
 	f.item.Status = postgres.WithdrawalSigned
+	f.attempts = append([]postgres.EVMTxAttempt{{
+		BusinessType:            postgres.EVMBusinessWithdrawal,
+		BusinessID:              f.item.ID,
+		Nonce:                   f.item.Nonce,
+		AttemptNo:               int32(len(f.attempts) + 1),
+		TxHash:                  signed.TxHash,
+		RawTx:                   append([]byte(nil), signed.RawTx...),
+		MaxFeePerGasWei:         new(big.Int).Set(signed.MaxFeePerGasWei),
+		MaxPriorityFeePerGasWei: new(big.Int).Set(signed.MaxPriorityFeePerGasWei),
+		GasLimit:                int64(signed.GasLimit),
+		CreatedAt:               time.Now(),
+	}}, f.attempts...)
+	return f.item, true, nil
+}
+
+// ListEVMTxAttempts 返回按尝试序号倒序排列的测试候选交易记录。
+func (f *fakeStore) ListEVMTxAttempts(context.Context, string, int64) ([]postgres.EVMTxAttempt, error) {
+	return append([]postgres.EVMTxAttempt(nil), f.attempts...), nil
+}
+
+// ReplaceWithdrawalTx 保存测试提币加价替换交易并推进替换次数。
+func (f *fakeStore) ReplaceWithdrawalTx(_ context.Context, replacement postgres.SignedWithdrawal, newReservedFeeWei *big.Int) (postgres.Withdrawal, bool, error) {
+	if newReservedFeeWei != nil {
+		f.item.ReservedFeeWei = new(big.Int).Set(newReservedFeeWei)
+	}
+	f.item.GasLimit = int64Pointer(int64(replacement.GasLimit))
+	f.item.MaxFeePerGasWei = new(big.Int).Set(replacement.MaxFeePerGasWei)
+	f.item.MaxPriorityFeePerGasWei = new(big.Int).Set(replacement.MaxPriorityFeePerGasWei)
+	f.item.RawTx = append([]byte(nil), replacement.RawTx...)
+	f.item.TxHash = replacement.TxHash
+	f.item.BumpCount++
+	now := time.Now()
+	f.item.LastBroadcastAt = &now
+	f.attempts = append([]postgres.EVMTxAttempt{{
+		BusinessType:            postgres.EVMBusinessWithdrawal,
+		BusinessID:              f.item.ID,
+		Nonce:                   f.item.Nonce,
+		AttemptNo:               int32(len(f.attempts) + 1),
+		TxHash:                  replacement.TxHash,
+		RawTx:                   append([]byte(nil), replacement.RawTx...),
+		MaxFeePerGasWei:         new(big.Int).Set(replacement.MaxFeePerGasWei),
+		MaxPriorityFeePerGasWei: new(big.Int).Set(replacement.MaxPriorityFeePerGasWei),
+		GasLimit:                int64(replacement.GasLimit),
+		CreatedAt:               now,
+	}}, f.attempts...)
+	return f.item, true, nil
+}
+
+// TouchWithdrawalBroadcast 更新测试提币最近广播时间戳。
+func (f *fakeStore) TouchWithdrawalBroadcast(context.Context, int64) (postgres.Withdrawal, error) {
+	now := time.Now()
+	if f.item.BroadcastedAt == nil {
+		f.item.BroadcastedAt = &now
+	}
+	f.item.LastBroadcastAt = &now
+	return f.item, nil
+}
+
+// MarkWithdrawalManualReview 将测试提币转入人工核查状态。
+func (f *fakeStore) MarkWithdrawalManualReview(_ context.Context, _ int64, errorCode, errorMessage string) (postgres.Withdrawal, bool, error) {
+	f.item.Status = postgres.WithdrawalManualReview
+	f.item.ErrorCode = errorCode
+	f.item.ErrorMessage = errorMessage
 	return f.item, true, nil
 }
 
 // TransitionWithdrawal 更新内存提币状态。
 func (f *fakeStore) TransitionWithdrawal(_ context.Context, _ int64, target string) (postgres.Withdrawal, error) {
 	f.item.Status = target
+	if target == postgres.WithdrawalBroadcasted {
+		now := time.Now()
+		if f.item.BroadcastedAt == nil {
+			f.item.BroadcastedAt = &now
+		}
+		f.item.LastBroadcastAt = &now
+	}
 	return f.item, nil
 }
 
@@ -154,6 +241,9 @@ func (f *fakeStore) FinalizeWithdrawal(_ context.Context, settlement postgres.Wi
 		f.item.Status = postgres.WithdrawalCompleted
 	} else {
 		f.item.Status = postgres.WithdrawalFailed
+	}
+	if settlement.TxHash != "" {
+		f.item.TxHash = settlement.TxHash
 	}
 	return f.item, true, nil
 }
@@ -465,3 +555,108 @@ func newTestWorker(t *testing.T, chain Chain, store WorkerStore) *Worker {
 
 // int64Pointer 返回测试所需的 int64 指针。
 func int64Pointer(value int64) *int64 { return &value }
+
+// TestWorkerRebroadcastsStuckTransactionAfterThreshold 验证卡单超过重播阈值时原样重播相同 raw_tx。
+func TestWorkerRebroadcastsStuckTransactionAfterThreshold(t *testing.T) {
+	chain := defaultFakeChain()
+	store := defaultFakeStore(t, postgres.WithdrawalCreated)
+	worker := newTestWorker(t, chain, store)
+	worker.config.RebroadcastAfter = 10 * time.Second
+	worker.config.BumpAfter = time.Hour
+	worker.config.MaxBumps = 3
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("first Process() error = %v", err)
+	}
+	stale := time.Now().Add(-30 * time.Second)
+	store.item.BroadcastedAt = &stale
+	store.item.LastBroadcastAt = &stale
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("rebroadcast Process() error = %v", err)
+	}
+	if len(chain.sentHashes) != 2 || chain.sentHashes[0] != chain.sentHashes[1] || store.item.BumpCount != 0 {
+		t.Fatalf("hashes = %v, bump_count = %d", chain.sentHashes, store.item.BumpCount)
+	}
+}
+
+// TestWorkerBumpsGasAndSettlesMatchedAttempt 验证加价替换使用同 Nonce 且在原始版本上链时正确结算。
+func TestWorkerBumpsGasAndSettlesMatchedAttempt(t *testing.T) {
+	chain := defaultFakeChain()
+	store := defaultFakeStore(t, postgres.WithdrawalCreated)
+	worker := newTestWorker(t, chain, store)
+	worker.config.RebroadcastAfter = 10 * time.Second
+	worker.config.BumpAfter = 30 * time.Second
+	worker.config.BumpPercent = 15
+	worker.config.MaxBumps = 3
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	firstHash := common.HexToHash(store.item.TxHash)
+	stale := time.Now().Add(-time.Minute)
+	store.item.BroadcastedAt = &stale
+	store.item.LastBroadcastAt = &stale
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("bump Process() error = %v", err)
+	}
+	secondHash := common.HexToHash(store.item.TxHash)
+	if secondHash == firstHash || store.item.BumpCount != 1 || len(store.attempts) != 2 {
+		t.Fatalf("first = %s, second = %s, bump_count = %d, attempts = %d", firstHash.Hex(), secondHash.Hex(), store.item.BumpCount, len(store.attempts))
+	}
+	var tx1, tx2 types.Transaction
+	_ = tx1.UnmarshalBinary(chain.sentRaw[0])
+	_ = tx2.UnmarshalBinary(chain.sentRaw[1])
+	if tx1.Nonce() != tx2.Nonce() {
+		t.Fatalf("nonce changed on bump: %d != %d", tx1.Nonce(), tx2.Nonce())
+	}
+	if tx2.GasFeeCap().Cmp(tx1.GasFeeCap()) <= 0 {
+		t.Fatalf("gasFeeCap not bumped: %s <= %s", tx2.GasFeeCap(), tx1.GasFeeCap())
+	}
+
+	chain.latest = 12
+	chain.receiptsByHash = map[common.Hash]*types.Receipt{
+		firstHash: {Status: types.ReceiptStatusSuccessful, BlockNumber: big.NewInt(10), GasUsed: 21_000, EffectiveGasPrice: big.NewInt(120)},
+	}
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("confirm Process() error = %v", err)
+	}
+	if store.settlement == nil || store.settlement.TxHash != firstHash.Hex() || store.item.Status != postgres.WithdrawalCompleted {
+		t.Fatalf("settlement = %+v, status = %s, first = %s", store.settlement, store.item.Status, firstHash.Hex())
+	}
+}
+
+// TestWorkerSkipsBumpWhenFeeCapExceededAndMovesNonceGapToManualReview 验证费用超上限拒绝加价以及越过 Nonce 进入人工核查。
+func TestWorkerSkipsBumpWhenFeeCapExceededAndMovesNonceGapToManualReview(t *testing.T) {
+	chain := defaultFakeChain()
+	store := defaultFakeStore(t, postgres.WithdrawalCreated)
+	worker := newTestWorker(t, chain, store)
+	worker.config.RebroadcastAfter = 10 * time.Second
+	worker.config.BumpAfter = 30 * time.Second
+	worker.config.BumpPercent = 15
+	worker.config.MaxBumps = 3
+	worker.config.MaxFeeCapWei = big.NewInt(210)
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	stale := time.Now().Add(-time.Minute)
+	store.item.BroadcastedAt = &stale
+	store.item.LastBroadcastAt = &stale
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("over-cap Process() error = %v", err)
+	}
+	if store.item.BumpCount != 0 || len(store.errors) == 0 || store.errors[0].ErrorCode != "EVM_BUMP_FEE_CAP_EXCEEDED" {
+		t.Fatalf("bump_count = %d, errors = %+v", store.item.BumpCount, store.errors)
+	}
+
+	chain.confirmedNonce = store.item.Nonce.Uint64() + 1
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("manual review Process() error = %v", err)
+	}
+	if store.item.Status != postgres.WithdrawalManualReview || store.errors[len(store.errors)-1].ErrorCode != "EVM_TX_MANUAL_REVIEW" {
+		t.Fatalf("status = %s, errors = %+v", store.item.Status, store.errors)
+	}
+}

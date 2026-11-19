@@ -1752,3 +1752,149 @@ func signedTokenWithdrawal(withdrawalID, hashValue int64) SignedTokenWithdrawal 
 		TxHash: fmt.Sprintf("0x%064x", hashValue),
 	}
 }
+
+// TestIntegrationEVMReplacementAttemptsFeeReserveAndManualReview 验证 B2 候选交易记录、ETH 费用追加替换、旧尝试结算与人工核查。
+func TestIntegrationEVMReplacementAttemptsFeeReserveAndManualReview(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	user, address := firstDemoWallet(t, store)
+	fundWallet(t, store, user.ID, address.ID, 100, 1_000)
+
+	item, _, err := store.ReserveWithdrawal(ctx, withdrawalRequest("b2-replace-1", user.ID, address.ID, 500, 200))
+	if err != nil {
+		t.Fatalf("ReserveWithdrawal() error = %v", err)
+	}
+	item, _, err = store.AllocateWithdrawalNonce(ctx, item.ID, 4)
+	if err != nil {
+		t.Fatalf("AllocateWithdrawalNonce() error = %v", err)
+	}
+	firstHash := fmt.Sprintf("0x%064x", 8801)
+	item, _, err = store.SaveSignedWithdrawal(ctx, SignedWithdrawal{
+		WithdrawalID: item.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20),
+		MaxPriorityFeePerGasWei: big.NewInt(2), RawTx: []byte{1, 2, 3}, TxHash: firstHash,
+	})
+	if err != nil {
+		t.Fatalf("SaveSignedWithdrawal() error = %v", err)
+	}
+	attempts, err := store.ListEVMTxAttempts(ctx, EVMBusinessWithdrawal, item.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].AttemptNo != 1 || attempts[0].TxHash != firstHash {
+		t.Fatalf("attempts after sign = %+v, error = %v", attempts, err)
+	}
+	if _, err := store.TransitionWithdrawal(ctx, item.ID, WithdrawalBroadcasting); err != nil {
+		t.Fatalf("TransitionWithdrawal(BROADCASTING) error = %v", err)
+	}
+	item, err = store.TransitionWithdrawal(ctx, item.ID, WithdrawalBroadcasted)
+	if err != nil || item.BroadcastedAt == nil || item.LastBroadcastAt == nil {
+		t.Fatalf("TransitionWithdrawal(BROADCASTED) = %+v, error = %v", item, err)
+	}
+
+	if _, _, err := store.ReplaceWithdrawalTx(ctx, SignedWithdrawal{
+		WithdrawalID: item.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(50),
+		MaxPriorityFeePerGasWei: big.NewInt(5), RawTx: []byte{9, 9, 9}, TxHash: fmt.Sprintf("0x%064x", 8802),
+	}, big.NewInt(900)); !errors.Is(err, ErrInsufficientBalance) {
+		t.Fatalf("over-balance ReplaceWithdrawalTx() error = %v, want ErrInsufficientBalance", err)
+	}
+
+	secondHash := fmt.Sprintf("0x%064x", 8803)
+	replaced, changed, err := store.ReplaceWithdrawalTx(ctx, SignedWithdrawal{
+		WithdrawalID: item.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(30),
+		MaxPriorityFeePerGasWei: big.NewInt(3), RawTx: []byte{4, 5, 6}, TxHash: secondHash,
+	}, big.NewInt(350))
+	if err != nil || !changed || replaced.BumpCount != 1 || replaced.TxHash != secondHash || replaced.ReservedFeeWei.Cmp(big.NewInt(350)) != 0 {
+		t.Fatalf("ReplaceWithdrawalTx() = %+v, changed = %v, error = %v", replaced, changed, err)
+	}
+	attempts, err = store.ListEVMTxAttempts(ctx, EVMBusinessWithdrawal, item.ID)
+	if err != nil || len(attempts) != 2 || attempts[0].AttemptNo != 2 || attempts[1].TxHash != firstHash {
+		t.Fatalf("attempts after replace = %+v, error = %v", attempts, err)
+	}
+	balance, err := store.BalanceByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("BalanceByUser() error = %v", err)
+	}
+	assertBigInt(t, "available after fee bump", balance.AvailableWei, 150)
+	assertBigInt(t, "pending after fee bump", balance.PendingWithdrawalWei, 850)
+
+	if _, err := store.TouchWithdrawalBroadcast(ctx, item.ID); err != nil {
+		t.Fatalf("TouchWithdrawalBroadcast() error = %v", err)
+	}
+	settled, changed, err := store.FinalizeWithdrawal(ctx, WithdrawalSettlement{
+		WithdrawalID: item.ID, ActualFeeWei: big.NewInt(120), Success: true,
+		BlockNumber: 200, Confirmations: 3, TxHash: firstHash,
+	})
+	if err != nil || !changed || settled.Status != WithdrawalCompleted || settled.TxHash != firstHash {
+		t.Fatalf("FinalizeWithdrawal() = %+v, changed = %v, error = %v", settled, changed, err)
+	}
+	balance, err = store.BalanceByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("BalanceByUser() after settle error = %v", err)
+	}
+	assertBigInt(t, "available after first-attempt settle", balance.AvailableWei, 380)
+	assertBigInt(t, "pending after first-attempt settle", balance.PendingWithdrawalWei, 0)
+
+	manualItem, _, err := store.ReserveWithdrawal(ctx, withdrawalRequest("b2-manual-1", user.ID, address.ID, 100, 50))
+	if err != nil {
+		t.Fatalf("ReserveWithdrawal(manual) error = %v", err)
+	}
+	manualItem, _, err = store.AllocateWithdrawalNonce(ctx, manualItem.ID, 5)
+	if err != nil {
+		t.Fatalf("AllocateWithdrawalNonce(manual) error = %v", err)
+	}
+	manualItem, _, err = store.SaveSignedWithdrawal(ctx, SignedWithdrawal{
+		WithdrawalID: manualItem.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20),
+		MaxPriorityFeePerGasWei: big.NewInt(2), RawTx: []byte{7, 7, 7}, TxHash: fmt.Sprintf("0x%064x", 8804),
+	})
+	if err != nil {
+		t.Fatalf("SaveSignedWithdrawal(manual) error = %v", err)
+	}
+	manualItem, changed, err = store.MarkWithdrawalManualReview(ctx, manualItem.ID, "EVM_TX_MANUAL_REVIEW", "nonce skipped")
+	if err != nil || !changed || manualItem.Status != WithdrawalManualReview {
+		t.Fatalf("MarkWithdrawalManualReview() = %+v, changed = %v, error = %v", manualItem, changed, err)
+	}
+}
+
+// TestIntegrationInternalTransferReplacementMatchesAttemptHashes 验证内部补气替换后所有尝试哈希都能被识别为内部交易。
+func TestIntegrationInternalTransferReplacementMatchesAttemptHashes(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	provider, err := wallet.NewMnemonicKeyProvider(integrationTestMnemonic)
+	if err != nil {
+		t.Fatalf("NewMnemonicKeyProvider() error = %v", err)
+	}
+	sweep, address, platform := createGasTopupFixture(t, store, provider)
+	transfer, _, err := store.CreateOrGetGasTopup(ctx, GasTopupRequest{
+		SweepID: sweep.ID, PlatformWalletID: platform.ID, FromAddress: platform.Address,
+		ToAddress: address.Address, AmountWei: big.NewInt(12_000_000), ChainPendingNonce: 11,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGetGasTopup() error = %v", err)
+	}
+	hash1 := fmt.Sprintf("0x%064x", 8901)
+	hash2 := fmt.Sprintf("0x%064x", 8902)
+	if _, _, err := store.SaveSignedInternalTransfer(ctx, SignedInternalTransfer{
+		TransferID: transfer.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20),
+		MaxPriorityFeePerGasWei: big.NewInt(2), RawTx: []byte{1, 1, 1}, TxHash: hash1,
+	}); err != nil {
+		t.Fatalf("SaveSignedInternalTransfer() error = %v", err)
+	}
+	if _, err := store.TransitionInternalTransfer(ctx, transfer.ID, InternalTransferSent); err != nil {
+		t.Fatalf("TransitionInternalTransfer() error = %v", err)
+	}
+	if _, changed, err := store.ReplaceInternalTransferTx(ctx, SignedInternalTransfer{
+		TransferID: transfer.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(30),
+		MaxPriorityFeePerGasWei: big.NewInt(3), RawTx: []byte{2, 2, 2}, TxHash: hash2,
+	}); err != nil || !changed {
+		t.Fatalf("ReplaceInternalTransferTx() changed = %v, error = %v", changed, err)
+	}
+	for _, hash := range []string{hash1, hash2} {
+		ok, err := store.IsInternalTransferTx(ctx, hash)
+		if err != nil || !ok {
+			t.Fatalf("IsInternalTransferTx(%s) = %v, error = %v", hash, ok, err)
+		}
+	}
+	attempts, err := store.ListEVMTxAttempts(ctx, EVMBusinessInternalTransfer, transfer.ID)
+	if err != nil || len(attempts) != 2 || attempts[0].TxHash != hash2 || attempts[1].TxHash != hash1 {
+		t.Fatalf("internal transfer attempts = %+v, error = %v", attempts, err)
+	}
+}

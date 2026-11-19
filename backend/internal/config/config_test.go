@@ -249,6 +249,31 @@ func TestConfigRejectsSweepWithoutERC20(t *testing.T) {
 	}
 }
 
+// TestConfigLoadsEVMReplacementSettings 验证 EVM 卡单重播与 Gas 加价配置解析及校验。
+func TestConfigLoadsEVMReplacementSettings(t *testing.T) {
+	setRequiredConfigEnvironment(t)
+	t.Setenv("EVM_REBROADCAST_AFTER", "45s")
+	t.Setenv("EVM_BUMP_AFTER", "120s")
+	t.Setenv("EVM_BUMP_PERCENT", "20")
+	t.Setenv("EVM_MAX_BUMPS", "4")
+	t.Setenv("EVM_MAX_FEE_CAP_GWEI", "150")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.EVMReplacement.RebroadcastAfter != 45*time.Second || cfg.EVMReplacement.BumpAfter != 120*time.Second ||
+		cfg.EVMReplacement.BumpPercent != 20 || cfg.EVMReplacement.MaxBumps != 4 ||
+		cfg.EVMReplacement.MaxFeeCapWei.String() != "150000000000" {
+		t.Fatalf("EVMReplacement = %+v", cfg.EVMReplacement)
+	}
+
+	t.Setenv("EVM_BUMP_PERCENT", "5")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want error for EVM_BUMP_PERCENT < 10")
+	}
+}
+
 // setRequiredConfigEnvironment 设置加载配置所需的最小非敏感测试值。
 func setRequiredConfigEnvironment(t *testing.T) {
 	t.Helper()

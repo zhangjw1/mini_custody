@@ -43,6 +43,7 @@ type WithdrawalSettlement struct {
 	Success       bool
 	BlockNumber   int64
 	Confirmations int64
+	TxHash        string
 }
 
 type SignedWithdrawal struct {
@@ -553,6 +554,10 @@ func (s *Store) SaveSignedWithdrawal(ctx context.Context, signed SignedWithdrawa
 	if item.Status != WithdrawalSigning || item.Nonce == nil {
 		return Withdrawal{}, false, ErrInvalidState
 	}
+	var fromAddress string
+	if err := tx.QueryRow(ctx, `SELECT address FROM wallet_addresses WHERE id = $1`, item.AddressID).Scan(&fromAddress); err != nil {
+		return Withdrawal{}, false, fmt.Errorf("查询提币发送地址失败：%w", mapNotFound(err))
+	}
 	item, err = s.scanWithdrawal(tx.QueryRow(ctx, `
 		UPDATE withdrawals SET
 			gas_limit = $2, max_fee_per_gas_wei = $3::numeric,
@@ -564,6 +569,20 @@ func (s *Store) SaveSignedWithdrawal(ctx context.Context, signed SignedWithdrawa
 	))
 	if err != nil {
 		return Withdrawal{}, false, fmt.Errorf("保存已签名提币失败：%w", err)
+	}
+	if err := insertEVMTxAttemptInTx(ctx, tx, EVMTxAttempt{
+		BusinessType:            EVMBusinessWithdrawal,
+		BusinessID:              item.ID,
+		FromAddress:             fromAddress,
+		Nonce:                   item.Nonce,
+		AttemptNo:               1,
+		TxHash:                  signed.TxHash,
+		RawTx:                   signed.RawTx,
+		MaxFeePerGasWei:         signed.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: signed.MaxPriorityFeePerGasWei,
+		GasLimit:                int64(signed.GasLimit),
+	}); err != nil {
+		return Withdrawal{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Withdrawal{}, false, fmt.Errorf("提交签名交易保存事务失败：%w", err)
@@ -613,10 +632,21 @@ func (s *Store) TransitionWithdrawal(ctx context.Context, withdrawalID int64, ta
 	if !allowedWithdrawalTransition(item.Status, target) {
 		return Withdrawal{}, ErrInvalidState
 	}
-	item, err = s.scanWithdrawal(tx.QueryRow(ctx, `
-		UPDATE withdrawals SET status = $2, updated_at = CURRENT_TIMESTAMP
-		WHERE id = $1 RETURNING `+withdrawalColumns, withdrawalID, target,
-	))
+	if target == WithdrawalBroadcasted {
+		item, err = s.scanWithdrawal(tx.QueryRow(ctx, `
+			UPDATE withdrawals SET
+				status = $2,
+				broadcasted_at = COALESCE(broadcasted_at, CURRENT_TIMESTAMP),
+				last_broadcast_at = CURRENT_TIMESTAMP,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 RETURNING `+withdrawalColumns, withdrawalID, target,
+		))
+	} else {
+		item, err = s.scanWithdrawal(tx.QueryRow(ctx, `
+			UPDATE withdrawals SET status = $2, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 RETURNING `+withdrawalColumns, withdrawalID, target,
+		))
+	}
 	if err != nil {
 		return Withdrawal{}, fmt.Errorf("迁移提币状态失败：%w", err)
 	}
@@ -758,14 +788,16 @@ func (s *Store) FinalizeWithdrawal(ctx context.Context, settlement WithdrawalSet
 	); err != nil {
 		return Withdrawal{}, false, fmt.Errorf("写入提币结算流水失败：%w", err)
 	}
+	matchedTxHash := strings.ToLower(strings.TrimSpace(settlement.TxHash))
 	item, err = s.scanWithdrawal(tx.QueryRow(ctx, `
 		UPDATE withdrawals SET
 			actual_fee_wei = $2::numeric, block_number = $3, confirmations = $4,
 			status = $5, error_code = NULLIF($6, ''), error_message = NULLIF($7, ''),
+			tx_hash = COALESCE(NULLIF($8, ''), tx_hash),
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+withdrawalColumns,
 		item.ID, settlement.ActualFeeWei.String(), settlement.BlockNumber, settlement.Confirmations,
-		status, errorCode, errorMessage,
+		status, errorCode, errorMessage, matchedTxHash,
 	))
 	if err != nil {
 		return Withdrawal{}, false, fmt.Errorf("记录提币结算结果失败：%w", err)
@@ -859,10 +891,11 @@ func allowedWithdrawalTransition(current, target string) bool {
 	allowed := map[string]map[string]bool{
 		WithdrawalCreated:          {WithdrawalSigning: true},
 		WithdrawalSigning:          {WithdrawalSigned: true},
-		WithdrawalSigned:           {WithdrawalBroadcasting: true},
-		WithdrawalBroadcasting:     {WithdrawalBroadcasted: true, WithdrawalBroadcastUnknown: true},
-		WithdrawalBroadcastUnknown: {WithdrawalBroadcasted: true},
-		WithdrawalBroadcasted:      {WithdrawalConfirming: true},
+		WithdrawalSigned:           {WithdrawalBroadcasting: true, WithdrawalManualReview: true},
+		WithdrawalBroadcasting:     {WithdrawalBroadcasted: true, WithdrawalBroadcastUnknown: true, WithdrawalManualReview: true},
+		WithdrawalBroadcastUnknown: {WithdrawalBroadcasted: true, WithdrawalManualReview: true},
+		WithdrawalBroadcasted:      {WithdrawalConfirming: true, WithdrawalManualReview: true},
+		WithdrawalConfirming:       {WithdrawalManualReview: true},
 	}
 	return allowed[current][target]
 }

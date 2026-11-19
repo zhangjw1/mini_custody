@@ -224,6 +224,9 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
 			ChainID: big.NewInt(evm.SepoliaChainID), GasSafetyBPS: cfg.ERC20.GasSafetyBPS,
 			GasTopupMaxWei: cfg.ERC20.GasTopupMaxWei, PlatformMinBalanceWei: cfg.PlatformWallet.MinETHBalanceWei,
+			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
+			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("创建 Gas Station Worker 失败：%w", err)
@@ -231,6 +234,9 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		tokenSweepWorker, err = tokensweep.NewWorker(chainClient, tokenContract, store, provider, logger, tokensweep.Config{
 			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
 			ChainID: big.NewInt(evm.SepoliaChainID), Symbol: cfg.ERC20.Symbol,
+			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
+			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("创建 Token Sweep Worker 失败：%w", err)
@@ -243,7 +249,10 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		}
 		tokenWithdrawalWorker, err = tokenwithdrawal.NewWorker(chainClient, tokenContract, store, provider, logger, tokenwithdrawal.WorkerConfig{
 			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
-			ChainID: big.NewInt(evm.SepoliaChainID),
+			ChainID:          big.NewInt(evm.SepoliaChainID),
+			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
+			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("创建 Token 提币 Worker 失败：%w", err)
@@ -254,9 +263,14 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		return nil, fmt.Errorf("创建 Sepolia 提币服务失败：%w", err)
 	}
 	withdrawalWorker, err := withdrawal.NewWorker(chainClient, store, provider, logger, withdrawal.WorkerConfig{
-		Interval:      cfg.SepoliaScanInterval,
-		Confirmations: cfg.SepoliaConfirmations,
-		ChainID:       big.NewInt(evm.SepoliaChainID),
+		Interval:         cfg.SepoliaScanInterval,
+		Confirmations:    cfg.SepoliaConfirmations,
+		ChainID:          big.NewInt(evm.SepoliaChainID),
+		RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter,
+		BumpAfter:        cfg.EVMReplacement.BumpAfter,
+		BumpPercent:      cfg.EVMReplacement.BumpPercent,
+		MaxBumps:         cfg.EVMReplacement.MaxBumps,
+		MaxFeeCapWei:     cfg.EVMReplacement.MaxFeeCapWei,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("创建 Sepolia 提币 Worker 失败：%w", err)

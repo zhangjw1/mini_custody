@@ -41,6 +41,7 @@ type InternalTransferSettlement struct {
 	Success       bool
 	BlockNumber   int64
 	Confirmations int64
+	TxHash        string
 }
 
 // ListGasStationSweeps 查询尚未准备 Gas 或仍有补气交易需要恢复的归集任务。
@@ -258,6 +259,20 @@ func (s *Store) SaveSignedInternalTransfer(ctx context.Context, signed SignedInt
 	if err != nil {
 		return InternalTransfer{}, false, fmt.Errorf("保存已签名内部转账失败：%w", err)
 	}
+	if err := insertEVMTxAttemptInTx(ctx, tx, EVMTxAttempt{
+		BusinessType:            EVMBusinessInternalTransfer,
+		BusinessID:              item.ID,
+		FromAddress:             item.FromAddress,
+		Nonce:                   item.Nonce,
+		AttemptNo:               1,
+		TxHash:                  signed.TxHash,
+		RawTx:                   signed.RawTx,
+		MaxFeePerGasWei:         signed.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: signed.MaxPriorityFeePerGasWei,
+		GasLimit:                int64(signed.GasLimit),
+	}); err != nil {
+		return InternalTransfer{}, false, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return InternalTransfer{}, false, fmt.Errorf("提交内部转账签名保存事务失败：%w", err)
 	}
@@ -287,14 +302,26 @@ func (s *Store) TransitionInternalTransfer(ctx context.Context, transferID int64
 		return item, nil
 	}
 	allowed := (item.Status == InternalTransferSigned && target == InternalTransferSent) ||
-		(item.Status == InternalTransferSent && target == InternalTransferChecking)
+		(item.Status == InternalTransferSent && target == InternalTransferChecking) ||
+		((item.Status == InternalTransferSigned || item.Status == InternalTransferSent || item.Status == InternalTransferChecking) && target == InternalTransferManualReview)
 	if !allowed {
 		return InternalTransfer{}, ErrInvalidState
 	}
-	item, err = s.scanInternalTransfer(tx.QueryRow(ctx, `
-		UPDATE internal_transfers SET status = $2, updated_at = CURRENT_TIMESTAMP
-		WHERE id = $1 RETURNING `+internalTransferColumns, item.ID, target,
-	))
+	if target == InternalTransferSent {
+		item, err = s.scanInternalTransfer(tx.QueryRow(ctx, `
+			UPDATE internal_transfers SET
+				status = $2,
+				broadcasted_at = COALESCE(broadcasted_at, CURRENT_TIMESTAMP),
+				last_broadcast_at = CURRENT_TIMESTAMP,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 RETURNING `+internalTransferColumns, item.ID, target,
+		))
+	} else {
+		item, err = s.scanInternalTransfer(tx.QueryRow(ctx, `
+			UPDATE internal_transfers SET status = $2, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 RETURNING `+internalTransferColumns, item.ID, target,
+		))
+	}
 	if err != nil {
 		return InternalTransfer{}, fmt.Errorf("更新内部转账状态失败：%w", err)
 	}
@@ -357,13 +384,16 @@ func (s *Store) FinalizeInternalTransfer(ctx context.Context, settlement Interna
 		errorCode = "GAS_TOPUP_REVERTED"
 		errorMessage = "Gas 补充交易链上执行失败"
 	}
+	matchedTxHash := strings.ToLower(strings.TrimSpace(settlement.TxHash))
 	item, err = s.scanInternalTransfer(tx.QueryRow(ctx, `
 		UPDATE internal_transfers SET block_number = $2, confirmations = GREATEST(confirmations, $3),
 			actual_fee_wei = $4::numeric, status = $5, error_code = NULLIF($6, ''),
-			error_message = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP
+			error_message = NULLIF($7, ''),
+			tx_hash = COALESCE(NULLIF($8, ''), tx_hash),
+			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+internalTransferColumns,
 		item.ID, settlement.BlockNumber, settlement.Confirmations, settlement.ActualFeeWei.String(),
-		status, errorCode, errorMessage,
+		status, errorCode, errorMessage, matchedTxHash,
 	))
 	if err != nil {
 		return InternalTransfer{}, false, fmt.Errorf("保存内部转账结算失败：%w", err)
@@ -390,7 +420,12 @@ func (s *Store) IsInternalTransferTx(ctx context.Context, txHash string) (bool, 
 		return false, errors.New("内部转账查询哈希无效")
 	}
 	var exists bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM internal_transfers WHERE tx_hash = $1)`, txHash).Scan(&exists); err != nil {
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM internal_transfers WHERE tx_hash = $1
+			UNION ALL
+			SELECT 1 FROM evm_tx_attempts WHERE business_type = $2 AND tx_hash = $1
+		)`, txHash, EVMBusinessInternalTransfer).Scan(&exists); err != nil {
 		return false, fmt.Errorf("查询内部转账哈希失败：%w", err)
 	}
 	return exists, nil

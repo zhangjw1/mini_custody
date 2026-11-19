@@ -37,6 +37,15 @@ func (s *Store) localTime(value time.Time) time.Time {
 	return value.In(s.timezone)
 }
 
+// localTimePtr 将可空数据库时间指针转换为业务时区。
+func (s *Store) localTimePtr(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	local := s.localTime(*value)
+	return &local
+}
+
 // parseDatabaseWei 将数据库无符号金额文本解析为大整数。
 func parseDatabaseWei(value, field string) (*big.Int, error) {
 	parsed, err := amount.ParseWei(value)
@@ -191,7 +200,8 @@ func (s *Store) scanWithdrawal(row rowScanner) (Withdrawal, error) {
 		&item.ID, &item.IdempotencyKey, &item.UserID, &item.AddressID, &item.ToAddress,
 		&amountValue, &reservedFeeValue, &actualFee, &nonce, &gasLimit, &maxFee,
 		&maxPriorityFee, &item.RawTx, &txHash, &blockNumber, &item.Confirmations,
-		&item.Status, &errorCode, &errorMessage, &item.CreatedAt, &item.UpdatedAt,
+		&item.Status, &errorCode, &errorMessage, &item.BroadcastedAt, &item.LastBroadcastAt,
+		&item.BumpCount, &item.CreatedAt, &item.UpdatedAt,
 	); err != nil {
 		return Withdrawal{}, err
 	}
@@ -219,6 +229,8 @@ func (s *Store) scanWithdrawal(row rowScanner) (Withdrawal, error) {
 	item.TxHash = optionalString(txHash)
 	item.ErrorCode = optionalString(errorCode)
 	item.ErrorMessage = optionalString(errorMessage)
+	item.BroadcastedAt = s.localTimePtr(item.BroadcastedAt)
+	item.LastBroadcastAt = s.localTimePtr(item.LastBroadcastAt)
 	item.CreatedAt = s.localTime(item.CreatedAt)
 	item.UpdatedAt = s.localTime(item.UpdatedAt)
 	return item, nil

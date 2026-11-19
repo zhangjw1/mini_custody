@@ -21,8 +21,12 @@ import (
 )
 
 const (
-	workerBatchSize      = 100
-	maxSigningRetryCount = 5
+	workerBatchSize       = 100
+	maxSigningRetryCount  = 5
+	defaultRebroadcastAge = 60 * time.Second
+	defaultBumpAge        = 180 * time.Second
+	defaultBumpPercent    = 15
+	defaultMaxFeeCapWei   = 100_000_000_000
 )
 
 var (
@@ -36,6 +40,7 @@ type Chain interface {
 	BlockNumber(ctx context.Context) (uint64, error)
 	BalanceAt(ctx context.Context, account common.Address, number *big.Int) (*big.Int, error)
 	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)
+	NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error)
 	SendTransaction(ctx context.Context, transaction *types.Transaction) error
 	TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error)
 }
@@ -53,20 +58,29 @@ type TokenContract interface {
 type WorkerStore interface {
 	TokenWithdrawalByID(ctx context.Context, id int64) (postgres.TokenWithdrawal, error)
 	ListProcessableTokenWithdrawals(ctx context.Context, limit int) ([]postgres.TokenWithdrawal, error)
+	ListEVMTxAttempts(ctx context.Context, businessType string, businessID int64) ([]postgres.EVMTxAttempt, error)
 	PlatformWalletByRole(ctx context.Context, network, role string) (postgres.PlatformWallet, error)
 	AllocateTokenWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64) (postgres.TokenWithdrawal, bool, error)
 	SaveSignedTokenWithdrawal(ctx context.Context, signed postgres.SignedTokenWithdrawal) (postgres.TokenWithdrawal, bool, error)
+	ReplaceTokenWithdrawalTx(ctx context.Context, replacement postgres.SignedTokenWithdrawal) (postgres.TokenWithdrawal, bool, error)
+	TouchTokenWithdrawalBroadcast(ctx context.Context, withdrawalID int64) (postgres.TokenWithdrawal, error)
+	MarkTokenWithdrawalManualReview(ctx context.Context, withdrawalID int64, errorCode, errorMessage string) (postgres.TokenWithdrawal, bool, error)
 	TransitionTokenWithdrawal(ctx context.Context, withdrawalID int64, target string) (postgres.TokenWithdrawal, error)
 	UpdateTokenWithdrawalConfirmations(ctx context.Context, withdrawalID, confirmations int64) (postgres.TokenWithdrawal, error)
 	FinalizeTokenWithdrawal(ctx context.Context, settlement postgres.TokenWithdrawalSettlement) (postgres.TokenWithdrawal, bool, error)
 	RecordWorkerError(ctx context.Context, item postgres.WorkerError) (int64, error)
 }
 
-// WorkerConfig 定义 Token 提币轮询间隔、确认数和 Sepolia Chain ID。
+// WorkerConfig 定义 Token 提币轮询间隔、确认数、卡单重播加价策略和 Sepolia Chain ID。
 type WorkerConfig struct {
-	Interval      time.Duration
-	Confirmations uint64
-	ChainID       *big.Int
+	Interval         time.Duration
+	Confirmations    uint64
+	ChainID          *big.Int
+	RebroadcastAfter time.Duration
+	BumpAfter        time.Duration
+	BumpPercent      uint64
+	MaxBumps         int
+	MaxFeeCapWei     *big.Int
 }
 
 // Worker 负责平台热钱包 Token 提币签名、幂等广播、恢复和账本结算。
@@ -89,6 +103,9 @@ func NewWorker(chain Chain, contract TokenContract, store WorkerStore, keys wall
 	}
 	if cfg.Interval <= 0 || cfg.Confirmations == 0 || cfg.ChainID == nil || cfg.ChainID.Cmp(big.NewInt(evm.SepoliaChainID)) != 0 {
 		return nil, errors.New("Token 提币 Worker 配置无效")
+	}
+	if err := normalizeReplacementConfig(&cfg); err != nil {
+		return nil, err
 	}
 	cfg.ChainID = new(big.Int).Set(cfg.ChainID)
 	return &Worker{
@@ -287,11 +304,20 @@ func (w *Worker) broadcast(ctx context.Context, item postgres.TokenWithdrawal) e
 		if err != nil {
 			return fmt.Errorf("恢复 Token 提币已广播状态失败：%w", err)
 		}
-		return w.confirmReceipt(ctx, item, receipt)
+		return w.confirmReceipt(ctx, item, receipt, item.TxHash)
 	} else if err != nil && !errors.Is(err, ethereum.NotFound) {
 		return fmt.Errorf("查询待广播 Token 提币 Receipt 失败：%w", err)
 	}
 	if err := w.chain.SendTransaction(ctx, &transaction); err != nil && !alreadyKnown(err) {
+		if nonceTooLow(err) {
+			handled, checkErr := w.handleNonceTooLow(ctx, item)
+			if checkErr != nil {
+				return checkErr
+			}
+			if handled {
+				return nil
+			}
+		}
 		return fmt.Errorf("广播 Token 提币交易结果不明确：%w", err)
 	}
 	item, err = w.store.TransitionTokenWithdrawal(ctx, item.ID, postgres.WithdrawalBroadcasted)
@@ -302,23 +328,46 @@ func (w *Worker) broadcast(ctx context.Context, item postgres.TokenWithdrawal) e
 	return nil
 }
 
-// confirm 查询 Token 提币 Receipt 并更新确认数或完成结算。
+// confirm 查询 Token 提币全部候选交易 Receipt，并在卡单超时后执行重播或 Gas 加价替换。
 func (w *Worker) confirm(ctx context.Context, item postgres.TokenWithdrawal) error {
-	if item.TxHash == "" {
-		return errors.New("待确认 Token 提币缺少交易哈希")
+	attempts, candidates, err := w.candidateHashes(ctx, item)
+	if err != nil {
+		return err
 	}
-	receipt, err := w.chain.TransactionReceipt(ctx, common.HexToHash(item.TxHash))
-	if errors.Is(err, ethereum.NotFound) {
+	for _, candidateHash := range candidates {
+		receipt, err := w.chain.TransactionReceipt(ctx, common.HexToHash(candidateHash))
+		if errors.Is(err, ethereum.NotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("查询 Token 提币 Receipt 失败：%w", err)
+		}
+		if receipt != nil {
+			return w.confirmReceipt(ctx, item, receipt, candidateHash)
+		}
+	}
+	consumed, err := w.checkNonceConsumed(ctx, item, candidates)
+	if err != nil {
+		return err
+	}
+	if consumed {
 		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("查询 Token 提币 Receipt 失败：%w", err)
+	if item.Status != postgres.WithdrawalBroadcasted {
+		return nil
 	}
-	return w.confirmReceipt(ctx, item, receipt)
+	tierStart := replacementTierStart(item.BumpCount, item.BroadcastedAt, item.LastBroadcastAt, attempts)
+	if tierStart != nil && time.Since(*tierStart) >= w.config.BumpAfter && int(item.BumpCount) < w.config.MaxBumps {
+		return w.bumpAndBroadcast(ctx, item, attempts)
+	}
+	if item.LastBroadcastAt != nil && time.Since(*item.LastBroadcastAt) >= w.config.RebroadcastAfter {
+		return w.rebroadcast(ctx, item)
+	}
+	return nil
 }
 
 // confirmReceipt 校验确认数和标准 Transfer Event，并分离结算用户 Token 与平台 Gas。
-func (w *Worker) confirmReceipt(ctx context.Context, item postgres.TokenWithdrawal, receipt *types.Receipt) error {
+func (w *Worker) confirmReceipt(ctx context.Context, item postgres.TokenWithdrawal, receipt *types.Receipt, matchedTxHash string) error {
 	if receipt == nil || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() || receipt.EffectiveGasPrice == nil {
 		return errors.New("Token 提币 Receipt 内容无效")
 	}
@@ -339,8 +388,11 @@ func (w *Worker) confirmReceipt(ctx context.Context, item postgres.TokenWithdraw
 		return err
 	}
 	settlement := postgres.TokenWithdrawalSettlement{
-		WithdrawalID: item.ID, ActualFeeWei: new(big.Int).Mul(new(big.Int).SetUint64(receipt.GasUsed), receipt.EffectiveGasPrice),
-		BlockNumber: int64(blockNumber), Confirmations: int64(confirmations),
+		WithdrawalID:  item.ID,
+		ActualFeeWei:  new(big.Int).Mul(new(big.Int).SetUint64(receipt.GasUsed), receipt.EffectiveGasPrice),
+		BlockNumber:   int64(blockNumber),
+		Confirmations: int64(confirmations),
+		TxHash:        matchedTxHash,
 	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
 		settlement.ErrorCode = "TOKEN_WITHDRAWAL_REVERTED"
@@ -360,7 +412,7 @@ func (w *Worker) confirmReceipt(ctx context.Context, item postgres.TokenWithdraw
 		return fmt.Errorf("结算 Token 提币失败：%w", err)
 	}
 	if changed {
-		w.logger.Info("Token 提币已完成账本结算", "withdrawal_id", result.ID, "status", result.Status, "confirmations", confirmations)
+		w.logger.Info("Token 提币已完成账本结算", "withdrawal_id", result.ID, "status", result.Status, "confirmations", confirmations, "tx_hash", result.TxHash)
 	}
 	return nil
 }
@@ -469,4 +521,345 @@ func alreadyKnown(err error) bool {
 		}
 	}
 	return false
+}
+
+// nonceTooLow 判断 RPC 错误链是否提示当前交易 Nonce 已被链上消费。
+func nonceTooLow(err error) bool {
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		message := strings.ToLower(current.Error())
+		if strings.Contains(message, "nonce too low") || strings.Contains(message, "nonce is too low") {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeReplacementConfig 校验并填充 Token 提币重播与 Gas 加价配置默认值。
+func normalizeReplacementConfig(cfg *WorkerConfig) error {
+	if cfg.RebroadcastAfter < 0 || cfg.BumpAfter < 0 || cfg.MaxBumps < 0 {
+		return errors.New("Token 提币重播与加价参数不能为负数")
+	}
+	if cfg.RebroadcastAfter == 0 {
+		cfg.RebroadcastAfter = defaultRebroadcastAge
+	}
+	if cfg.BumpAfter == 0 {
+		cfg.BumpAfter = defaultBumpAge
+	}
+	if cfg.BumpPercent == 0 {
+		cfg.BumpPercent = defaultBumpPercent
+	} else if cfg.BumpPercent < 10 {
+		return errors.New("Token 提币 Gas 加价比例不能低于 10%")
+	}
+	if cfg.MaxFeeCapWei == nil {
+		cfg.MaxFeeCapWei = big.NewInt(defaultMaxFeeCapWei)
+	} else if cfg.MaxFeeCapWei.Sign() <= 0 {
+		return errors.New("Token 提币最大费用上限必须大于零")
+	} else {
+		cfg.MaxFeeCapWei = new(big.Int).Set(cfg.MaxFeeCapWei)
+	}
+	return nil
+}
+
+// candidateHashes 查询同一笔 Token 提币按尝试序号倒序排列的所有候选交易哈希。
+func (w *Worker) candidateHashes(ctx context.Context, item postgres.TokenWithdrawal) ([]postgres.EVMTxAttempt, []string, error) {
+	attempts, err := w.store.ListEVMTxAttempts(ctx, postgres.EVMBusinessTokenWithdrawal, item.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("查询 Token 提币候选交易记录失败：%w", err)
+	}
+	seen := make(map[string]struct{}, len(attempts)+1)
+	candidates := make([]string, 0, len(attempts)+1)
+	for _, attempt := range attempts {
+		hash := strings.ToLower(strings.TrimSpace(attempt.TxHash))
+		if hash == "" {
+			continue
+		}
+		if _, ok := seen[hash]; !ok {
+			seen[hash] = struct{}{}
+			candidates = append(candidates, hash)
+		}
+	}
+	if itemHash := strings.ToLower(strings.TrimSpace(item.TxHash)); itemHash != "" {
+		if _, ok := seen[itemHash]; !ok {
+			candidates = append(candidates, itemHash)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil, errors.New("待确认 Token 提币缺少交易哈希")
+	}
+	return attempts, candidates, nil
+}
+
+// checkNonceConsumed 在所有候选交易均无 Receipt 时校验平台钱包已确认 Nonce 是否已越过本单 Nonce。
+func (w *Worker) checkNonceConsumed(ctx context.Context, item postgres.TokenWithdrawal, candidates []string) (bool, error) {
+	if item.Nonce == nil || !item.Nonce.IsUint64() {
+		return false, nil
+	}
+	platform, err := w.platformFor(ctx, item)
+	if err != nil {
+		return false, err
+	}
+	confirmedNonce, err := w.chain.NonceAt(ctx, common.HexToAddress(platform.Address), nil)
+	if err != nil {
+		return false, fmt.Errorf("查询 Token 提币平台已确认 Nonce 失败：%w", err)
+	}
+	if confirmedNonce <= item.Nonce.Uint64() {
+		return false, nil
+	}
+	for _, candidateHash := range candidates {
+		receipt, err := w.chain.TransactionReceipt(ctx, common.HexToHash(candidateHash))
+		if errors.Is(err, ethereum.NotFound) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("二次复核 Token 提币 Receipt 失败：%w", err)
+		}
+		if receipt != nil {
+			return true, w.confirmReceipt(ctx, item, receipt, candidateHash)
+		}
+	}
+	reason := fmt.Sprintf("平台热钱包最新确认 Nonce(%d) 已超过 Token 提币 Nonce(%d)，但所有候选交易均未上链，需人工核查", confirmedNonce, item.Nonce.Uint64())
+	_, changed, err := w.store.MarkTokenWithdrawalManualReview(ctx, item.ID, "EVM_TX_MANUAL_REVIEW", reason)
+	if err != nil {
+		return false, fmt.Errorf("转入 Token 提币人工核查状态失败：%w", err)
+	}
+	if changed {
+		w.recordError(ctx, item.ID, "confirm", "EVM_TX_MANUAL_REVIEW", errors.New(reason))
+		w.logger.Warn("Token 提币转入人工核查状态", "withdrawal_id", item.ID, "nonce", item.Nonce.String(), "confirmed_nonce", confirmedNonce)
+	}
+	return true, nil
+}
+
+// handleNonceTooLow 在广播遇到 nonce too low 时优先复核所有候选 Receipt 与已确认 Nonce。
+func (w *Worker) handleNonceTooLow(ctx context.Context, item postgres.TokenWithdrawal) (bool, error) {
+	_, candidates, err := w.candidateHashes(ctx, item)
+	if err != nil {
+		return false, err
+	}
+	for _, candidateHash := range candidates {
+		receipt, err := w.chain.TransactionReceipt(ctx, common.HexToHash(candidateHash))
+		if errors.Is(err, ethereum.NotFound) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("复核 Token 提币 Receipt 失败：%w", err)
+		}
+		if receipt != nil {
+			ensured, transitionErr := w.store.TransitionTokenWithdrawal(ctx, item.ID, postgres.WithdrawalBroadcasted)
+			if transitionErr != nil {
+				return false, fmt.Errorf("恢复 Token 提币已广播状态失败：%w", transitionErr)
+			}
+			return true, w.confirmReceipt(ctx, ensured, receipt, candidateHash)
+		}
+	}
+	return w.checkNonceConsumed(ctx, item, candidates)
+}
+
+// bumpAndBroadcast 按同一 Nonce 提升 Token 提币 Gas 费用重新签名、落库并广播替换交易。
+func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.TokenWithdrawal, attempts []postgres.EVMTxAttempt) error {
+	if item.Nonce == nil || !item.Nonce.IsUint64() || item.AmountUnits == nil || item.AmountUnits.Sign() <= 0 {
+		return errors.New("待加价 Token 提币缺少有效 Nonce 或金额")
+	}
+	prevFeeCap := item.MaxFeePerGasWei
+	prevTip := item.MaxPriorityFeePerGasWei
+	if (prevFeeCap == nil || prevTip == nil) && len(attempts) > 0 {
+		prevFeeCap = attempts[0].MaxFeePerGasWei
+		prevTip = attempts[0].MaxPriorityFeePerGasWei
+	}
+	if prevFeeCap == nil || prevFeeCap.Sign() <= 0 || prevTip == nil || prevTip.Sign() < 0 {
+		return errors.New("待加价 Token 提币缺少有效历史 Gas 参数")
+	}
+	platform, err := w.platformFor(ctx, item)
+	if err != nil {
+		return err
+	}
+	from := common.HexToAddress(platform.Address)
+	to := common.HexToAddress(item.ToAddress)
+	fee, err := estimateFee(ctx, w.chain, w.contract, from, to, item.AmountUnits)
+	if err != nil {
+		return err
+	}
+	gasLimit := fee.GasLimit
+	if item.GasLimit != nil && *item.GasLimit > 0 && uint64(*item.GasLimit) > gasLimit {
+		gasLimit = uint64(*item.GasLimit)
+	}
+	header, err := w.chain.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("Token 提币加价查询 Base Fee 失败：%w", err)
+	}
+	if header == nil || header.BaseFee == nil || header.BaseFee.Sign() < 0 {
+		return errors.New("Token 提币加价最新区块缺少有效 Base Fee")
+	}
+	bumpedFeeCap, bumpedTip, ok := computeBumpedFees(prevFeeCap, prevTip, header.BaseFee, fee.MaxPriorityFeePerGasWei, w.config.BumpPercent, w.config.MaxFeeCapWei)
+	if !ok {
+		w.recordError(ctx, item.ID, "bump", "EVM_BUMP_FEE_CAP_EXCEEDED", errors.New("Token 提币加价后手续费上限超过配置最大值，停止继续加价"))
+		if item.LastBroadcastAt != nil && time.Since(*item.LastBroadcastAt) >= w.config.RebroadcastAfter {
+			return w.rebroadcast(ctx, item)
+		}
+		return nil
+	}
+	requiredFee := new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), bumpedFeeCap)
+	ethBalance, err := w.chain.BalanceAt(ctx, from, nil)
+	if err != nil {
+		return fmt.Errorf("Token 提币加价查询平台热钱包 ETH 余额失败：%w", err)
+	}
+	if ethBalance == nil || ethBalance.Cmp(requiredFee) < 0 {
+		w.recordError(ctx, item.ID, "bump", "HOT_WALLET_GAS_INSUFFICIENT", ErrHotWalletGasInsufficient)
+		return nil
+	}
+	calldata, err := w.contract.EncodeTransfer(to, item.AmountUnits)
+	if err != nil {
+		return fmt.Errorf("编码 Token 提币加价 calldata 失败：%w", err)
+	}
+	contractAddress := w.contract.Address()
+	transaction := types.NewTx(&types.DynamicFeeTx{
+		ChainID:   new(big.Int).Set(w.config.ChainID),
+		Nonce:     item.Nonce.Uint64(),
+		GasTipCap: bumpedTip,
+		GasFeeCap: bumpedFeeCap,
+		Gas:       gasLimit,
+		To:        &contractAddress,
+		Value:     new(big.Int),
+		Data:      calldata,
+	})
+	if err := w.validateTransaction(transaction, item); err != nil {
+		return err
+	}
+	signed, err := w.keys.SignTx(ctx, platform.DerivationPath, transaction, w.config.ChainID)
+	if err != nil {
+		return fmt.Errorf("签署 Token 提币加价替换交易失败：%w", err)
+	}
+	sender, err := types.Sender(types.LatestSignerForChainID(w.config.ChainID), signed)
+	if err != nil || sender != from {
+		return errors.New("Token 提币加价替换签名地址与平台热钱包不一致")
+	}
+	if err := w.validateTransaction(signed, item); err != nil {
+		return err
+	}
+	raw, err := signed.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("编码 Token 提币加价替换交易失败：%w", err)
+	}
+	replaced, changed, err := w.store.ReplaceTokenWithdrawalTx(ctx, postgres.SignedTokenWithdrawal{
+		WithdrawalID:            item.ID,
+		GasLimit:                gasLimit,
+		MaxFeePerGasWei:         bumpedFeeCap,
+		MaxPriorityFeePerGasWei: bumpedTip,
+		RawTx:                   raw,
+		TxHash:                  strings.ToLower(signed.Hash().Hex()),
+	})
+	if err != nil {
+		return fmt.Errorf("保存 Token 提币加价替换交易失败：%w", err)
+	}
+	if err := w.chain.SendTransaction(ctx, signed); err != nil && !alreadyKnown(err) {
+		if nonceTooLow(err) {
+			handled, checkErr := w.handleNonceTooLow(ctx, replaced)
+			if checkErr != nil {
+				return checkErr
+			}
+			if handled {
+				return nil
+			}
+		}
+		return fmt.Errorf("广播 Token 提币加价替换交易失败：%w", err)
+	}
+	if changed {
+		w.logger.Info("Token 提币已完成 Gas 加价替换并广播", "withdrawal_id", replaced.ID, "bump_count", replaced.BumpCount, "tx_hash", replaced.TxHash)
+	}
+	return nil
+}
+
+// rebroadcast 使用相同 raw_tx 原样重播卡在内存池的 Token 提币交易。
+func (w *Worker) rebroadcast(ctx context.Context, item postgres.TokenWithdrawal) error {
+	if len(item.RawTx) == 0 || item.TxHash == "" {
+		return errors.New("重播 Token 提币缺少原始交易")
+	}
+	var transaction types.Transaction
+	if err := transaction.UnmarshalBinary(item.RawTx); err != nil {
+		return errors.New("重播 Token 提币原始交易无效")
+	}
+	if transaction.Hash() != common.HexToHash(item.TxHash) {
+		return errors.New("重播 Token 提币交易哈希与原始交易不一致")
+	}
+	if err := w.validateTransaction(&transaction, item); err != nil {
+		return err
+	}
+	if err := w.chain.SendTransaction(ctx, &transaction); err != nil && !alreadyKnown(err) {
+		if nonceTooLow(err) {
+			handled, checkErr := w.handleNonceTooLow(ctx, item)
+			if checkErr != nil {
+				return checkErr
+			}
+			if handled {
+				return nil
+			}
+		}
+		return fmt.Errorf("重播 Token 提币交易失败：%w", err)
+	}
+	if _, err := w.store.TouchTokenWithdrawalBroadcast(ctx, item.ID); err != nil {
+		return fmt.Errorf("更新 Token 提币重播时间失败：%w", err)
+	}
+	w.logger.Info("Token 提币交易已重播", "withdrawal_id", item.ID, "tx_hash", item.TxHash)
+	return nil
+}
+
+// replacementTierStart 返回当前费率阶梯的起始时间，用于判断是否满足加价等待阈值。
+func replacementTierStart(bumpCount int32, broadcastedAt, lastBroadcastAt *time.Time, attempts []postgres.EVMTxAttempt) *time.Time {
+	if bumpCount > 0 {
+		if len(attempts) > 0 && !attempts[0].CreatedAt.IsZero() {
+			t := attempts[0].CreatedAt
+			return &t
+		}
+		return lastBroadcastAt
+	}
+	if broadcastedAt != nil {
+		return broadcastedAt
+	}
+	return lastBroadcastAt
+}
+
+// computeBumpedFees 计算满足 EIP-1559 最低加价比例和链上市场费率的替换手续费上限。
+func computeBumpedFees(prevFeeCap, prevTip, baseFee, suggestTip *big.Int, bumpPercent uint64, maxFeeCapWei *big.Int) (*big.Int, *big.Int, bool) {
+	minFeeCap := ceilBumpPercent(prevFeeCap, bumpPercent)
+	if minFeeCap.Cmp(prevFeeCap) <= 0 {
+		minFeeCap = new(big.Int).Add(prevFeeCap, big.NewInt(1))
+	}
+	minTip := ceilBumpPercent(prevTip, bumpPercent)
+	if prevTip.Sign() > 0 && minTip.Cmp(prevTip) <= 0 {
+		minTip = new(big.Int).Add(prevTip, big.NewInt(1))
+	}
+	if maxFeeCapWei != nil && minFeeCap.Cmp(maxFeeCapWei) > 0 {
+		return nil, nil, false
+	}
+	tip := new(big.Int).Set(minTip)
+	if suggestTip != nil && suggestTip.Cmp(tip) > 0 {
+		tip.Set(suggestTip)
+	}
+	feeCap := new(big.Int).Set(minFeeCap)
+	if baseFee != nil {
+		marketFeeCap := new(big.Int).Add(new(big.Int).Mul(baseFee, big.NewInt(2)), tip)
+		if marketFeeCap.Cmp(feeCap) > 0 {
+			feeCap.Set(marketFeeCap)
+		}
+	}
+	if maxFeeCapWei != nil && feeCap.Cmp(maxFeeCapWei) > 0 {
+		feeCap.Set(maxFeeCapWei)
+		if tip.Cmp(feeCap) > 0 {
+			tip.Set(feeCap)
+		}
+	}
+	if feeCap.Cmp(tip) < 0 {
+		feeCap.Set(tip)
+	}
+	return feeCap, tip, true
+}
+
+// ceilBumpPercent 按百分比向上取整放大费用数值。
+func ceilBumpPercent(value *big.Int, percent uint64) *big.Int {
+	if value == nil || value.Sign() <= 0 {
+		return new(big.Int)
+	}
+	factor := new(big.Int).SetUint64(100 + percent)
+	numerator := new(big.Int).Mul(new(big.Int).Set(value), factor)
+	numerator.Add(numerator, big.NewInt(99))
+	return numerator.Div(numerator, big.NewInt(100))
 }

@@ -81,6 +81,8 @@ type EVMClient interface {
 	BalanceAt(ctx context.Context, account common.Address, number *big.Int) (*big.Int, error)
 	// PendingNonceAt 查询地址待处理 Nonce。
 	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)
+	// NonceAt 查询地址在指定区块（nil 为最新已确认区块）的 Nonce。
+	NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error)
 	// SuggestGasTipCap 查询建议优先费。
 	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
 	// EstimateGas 估算交易 Gas。
@@ -289,6 +291,17 @@ func (c *Client) PendingNonceAt(ctx context.Context, account common.Address) (ui
 	err := c.invoke(ctx, func(client *ethclient.Client) error {
 		var err error
 		result, err = client.PendingNonceAt(ctx, account)
+		return err
+	})
+	return result, err
+}
+
+// NonceAt 查询地址在指定区块（nil 表示最新已确认区块）的 Nonce。
+func (c *Client) NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error) {
+	var result uint64
+	err := c.invoke(ctx, func(client *ethclient.Client) error {
+		var err error
+		result, err = client.NonceAt(ctx, account, blockNumber)
 		return err
 	})
 	return result, err

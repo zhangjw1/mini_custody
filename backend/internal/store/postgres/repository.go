@@ -20,7 +20,7 @@ const (
 	balanceColumns     = `id, user_id, asset_id, asset, available_wei::text, pending_deposit_wei::text, pending_withdrawal_wei::text, version, updated_at`
 	entryColumns       = `id, user_id, asset_id, asset, entry_type, amount_wei::text, reference_type, reference_id, created_at`
 	depositColumns     = `id, user_id, address_id, network, asset, tx_hash, tx_index, block_number, block_hash, amount_wei::text, confirmations, status, created_at, updated_at`
-	withdrawalColumns  = `id, idempotency_key, user_id, address_id, to_address, amount_wei::text, reserved_fee_wei::text, actual_fee_wei::text, nonce::text, gas_limit, max_fee_per_gas_wei::text, max_priority_fee_per_gas_wei::text, raw_tx, tx_hash, block_number, confirmations, status, error_code, error_message, created_at, updated_at`
+	withdrawalColumns  = `id, idempotency_key, user_id, address_id, to_address, amount_wei::text, reserved_fee_wei::text, actual_fee_wei::text, nonce::text, gas_limit, max_fee_per_gas_wei::text, max_priority_fee_per_gas_wei::text, raw_tx, tx_hash, block_number, confirmations, status, error_code, error_message, broadcasted_at, last_broadcast_at, bump_count, created_at, updated_at`
 	checkpointColumns  = `id, network, scanner, last_scanned_block, last_scanned_hash, updated_at`
 	workerErrorColumns = `id, worker, stage, reference_type, reference_id, error_code, error_message, retry_count, first_occurred_at, last_occurred_at`
 )

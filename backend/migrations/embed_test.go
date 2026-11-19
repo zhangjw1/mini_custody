@@ -154,3 +154,31 @@ func TestAdminAuthMigrationDocumentsEveryNewColumn(t *testing.T) {
 		}
 	}
 }
+
+// TestEVMReplacementMigrationDocumentsEveryColumn 验证 000006 迁移新增表与字段都有中文注释。
+func TestEVMReplacementMigrationDocumentsEveryColumn(t *testing.T) {
+	sqlBytes, err := migrationFiles.ReadFile("000006_evm_tx_replacement.up.sql")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	sql := string(sqlBytes)
+	if !strings.Contains(sql, "COMMENT ON TABLE evm_tx_attempts IS") {
+		t.Error("table evm_tx_attempts has no comment")
+	}
+	for _, col := range []string{
+		"id", "business_type", "business_id", "from_address", "nonce",
+		"attempt_no", "tx_hash", "raw_tx", "max_fee_per_gas_wei",
+		"max_priority_fee_per_gas_wei", "gas_limit", "created_at",
+	} {
+		if !strings.Contains(sql, "COMMENT ON COLUMN evm_tx_attempts."+col+" IS") {
+			t.Errorf("column evm_tx_attempts.%s has no comment", col)
+		}
+	}
+	for _, table := range []string{"withdrawals", "token_withdrawals", "token_sweeps", "internal_transfers"} {
+		for _, col := range []string{"broadcasted_at", "last_broadcast_at", "bump_count"} {
+			if !strings.Contains(sql, "COMMENT ON COLUMN "+table+"."+col+" IS") {
+				t.Errorf("column %s.%s has no comment", table, col)
+			}
+		}
+	}
+}

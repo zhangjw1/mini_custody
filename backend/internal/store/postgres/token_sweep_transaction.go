@@ -32,6 +32,7 @@ type TokenSweepSettlement struct {
 	Confirmations int64
 	ErrorCode     string
 	ErrorMessage  string
+	TxHash        string
 }
 
 // AllocateTokenSweepNonce 在用户地址行锁下固定归集金额、分配 Nonce 并进入签名状态。
@@ -155,6 +156,10 @@ func (s *Store) SaveSignedTokenSweep(ctx context.Context, signed SignedTokenSwee
 	if item.Status != TokenSweepSigning || item.Nonce == nil || item.SweepAmountUnits == nil {
 		return TokenSweep{}, false, ErrInvalidState
 	}
+	var fromAddress string
+	if err := tx.QueryRow(ctx, `SELECT address FROM wallet_addresses WHERE id = $1`, item.AddressID).Scan(&fromAddress); err != nil {
+		return TokenSweep{}, false, fmt.Errorf("查询 Token 归集发送地址失败：%w", mapNotFound(err))
+	}
 	item, err = s.scanTokenSweep(tx.QueryRow(ctx, `
 		UPDATE token_sweeps SET gas_limit = $2, max_fee_per_gas_wei = $3::numeric,
 			max_priority_fee_per_gas_wei = $4::numeric, raw_tx = $5, tx_hash = $6,
@@ -165,6 +170,20 @@ func (s *Store) SaveSignedTokenSweep(ctx context.Context, signed SignedTokenSwee
 	))
 	if err != nil {
 		return TokenSweep{}, false, fmt.Errorf("保存已签名 Token 归集失败：%w", err)
+	}
+	if err := insertEVMTxAttemptInTx(ctx, tx, EVMTxAttempt{
+		BusinessType:            EVMBusinessTokenSweep,
+		BusinessID:              item.ID,
+		FromAddress:             fromAddress,
+		Nonce:                   item.Nonce,
+		AttemptNo:               1,
+		TxHash:                  signed.TxHash,
+		RawTx:                   signed.RawTx,
+		MaxFeePerGasWei:         signed.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: signed.MaxPriorityFeePerGasWei,
+		GasLimit:                int64(signed.GasLimit),
+	}); err != nil {
+		return TokenSweep{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return TokenSweep{}, false, fmt.Errorf("提交 Token 归集签名保存事务失败：%w", err)
@@ -195,14 +214,26 @@ func (s *Store) TransitionTokenSweep(ctx context.Context, sweepID int64, target 
 		return item, nil
 	}
 	allowed := (item.Status == TokenSweepSigned && target == TokenSweepBroadcasted) ||
-		(item.Status == TokenSweepBroadcasted && target == TokenSweepConfirming)
+		(item.Status == TokenSweepBroadcasted && target == TokenSweepConfirming) ||
+		((item.Status == TokenSweepSigned || item.Status == TokenSweepBroadcasted || item.Status == TokenSweepConfirming) && target == TokenSweepManualReview)
 	if !allowed {
 		return TokenSweep{}, ErrInvalidState
 	}
-	item, err = s.scanTokenSweep(tx.QueryRow(ctx, `
-		UPDATE token_sweeps SET status = $2, updated_at = CURRENT_TIMESTAMP
-		WHERE id = $1 RETURNING `+tokenSweepColumns, item.ID, target,
-	))
+	if target == TokenSweepBroadcasted {
+		item, err = s.scanTokenSweep(tx.QueryRow(ctx, `
+			UPDATE token_sweeps SET
+				status = $2,
+				broadcasted_at = COALESCE(broadcasted_at, CURRENT_TIMESTAMP),
+				last_broadcast_at = CURRENT_TIMESTAMP,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 RETURNING `+tokenSweepColumns, item.ID, target,
+		))
+	} else {
+		item, err = s.scanTokenSweep(tx.QueryRow(ctx, `
+			UPDATE token_sweeps SET status = $2, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 RETURNING `+tokenSweepColumns, item.ID, target,
+		))
+	}
 	if err != nil {
 		return TokenSweep{}, fmt.Errorf("更新 Token 归集状态失败：%w", err)
 	}
@@ -269,13 +300,16 @@ func (s *Store) FinalizeTokenSweep(ctx context.Context, settlement TokenSweepSet
 	if !settlement.Success {
 		status = TokenSweepFailed
 	}
+	matchedTxHash := strings.ToLower(strings.TrimSpace(settlement.TxHash))
 	item, err = s.scanTokenSweep(tx.QueryRow(ctx, `
 		UPDATE token_sweeps SET block_number = $2, confirmations = GREATEST(confirmations, $3),
 			actual_fee_wei = $4::numeric, status = $5, error_code = NULLIF($6, ''),
-			error_message = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP
+			error_message = NULLIF($7, ''),
+			tx_hash = COALESCE(NULLIF($8, ''), tx_hash),
+			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+tokenSweepColumns,
 		item.ID, settlement.BlockNumber, settlement.Confirmations, settlement.ActualFeeWei.String(),
-		status, settlement.ErrorCode, settlement.ErrorMessage,
+		status, settlement.ErrorCode, settlement.ErrorMessage, matchedTxHash,
 	))
 	if err != nil {
 		return TokenSweep{}, false, fmt.Errorf("保存 Token 归集结算失败：%w", err)

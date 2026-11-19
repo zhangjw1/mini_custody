@@ -22,6 +22,7 @@ type Chain interface {
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
 	BalanceAt(ctx context.Context, account common.Address, number *big.Int) (*big.Int, error)
 	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)
+	NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error)
 	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
 	EstimateGas(ctx context.Context, call ethereum.CallMsg) (uint64, error)
 	SendTransaction(ctx context.Context, tx *types.Transaction) error

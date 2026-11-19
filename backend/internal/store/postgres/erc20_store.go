@@ -81,6 +81,7 @@ func (s *Store) scanTokenSweep(row rowScanner) (TokenSweep, error) {
 		&recognizedAmount, &sweepAmount, &gasTopupTransferID, &nonce, &gasLimit,
 		&maxFee, &maxPriorityFee, &item.RawTx, &txHash, &blockNumber,
 		&item.Confirmations, &actualFee, &item.Status, &errorCode, &errorMessage,
+		&item.BroadcastedAt, &item.LastBroadcastAt, &item.BumpCount,
 		&item.CreatedAt, &item.UpdatedAt,
 	); err != nil {
 		return TokenSweep{}, err
@@ -110,6 +111,8 @@ func (s *Store) scanTokenSweep(row rowScanner) (TokenSweep, error) {
 	item.TxHash = optionalString(txHash)
 	item.ErrorCode = optionalString(errorCode)
 	item.ErrorMessage = optionalString(errorMessage)
+	item.BroadcastedAt = s.localTimePtr(item.BroadcastedAt)
+	item.LastBroadcastAt = s.localTimePtr(item.LastBroadcastAt)
 	item.CreatedAt = s.localTime(item.CreatedAt)
 	item.UpdatedAt = s.localTime(item.UpdatedAt)
 	return item, nil
@@ -127,6 +130,7 @@ func (s *Store) scanInternalTransfer(row rowScanner) (InternalTransfer, error) {
 		&item.FromAddress, &item.ToAddress, &amountWei, &nonce, &gasLimit,
 		&maxFee, &maxPriorityFee, &item.RawTx, &txHash, &blockNumber,
 		&item.Confirmations, &actualFee, &item.Status, &errorCode, &errorMessage,
+		&item.BroadcastedAt, &item.LastBroadcastAt, &item.BumpCount,
 		&item.CreatedAt, &item.UpdatedAt,
 	); err != nil {
 		return InternalTransfer{}, err
@@ -152,6 +156,8 @@ func (s *Store) scanInternalTransfer(row rowScanner) (InternalTransfer, error) {
 	item.TxHash = optionalString(txHash)
 	item.ErrorCode = optionalString(errorCode)
 	item.ErrorMessage = optionalString(errorMessage)
+	item.BroadcastedAt = s.localTimePtr(item.BroadcastedAt)
+	item.LastBroadcastAt = s.localTimePtr(item.LastBroadcastAt)
 	item.CreatedAt = s.localTime(item.CreatedAt)
 	item.UpdatedAt = s.localTime(item.UpdatedAt)
 	return item, nil
@@ -169,6 +175,7 @@ func (s *Store) scanTokenWithdrawal(row rowScanner) (TokenWithdrawal, error) {
 		&item.PlatformWalletID, &item.ToAddress, &amountUnits, &nonce, &gasLimit,
 		&maxFee, &maxPriorityFee, &item.RawTx, &txHash, &blockNumber,
 		&item.Confirmations, &actualFee, &item.Status, &errorCode, &errorMessage,
+		&item.BroadcastedAt, &item.LastBroadcastAt, &item.BumpCount,
 		&item.CreatedAt, &item.UpdatedAt,
 	); err != nil {
 		return TokenWithdrawal{}, err
@@ -194,6 +201,8 @@ func (s *Store) scanTokenWithdrawal(row rowScanner) (TokenWithdrawal, error) {
 	item.TxHash = optionalString(txHash)
 	item.ErrorCode = optionalString(errorCode)
 	item.ErrorMessage = optionalString(errorMessage)
+	item.BroadcastedAt = s.localTimePtr(item.BroadcastedAt)
+	item.LastBroadcastAt = s.localTimePtr(item.LastBroadcastAt)
 	item.CreatedAt = s.localTime(item.CreatedAt)
 	item.UpdatedAt = s.localTime(item.UpdatedAt)
 	return item, nil

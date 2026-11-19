@@ -29,6 +29,7 @@ var businessTables = []string{
 	"btc_sweeps",
 	"btc_withdrawals",
 	"admin_users",
+	"evm_tx_attempts",
 }
 
 type Verification struct {

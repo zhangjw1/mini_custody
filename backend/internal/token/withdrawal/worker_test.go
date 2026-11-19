@@ -24,15 +24,17 @@ const tokenWithdrawalTestMnemonic = "tag volcano eight thank tide danger coast h
 
 // fakeChain 提供 Token 提币测试所需的费用、ETH、Nonce、广播和 Receipt。
 type fakeChain struct {
-	header     *types.Header
-	tip        *big.Int
-	ethBalance *big.Int
-	nonce      uint64
-	latest     uint64
-	receipt    *types.Receipt
-	receiptErr error
-	sendErrors []error
-	sentRaw    [][]byte
+	header         *types.Header
+	tip            *big.Int
+	ethBalance     *big.Int
+	nonce          uint64
+	confirmedNonce uint64
+	latest         uint64
+	receipt        *types.Receipt
+	receiptsByHash map[common.Hash]*types.Receipt
+	receiptErr     error
+	sendErrors     []error
+	sentRaw        [][]byte
 }
 
 // HeaderByNumber 返回固定 EIP-1559 区块头。
@@ -58,6 +60,11 @@ func (f *fakeChain) PendingNonceAt(context.Context, common.Address) (uint64, err
 	return f.nonce, nil
 }
 
+// NonceAt 返回平台钱包测试最新已确认 Nonce。
+func (f *fakeChain) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	return f.confirmedNonce, nil
+}
+
 // SendTransaction 记录完整原始交易并按配置返回广播错误。
 func (f *fakeChain) SendTransaction(_ context.Context, transaction *types.Transaction) error {
 	raw, _ := transaction.MarshalBinary()
@@ -71,7 +78,13 @@ func (f *fakeChain) SendTransaction(_ context.Context, transaction *types.Transa
 }
 
 // TransactionReceipt 返回测试 Receipt 或未找到错误。
-func (f *fakeChain) TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error) {
+func (f *fakeChain) TransactionReceipt(_ context.Context, hash common.Hash) (*types.Receipt, error) {
+	if f.receiptsByHash != nil {
+		if receipt, ok := f.receiptsByHash[hash]; ok && receipt != nil {
+			return receipt, nil
+		}
+		return nil, ethereum.NotFound
+	}
 	return f.receipt, f.receiptErr
 }
 
@@ -134,6 +147,7 @@ func (f *fakeContract) DecodeTransferLog(log types.Log) (erc20.TransferEvent, er
 type fakeStore struct {
 	item       postgres.TokenWithdrawal
 	platform   postgres.PlatformWallet
+	attempts   []postgres.EVMTxAttempt
 	settlement *postgres.TokenWithdrawalSettlement
 	errors     []postgres.WorkerError
 }
@@ -172,12 +186,80 @@ func (f *fakeStore) SaveSignedTokenWithdrawal(_ context.Context, signed postgres
 	f.item.RawTx = append([]byte(nil), signed.RawTx...)
 	f.item.TxHash = signed.TxHash
 	f.item.Status = postgres.WithdrawalSigned
+	f.attempts = append([]postgres.EVMTxAttempt{{
+		BusinessType:            postgres.EVMBusinessTokenWithdrawal,
+		BusinessID:              f.item.ID,
+		Nonce:                   f.item.Nonce,
+		AttemptNo:               int32(len(f.attempts) + 1),
+		TxHash:                  signed.TxHash,
+		RawTx:                   append([]byte(nil), signed.RawTx...),
+		MaxFeePerGasWei:         new(big.Int).Set(signed.MaxFeePerGasWei),
+		MaxPriorityFeePerGasWei: new(big.Int).Set(signed.MaxPriorityFeePerGasWei),
+		GasLimit:                gasLimit,
+		CreatedAt:               time.Now(),
+	}}, f.attempts...)
+	return f.item, true, nil
+}
+
+// ListEVMTxAttempts 返回按尝试序号倒序排列的测试候选交易记录。
+func (f *fakeStore) ListEVMTxAttempts(context.Context, string, int64) ([]postgres.EVMTxAttempt, error) {
+	return append([]postgres.EVMTxAttempt(nil), f.attempts...), nil
+}
+
+// ReplaceTokenWithdrawalTx 保存测试 Token 提币加价替换交易并推进替换次数。
+func (f *fakeStore) ReplaceTokenWithdrawalTx(_ context.Context, replacement postgres.SignedTokenWithdrawal) (postgres.TokenWithdrawal, bool, error) {
+	gasLimit := int64(replacement.GasLimit)
+	f.item.GasLimit = &gasLimit
+	f.item.MaxFeePerGasWei = new(big.Int).Set(replacement.MaxFeePerGasWei)
+	f.item.MaxPriorityFeePerGasWei = new(big.Int).Set(replacement.MaxPriorityFeePerGasWei)
+	f.item.RawTx = append([]byte(nil), replacement.RawTx...)
+	f.item.TxHash = replacement.TxHash
+	f.item.BumpCount++
+	now := time.Now()
+	f.item.LastBroadcastAt = &now
+	f.attempts = append([]postgres.EVMTxAttempt{{
+		BusinessType:            postgres.EVMBusinessTokenWithdrawal,
+		BusinessID:              f.item.ID,
+		Nonce:                   f.item.Nonce,
+		AttemptNo:               int32(len(f.attempts) + 1),
+		TxHash:                  replacement.TxHash,
+		RawTx:                   append([]byte(nil), replacement.RawTx...),
+		MaxFeePerGasWei:         new(big.Int).Set(replacement.MaxFeePerGasWei),
+		MaxPriorityFeePerGasWei: new(big.Int).Set(replacement.MaxPriorityFeePerGasWei),
+		GasLimit:                gasLimit,
+		CreatedAt:               now,
+	}}, f.attempts...)
+	return f.item, true, nil
+}
+
+// TouchTokenWithdrawalBroadcast 更新测试 Token 提币最近广播时间。
+func (f *fakeStore) TouchTokenWithdrawalBroadcast(context.Context, int64) (postgres.TokenWithdrawal, error) {
+	now := time.Now()
+	if f.item.BroadcastedAt == nil {
+		f.item.BroadcastedAt = &now
+	}
+	f.item.LastBroadcastAt = &now
+	return f.item, nil
+}
+
+// MarkTokenWithdrawalManualReview 将测试 Token 提币转入人工核查状态。
+func (f *fakeStore) MarkTokenWithdrawalManualReview(_ context.Context, _ int64, errorCode, errorMessage string) (postgres.TokenWithdrawal, bool, error) {
+	f.item.Status = postgres.WithdrawalManualReview
+	f.item.ErrorCode = errorCode
+	f.item.ErrorMessage = errorMessage
 	return f.item, true, nil
 }
 
 // TransitionTokenWithdrawal 更新测试 Token 提币状态。
 func (f *fakeStore) TransitionTokenWithdrawal(_ context.Context, _ int64, target string) (postgres.TokenWithdrawal, error) {
 	f.item.Status = target
+	if target == postgres.WithdrawalBroadcasted {
+		now := time.Now()
+		if f.item.BroadcastedAt == nil {
+			f.item.BroadcastedAt = &now
+		}
+		f.item.LastBroadcastAt = &now
+	}
 	return f.item, nil
 }
 
@@ -195,6 +277,9 @@ func (f *fakeStore) FinalizeTokenWithdrawal(_ context.Context, settlement postgr
 		f.item.Status = postgres.WithdrawalCompleted
 	} else {
 		f.item.Status = postgres.WithdrawalFailed
+	}
+	if settlement.TxHash != "" {
+		f.item.TxHash = settlement.TxHash
 	}
 	return f.item, true, nil
 }
@@ -320,4 +405,66 @@ func newTestWorker(t *testing.T) (*fakeChain, *fakeContract, *fakeStore, *Worker
 		t.Fatalf("NewWorker() error = %v", err)
 	}
 	return chain, contract, store, worker
+}
+
+// TestWorkerRebroadcastsBumpsAndSettlesMatchedTokenAttempt 验证 Token 提币重播、加价替换、多候选结算和人工核查。
+func TestWorkerRebroadcastsBumpsAndSettlesMatchedTokenAttempt(t *testing.T) {
+	chain, contract, store, worker := newTestWorker(t)
+	worker.config.RebroadcastAfter = 10 * time.Second
+	worker.config.BumpAfter = 30 * time.Second
+	worker.config.BumpPercent = 15
+	worker.config.MaxBumps = 3
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	firstHash := common.HexToHash(store.item.TxHash)
+	stale := time.Now().Add(-15 * time.Second)
+	store.item.BroadcastedAt = &stale
+	store.item.LastBroadcastAt = &stale
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("rebroadcast Process() error = %v", err)
+	}
+	if len(chain.sentRaw) != 2 || !bytes.Equal(chain.sentRaw[0], chain.sentRaw[1]) || store.item.BumpCount != 0 {
+		t.Fatalf("sends = %d, bump_count = %d", len(chain.sentRaw), store.item.BumpCount)
+	}
+
+	veryStale := time.Now().Add(-time.Minute)
+	store.item.BroadcastedAt = &veryStale
+	store.item.LastBroadcastAt = &veryStale
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("bump Process() error = %v", err)
+	}
+	if store.item.BumpCount != 1 || len(store.attempts) != 2 || len(chain.sentRaw) != 3 {
+		t.Fatalf("bump_count = %d, attempts = %d, sends = %d", store.item.BumpCount, len(store.attempts), len(chain.sentRaw))
+	}
+
+	chain.latest = 12
+	chain.receiptsByHash = map[common.Hash]*types.Receipt{
+		firstHash: {
+			Status: types.ReceiptStatusSuccessful, BlockNumber: big.NewInt(10), GasUsed: 50_000,
+			EffectiveGasPrice: big.NewInt(100), Logs: []*types.Log{tokenWithdrawalTransferLog(t, contract, store)},
+		},
+	}
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("confirm Process() error = %v", err)
+	}
+	if store.settlement == nil || store.settlement.TxHash != firstHash.Hex() || store.item.Status != postgres.WithdrawalCompleted {
+		t.Fatalf("settlement = %+v, status = %s", store.settlement, store.item.Status)
+	}
+}
+
+// TestWorkerMovesNonceGapTokenWithdrawalToManualReview 验证越过 Nonce 且无 Receipt 时 Token 提币转入人工核查。
+func TestWorkerMovesNonceGapTokenWithdrawalToManualReview(t *testing.T) {
+	chain, _, store, worker := newTestWorker(t)
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	chain.confirmedNonce = store.item.Nonce.Uint64() + 1
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("manual review Process() error = %v", err)
+	}
+	if store.item.Status != postgres.WithdrawalManualReview || len(store.errors) == 0 || store.errors[0].ErrorCode != "EVM_TX_MANUAL_REVIEW" {
+		t.Fatalf("status = %s, errors = %+v", store.item.Status, store.errors)
+	}
 }

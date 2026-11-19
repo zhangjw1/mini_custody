@@ -327,7 +327,7 @@ BROADCAST_UNKNOWN ──> 重播原 raw_tx（保持相同 tx_hash）
                       MANUAL_REVIEW（写 worker_errors，停止自动重发与释放，等待人工处理）
 ```
 
-### 8.3 数据库表结构变更（预留迁移号 `000007_evm_tx_replacement`，注意连续递增）
+### 8.3 数据库表结构变更（迁移号 `000006_evm_tx_replacement`，连续递增）
 1. 为 4 张业务表增加列：
    - `broadcasted_at TIMESTAMPTZ`（首次广播时间戳，重播与加价计时起点）
    - `last_broadcast_at TIMESTAMPTZ`（最近一次广播/重播时间）

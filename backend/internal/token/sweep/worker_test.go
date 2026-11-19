@@ -24,15 +24,17 @@ const sweepTestMnemonic = "tag volcano eight thank tide danger coast health abov
 
 // fakeChain 提供 Token Sweep 测试所需的费用、ETH 余额、Nonce、广播和 Receipt。
 type fakeChain struct {
-	header     *types.Header
-	tip        *big.Int
-	balances   map[common.Address]*big.Int
-	nonce      uint64
-	latest     uint64
-	receipt    *types.Receipt
-	receiptErr error
-	sendErrors []error
-	sentRaw    [][]byte
+	header         *types.Header
+	tip            *big.Int
+	balances       map[common.Address]*big.Int
+	nonce          uint64
+	confirmedNonce uint64
+	latest         uint64
+	receipt        *types.Receipt
+	receiptsByHash map[common.Hash]*types.Receipt
+	receiptErr     error
+	sendErrors     []error
+	sentRaw        [][]byte
 }
 
 // BlockNumber 返回测试最新区块高度。
@@ -57,6 +59,11 @@ func (f *fakeChain) PendingNonceAt(context.Context, common.Address) (uint64, err
 	return f.nonce, nil
 }
 
+// NonceAt 返回用户归集地址测试最新已确认 Nonce。
+func (f *fakeChain) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	return f.confirmedNonce, nil
+}
+
 // SuggestGasTipCap 返回测试建议优先费。
 func (f *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) {
 	return new(big.Int).Set(f.tip), nil
@@ -75,7 +82,13 @@ func (f *fakeChain) SendTransaction(_ context.Context, transaction *types.Transa
 }
 
 // TransactionReceipt 返回测试 Receipt 或未找到错误。
-func (f *fakeChain) TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error) {
+func (f *fakeChain) TransactionReceipt(_ context.Context, hash common.Hash) (*types.Receipt, error) {
+	if f.receiptsByHash != nil {
+		if receipt, ok := f.receiptsByHash[hash]; ok && receipt != nil {
+			return receipt, nil
+		}
+		return nil, ethereum.NotFound
+	}
 	return f.receipt, f.receiptErr
 }
 
@@ -125,6 +138,7 @@ type fakeStore struct {
 	sweep      postgres.TokenSweep
 	address    postgres.WalletAddress
 	platform   postgres.PlatformWallet
+	attempts   []postgres.EVMTxAttempt
 	settlement *postgres.TokenSweepSettlement
 	errors     []postgres.WorkerError
 	failed     bool
@@ -169,12 +183,79 @@ func (f *fakeStore) SaveSignedTokenSweep(_ context.Context, signed postgres.Sign
 	f.sweep.RawTx = append([]byte(nil), signed.RawTx...)
 	f.sweep.TxHash = signed.TxHash
 	f.sweep.Status = postgres.TokenSweepSigned
+	f.attempts = append([]postgres.EVMTxAttempt{{
+		BusinessType:            postgres.EVMBusinessTokenSweep,
+		BusinessID:              f.sweep.ID,
+		Nonce:                   f.sweep.Nonce,
+		AttemptNo:               int32(len(f.attempts) + 1),
+		TxHash:                  signed.TxHash,
+		RawTx:                   append([]byte(nil), signed.RawTx...),
+		MaxFeePerGasWei:         new(big.Int).Set(signed.MaxFeePerGasWei),
+		MaxPriorityFeePerGasWei: new(big.Int).Set(signed.MaxPriorityFeePerGasWei),
+		GasLimit:                int64(signed.GasLimit),
+		CreatedAt:               time.Now(),
+	}}, f.attempts...)
+	return f.sweep, true, nil
+}
+
+// ListEVMTxAttempts 返回按尝试序号倒序排列的测试候选交易记录。
+func (f *fakeStore) ListEVMTxAttempts(context.Context, string, int64) ([]postgres.EVMTxAttempt, error) {
+	return append([]postgres.EVMTxAttempt(nil), f.attempts...), nil
+}
+
+// ReplaceTokenSweepTx 保存测试 Token 归集加价替换交易并推进替换次数。
+func (f *fakeStore) ReplaceTokenSweepTx(_ context.Context, replacement postgres.SignedTokenSweep) (postgres.TokenSweep, bool, error) {
+	f.sweep.GasLimit = int64Pointer(int64(replacement.GasLimit))
+	f.sweep.MaxFeePerGasWei = new(big.Int).Set(replacement.MaxFeePerGasWei)
+	f.sweep.MaxPriorityFeePerGasWei = new(big.Int).Set(replacement.MaxPriorityFeePerGasWei)
+	f.sweep.RawTx = append([]byte(nil), replacement.RawTx...)
+	f.sweep.TxHash = replacement.TxHash
+	f.sweep.BumpCount++
+	now := time.Now()
+	f.sweep.LastBroadcastAt = &now
+	f.attempts = append([]postgres.EVMTxAttempt{{
+		BusinessType:            postgres.EVMBusinessTokenSweep,
+		BusinessID:              f.sweep.ID,
+		Nonce:                   f.sweep.Nonce,
+		AttemptNo:               int32(len(f.attempts) + 1),
+		TxHash:                  replacement.TxHash,
+		RawTx:                   append([]byte(nil), replacement.RawTx...),
+		MaxFeePerGasWei:         new(big.Int).Set(replacement.MaxFeePerGasWei),
+		MaxPriorityFeePerGasWei: new(big.Int).Set(replacement.MaxPriorityFeePerGasWei),
+		GasLimit:                int64(replacement.GasLimit),
+		CreatedAt:               now,
+	}}, f.attempts...)
+	return f.sweep, true, nil
+}
+
+// TouchTokenSweepBroadcast 更新测试 Token 归集最近广播时间戳。
+func (f *fakeStore) TouchTokenSweepBroadcast(context.Context, int64) (postgres.TokenSweep, error) {
+	now := time.Now()
+	if f.sweep.BroadcastedAt == nil {
+		f.sweep.BroadcastedAt = &now
+	}
+	f.sweep.LastBroadcastAt = &now
+	return f.sweep, nil
+}
+
+// MarkTokenSweepManualReview 将测试 Token 归集转入人工核查状态。
+func (f *fakeStore) MarkTokenSweepManualReview(_ context.Context, _ int64, errorCode, errorMessage string) (postgres.TokenSweep, bool, error) {
+	f.sweep.Status = postgres.TokenSweepManualReview
+	f.sweep.ErrorCode = errorCode
+	f.sweep.ErrorMessage = errorMessage
 	return f.sweep, true, nil
 }
 
 // TransitionTokenSweep 更新测试归集状态。
 func (f *fakeStore) TransitionTokenSweep(_ context.Context, _ int64, target string) (postgres.TokenSweep, error) {
 	f.sweep.Status = target
+	if target == postgres.TokenSweepBroadcasted {
+		now := time.Now()
+		if f.sweep.BroadcastedAt == nil {
+			f.sweep.BroadcastedAt = &now
+		}
+		f.sweep.LastBroadcastAt = &now
+	}
 	return f.sweep, nil
 }
 
@@ -192,6 +273,9 @@ func (f *fakeStore) FinalizeTokenSweep(_ context.Context, settlement postgres.To
 		f.sweep.Status = postgres.TokenSweepCompleted
 	} else {
 		f.sweep.Status = postgres.TokenSweepFailed
+	}
+	if settlement.TxHash != "" {
+		f.sweep.TxHash = settlement.TxHash
 	}
 	return f.sweep, true, nil
 }
@@ -379,3 +463,71 @@ func newTestWorker(t *testing.T) (*fakeChain, *fakeContractChain, *fakeStore, *W
 
 // int64Pointer 返回测试需要的 int64 指针。
 func int64Pointer(value int64) *int64 { return &value }
+
+// TestWorkerRebroadcastsBumpsAndSettlesMatchedSweepAttempt 验证 Token 归集重播、加价替换和早期尝试结算。
+func TestWorkerRebroadcastsBumpsAndSettlesMatchedSweepAttempt(t *testing.T) {
+	chain, contractChain, store, worker := newTestWorker(t)
+	worker.config.RebroadcastAfter = 10 * time.Second
+	worker.config.BumpAfter = 30 * time.Second
+	worker.config.BumpPercent = 15
+	worker.config.MaxBumps = 3
+
+	from := common.HexToAddress(store.address.Address)
+	to := common.HexToAddress(store.platform.Address)
+	contractChain.balances[from] = big.NewInt(1_000)
+
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	firstHash := common.HexToHash(store.sweep.TxHash)
+	stale := time.Now().Add(-15 * time.Second)
+	store.sweep.BroadcastedAt = &stale
+	store.sweep.LastBroadcastAt = &stale
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("rebroadcast Process() error = %v", err)
+	}
+	if len(chain.sentRaw) != 2 || !bytes.Equal(chain.sentRaw[0], chain.sentRaw[1]) || store.sweep.BumpCount != 0 {
+		t.Fatalf("sends = %d, bump_count = %d", len(chain.sentRaw), store.sweep.BumpCount)
+	}
+
+	veryStale := time.Now().Add(-time.Minute)
+	store.sweep.BroadcastedAt = &veryStale
+	store.sweep.LastBroadcastAt = &veryStale
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("bump Process() error = %v", err)
+	}
+	if store.sweep.BumpCount != 1 || len(store.attempts) != 2 || len(chain.sentRaw) != 3 {
+		t.Fatalf("bump_count = %d, attempts = %d, sends = %d", store.sweep.BumpCount, len(store.attempts), len(chain.sentRaw))
+	}
+
+	chain.latest = 12
+	contractChain.balances[to] = big.NewInt(1_000)
+	chain.receiptsByHash = map[common.Hash]*types.Receipt{
+		firstHash: {
+			Status: types.ReceiptStatusSuccessful, BlockNumber: big.NewInt(10), GasUsed: 50_000,
+			EffectiveGasPrice: big.NewInt(100), Logs: []*types.Log{transferLog(t, contractChain, from, to, big.NewInt(1_000))},
+		},
+	}
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("confirm Process() error = %v", err)
+	}
+	if store.settlement == nil || store.settlement.TxHash != firstHash.Hex() || store.sweep.Status != postgres.TokenSweepCompleted {
+		t.Fatalf("settlement = %+v, status = %s", store.settlement, store.sweep.Status)
+	}
+}
+
+// TestWorkerMovesNonceGapSweepToManualReview 验证越过 Nonce 且无 Receipt 时 Token 归集转入人工核查。
+func TestWorkerMovesNonceGapSweepToManualReview(t *testing.T) {
+	chain, contractChain, store, worker := newTestWorker(t)
+	contractChain.balances[common.HexToAddress(store.address.Address)] = big.NewInt(1_000)
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	chain.confirmedNonce = store.sweep.Nonce.Uint64() + 1
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("manual review Process() error = %v", err)
+	}
+	if store.sweep.Status != postgres.TokenSweepManualReview || len(store.errors) == 0 || store.errors[0].ErrorCode != "EVM_TX_MANUAL_REVIEW" {
+		t.Fatalf("status = %s, errors = %+v", store.sweep.Status, store.errors)
+	}
+}

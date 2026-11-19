@@ -36,6 +36,11 @@ func (handlerChain) BalanceAt(context.Context, common.Address, *big.Int) (*big.I
 // PendingNonceAt 返回测试 Nonce。
 func (handlerChain) PendingNonceAt(context.Context, common.Address) (uint64, error) { return 0, nil }
 
+// NonceAt 返回测试已确认 Nonce。
+func (handlerChain) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	return 0, nil
+}
+
 // SuggestGasTipCap 返回测试优先费。
 func (handlerChain) SuggestGasTipCap(context.Context) (*big.Int, error) { return big.NewInt(2), nil }
 
