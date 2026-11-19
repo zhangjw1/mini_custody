@@ -32,9 +32,15 @@
 
 ## 2. 接口列表
 
+除 `/healthz`、`/livez`、`/readyz` 和 `POST /api/v1/auth/login` 外，所有 `/api/v1/*` 接口均需携带管理员 JWT（`Authorization: Bearer <token>`）或自动化 `X-API-Key` 请求头。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/users` | 查询演示用户 |
+| POST | `/auth/login` | 管理员账号密码登录并获取 JWT |
+| GET | `/auth/me` | 获取当前管理员身份信息 |
+| GET | `/users` | 查询托管用户列表 |
+| POST | `/users` | 新建托管用户并原子派生充值地址 |
+| PATCH | `/users/{user_id}` | 更新托管用户名称、备注及启用状态 |
 | GET | `/assets` | 查询链上资产配置 |
 | GET | `/users/{user_id}/wallet` | 查询用户充值地址和余额 |
 | GET | `/users/{user_id}/balances` | 查询用户全部资产余额 |

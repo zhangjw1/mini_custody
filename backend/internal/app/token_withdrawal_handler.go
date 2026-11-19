@@ -2,11 +2,8 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -125,20 +122,12 @@ func (a *App) createTokenWithdrawal(w http.ResponseWriter, r *http.Request) {
 
 // decodeTokenWithdrawalRequest 严格读取用户 ID 和单个 Token 提币 JSON 对象。
 func decodeTokenWithdrawalRequest(w http.ResponseWriter, r *http.Request) (int64, tokenWithdrawalRequest, bool) {
-	userID, err := strconv.ParseInt(r.PathValue("user_id"), 10, 64)
-	if err != nil || userID <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_USER_ID", "用户 ID 无效")
+	userID, ok := parseUserID(w, r)
+	if !ok {
 		return 0, tokenWithdrawalRequest{}, false
 	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	decoder.DisallowUnknownFields()
 	var request tokenWithdrawalRequest
-	if err := decoder.Decode(&request); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_BODY", "请求体格式无效")
-		return 0, tokenWithdrawalRequest{}, false
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_BODY", "请求体只能包含一个 JSON 对象")
+	if !decodeJSONBody(w, r, &request) {
 		return 0, tokenWithdrawalRequest{}, false
 	}
 	return userID, request, true
@@ -185,6 +174,8 @@ func (a *App) writeTokenWithdrawalError(ctx context.Context, w http.ResponseWrit
 		writeAPIError(w, http.StatusBadRequest, "INVALID_TOKEN_WITHDRAWAL", err.Error())
 	case errors.Is(err, postgres.ErrNotFound):
 		writeAPIError(w, http.StatusNotFound, "USER_OR_ASSET_NOT_FOUND", "用户、Token 余额或平台钱包不存在")
+	case errors.Is(err, postgres.ErrUserDisabled):
+		writeAPIError(w, http.StatusForbidden, "USER_DISABLED", "该托管用户已被禁用，禁止提币")
 	case errors.Is(err, postgres.ErrInsufficientBalance):
 		writeAPIError(w, http.StatusConflict, "INSUFFICIENT_TOKEN_BALANCE", "Token 可用余额不足")
 	case errors.Is(err, postgres.ErrIdempotencyConflict):

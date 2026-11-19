@@ -15,6 +15,7 @@ type Chain interface {
 	Block(context.Context, string) (bitcoin.Block, error)
 }
 type ScannerStore interface {
+	ListBTCAddresses(context.Context) (map[string]Address, error)
 	BTCCheckpoint(context.Context) (int64, string, error)
 	RecordBTCDepositsAndCheckpoint(context.Context, []DepositObservation, Checkpoint) (int, error)
 	ListConfirmingBTCDeposits(context.Context, int) ([]ConfirmingDeposit, error)
@@ -66,8 +67,13 @@ func (s *Scanner) Run(ctx context.Context) error {
 	}
 }
 
-// RunOnce 扫描一批新区块并推进检查点。
+// RunOnce 刷新托管地址索引、扫描一批新区块并推进检查点。
 func (s *Scanner) RunOnce(ctx context.Context) error {
+	if latestAddresses, err := s.store.ListBTCAddresses(ctx); err != nil {
+		return err
+	} else {
+		s.addresses = latestAddresses
+	}
 	tip, err := s.chain.BlockCount(ctx)
 	if err != nil {
 		return err

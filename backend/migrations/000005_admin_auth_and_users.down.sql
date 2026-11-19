@@ -1,0 +1,7 @@
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_status_check;
+ALTER TABLE users DROP COLUMN IF EXISTS note;
+ALTER TABLE users DROP COLUMN IF EXISTS status;
+
+COMMENT ON TABLE users IS '演示用户表';
+
+DROP TABLE IF EXISTS admin_users;

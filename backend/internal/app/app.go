@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/xiaoqi/mini-custody/backend/internal/auth"
 	"github.com/xiaoqi/mini-custody/backend/internal/btc"
 	bitcoinchain "github.com/xiaoqi/mini-custody/backend/internal/chain/bitcoin"
 	"github.com/xiaoqi/mini-custody/backend/internal/chain/evm"
@@ -34,6 +36,8 @@ type App struct {
 	pool                    *pgxpool.Pool
 	store                   *postgres.Store
 	apiStore                APIStore
+	authStore               AuthStore
+	jwtSecret               []byte
 	keys                    wallet.KeyProvider
 	chain                   *evm.Client
 	tokenContract           *erc20.Contract
@@ -111,8 +115,12 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	if err != nil {
 		return nil, err
 	}
-	if err := store.BootstrapDemoUsers(ctx, provider); err != nil {
-		return nil, fmt.Errorf("初始化演示用户失败：%w", err)
+	jwtSecret, err := resolveJWTSecret(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureBootstrapAdmin(ctx, store, cfg, logger); err != nil {
+		return nil, err
 	}
 	var bitcoinClient *bitcoinchain.Client
 	var bitcoinScanner *btc.Scanner
@@ -260,6 +268,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		pool:                  pool,
 		store:                 store,
 		apiStore:              store,
+		authStore:             store,
+		jwtSecret:             jwtSecret,
 		keys:                  provider,
 		chain:                 chainClient,
 		tokenContract:         tokenContract,
@@ -278,41 +288,50 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", application.health)
-	mux.HandleFunc("GET /api/v1/users", application.listUsers)
-	mux.HandleFunc("GET /api/v1/assets", application.listAssets)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/wallet", application.getWallet)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-wallet", application.getBitcoinWallet)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-deposits", application.listBitcoinDeposits)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/balances", application.listUserBalances)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/deposits", application.listDeposits)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/token-deposits", application.listTokenDeposits)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/withdrawals", application.listWithdrawals)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/token-withdrawals", application.listTokenWithdrawals)
-	mux.HandleFunc("POST /api/v1/users/{user_id}/withdrawal-quote", application.quoteWithdrawal)
-	mux.HandleFunc("POST /api/v1/users/{user_id}/withdrawals", application.createWithdrawal)
+	mux.HandleFunc("GET /livez", application.livez)
+	mux.HandleFunc("GET /readyz", application.health)
+	mux.HandleFunc("POST /api/v1/auth/login", application.login)
+
+	mux.HandleFunc("GET /api/v1/auth/me", application.requireAdminAuth(application.me))
+	mux.HandleFunc("GET /api/v1/users", application.requireAdminAuth(application.listUsers))
+	mux.HandleFunc("POST /api/v1/users", application.requireAdminAuth(application.createUser))
+	mux.HandleFunc("PATCH /api/v1/users/{user_id}", application.requireAdminAuth(application.updateUser))
+	mux.HandleFunc("GET /api/v1/assets", application.requireAdminAuth(application.listAssets))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/wallet", application.requireAdminAuth(application.getWallet))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-wallet", application.requireAdminAuth(application.getBitcoinWallet))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-deposits", application.requireAdminAuth(application.listBitcoinDeposits))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/balances", application.requireAdminAuth(application.listUserBalances))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/deposits", application.requireAdminAuth(application.listDeposits))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/token-deposits", application.requireAdminAuth(application.listTokenDeposits))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/withdrawals", application.requireAdminAuth(application.listWithdrawals))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/token-withdrawals", application.requireAdminAuth(application.listTokenWithdrawals))
+	mux.HandleFunc("POST /api/v1/users/{user_id}/withdrawal-quote", application.requireAdminAuth(application.quoteWithdrawal))
+	mux.HandleFunc("POST /api/v1/users/{user_id}/withdrawals", application.requireAdminAuth(application.createWithdrawal))
 	if application.tokenWithdrawals != nil {
-		mux.HandleFunc("POST /api/v1/users/{user_id}/token-withdrawal-quote", application.quoteTokenWithdrawal)
-		mux.HandleFunc("POST /api/v1/users/{user_id}/token-withdrawals", application.createTokenWithdrawal)
+		mux.HandleFunc("POST /api/v1/users/{user_id}/token-withdrawal-quote", application.requireAdminAuth(application.quoteTokenWithdrawal))
+		mux.HandleFunc("POST /api/v1/users/{user_id}/token-withdrawals", application.requireAdminAuth(application.createTokenWithdrawal))
 	}
-	mux.HandleFunc("GET /api/v1/withdrawals/{withdrawal_id}", application.getWithdrawal)
-	mux.HandleFunc("GET /api/v1/token-withdrawals/{withdrawal_id}", application.getTokenWithdrawal)
-	mux.HandleFunc("GET /api/v1/transactions", application.listTransactions)
-	mux.HandleFunc("GET /api/v1/sweeps", application.listTokenSweeps)
-	mux.HandleFunc("GET /api/v1/btc/sweeps", application.listBitcoinSweeps)
+	mux.HandleFunc("GET /api/v1/withdrawals/{withdrawal_id}", application.requireAdminAuth(application.getWithdrawal))
+	mux.HandleFunc("GET /api/v1/token-withdrawals/{withdrawal_id}", application.requireAdminAuth(application.getTokenWithdrawal))
+	mux.HandleFunc("GET /api/v1/transactions", application.requireAdminAuth(application.listTransactions))
+	mux.HandleFunc("GET /api/v1/sweeps", application.requireAdminAuth(application.listTokenSweeps))
+	mux.HandleFunc("GET /api/v1/btc/sweeps", application.requireAdminAuth(application.listBitcoinSweeps))
 	if application.bitcoinWithdrawals != nil {
-		mux.HandleFunc("POST /api/v1/users/{user_id}/btc-withdrawals", application.createBitcoinWithdrawal)
-		mux.HandleFunc("GET /api/v1/users/{user_id}/btc-withdrawals", application.listBitcoinWithdrawals)
-		mux.HandleFunc("GET /api/v1/btc-withdrawals/{withdrawal_id}", application.getBitcoinWithdrawal)
+		mux.HandleFunc("POST /api/v1/users/{user_id}/btc-withdrawals", application.requireAdminAuth(application.createBitcoinWithdrawal))
+		mux.HandleFunc("GET /api/v1/users/{user_id}/btc-withdrawals", application.requireAdminAuth(application.listBitcoinWithdrawals))
+		mux.HandleFunc("GET /api/v1/btc-withdrawals/{withdrawal_id}", application.requireAdminAuth(application.getBitcoinWithdrawal))
 	}
-	mux.HandleFunc("GET /api/v1/internal-transfers", application.listInternalTransfers)
-	mux.HandleFunc("GET /api/v1/system/platform-wallet", application.getPlatformWalletStatus)
-	mux.HandleFunc("GET /api/v1/system/chains/sepolia", application.getChainStatus)
-	mux.HandleFunc("GET /api/v1/worker-errors", application.listWorkerErrors)
+	mux.HandleFunc("GET /api/v1/internal-transfers", application.requireAdminAuth(application.listInternalTransfers))
+	mux.HandleFunc("GET /api/v1/system/platform-wallet", application.requireAdminAuth(application.getPlatformWalletStatus))
+	mux.HandleFunc("GET /api/v1/system/chains/sepolia", application.requireAdminAuth(application.getChainStatus))
+	mux.HandleFunc("GET /api/v1/worker-errors", application.requireAdminAuth(application.listWorkerErrors))
 	application.server = &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           application.requestContext(mux),
 		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       time.Minute,
+		ReadTimeout:       cfg.HTTP.ReadTimeout,
+		WriteTimeout:      cfg.HTTP.WriteTimeout,
+		IdleTimeout:       cfg.HTTP.IdleTimeout,
 	}
 	failed = false
 	chainFailed = false
@@ -389,24 +408,18 @@ func (a *App) Run(ctx context.Context) error {
 		// 前面components只是定义了组件，后面go func()中才是真正的启动组件
 		go func() { results <- componentResult{name: item.name, err: item.run()} }()
 	}
-	// 主线程被阻塞，等待所有组件启动完成或者关闭。
+	// 阻塞等待第一个退出的组件或外部取消信号。
 	select {
-	// result是channel里拿到的第一个事件
 	case result := <-results:
 		cancel()
-		// web组件是特殊的，不监听 runCtx，不受cancel方法控制，需要主动 shutdownServer() 关它
 		if result.name != "web" {
 			if shutdownErr := a.shutdownServer(); shutdownErr != nil {
+				waitRemainingComponents(results, len(components)-1, 15*time.Second)
 				return shutdownErr
 			}
 		}
-		// 循环所有的worker，从channel里取出来，并判断是哪个组件停止了
-		for index := 1; index < len(components); index++ {
-			// 每次只从channel里取一个出来
-			other := <-results
-			if result.err == nil && other.err != nil {
-				result = other
-			}
+		if firstErr := waitRemainingComponents(results, len(components)-1, 15*time.Second); result.err == nil && firstErr != nil {
+			result.err = firstErr
 		}
 		if result.err != nil {
 			return fmt.Errorf("应用组件 %s 已停止：%w", result.name, result.err)
@@ -414,17 +427,69 @@ func (a *App) Run(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		cancel()
-		if err := a.shutdownServer(); err != nil {
-			return err
+		shutdownErr := a.shutdownServer()
+		waitErr := waitRemainingComponents(results, len(components), 15*time.Second)
+		if shutdownErr != nil {
+			return shutdownErr
 		}
-		for range components {
-			result := <-results
-			if result.err != nil {
-				return fmt.Errorf("关闭应用组件 %s 失败：%w", result.name, result.err)
-			}
+		if waitErr != nil {
+			return fmt.Errorf("关闭应用组件失败：%w", waitErr)
 		}
 		return nil
 	}
+}
+
+// waitRemainingComponents 带超时等待其余后台组件退出，避免过早关闭数据库连接池。
+func waitRemainingComponents(results <-chan componentResult, remaining int, timeout time.Duration) error {
+	if remaining <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var firstErr error
+	for i := 0; i < remaining; i++ {
+		select {
+		case item := <-results:
+			if firstErr == nil && item.err != nil {
+				firstErr = item.err
+			}
+		case <-timer.C:
+			if firstErr != nil {
+				return firstErr
+			}
+			return errors.New("等待后台组件退出超时")
+		}
+	}
+	return firstErr
+}
+
+// resolveJWTSecret 加载并校验 JWT 签名密钥，未配置时在开发环境自动生成临时密钥。
+func resolveJWTSecret(cfg config.Config, logger *slog.Logger) ([]byte, error) {
+	if cfg.Auth.JWTSecret != "" {
+		return []byte(cfg.Auth.JWTSecret), nil
+	}
+	secret, err := auth.GenerateRandomSecret()
+	if err != nil {
+		return nil, err
+	}
+	logger.Warn("未配置 JWT_SECRET，已为当前开发进程生成临时签名密钥")
+	return secret, nil
+}
+
+// ensureBootstrapAdmin 根据启动配置幂等初始化首个管理员账号。
+func ensureBootstrapAdmin(ctx context.Context, store *postgres.Store, cfg config.Config, logger *slog.Logger) error {
+	if strings.TrimSpace(cfg.Auth.BootstrapPassword) == "" {
+		logger.Warn("未配置 ADMIN_BOOTSTRAP_PASSWORD，若数据库尚无管理员将无法登录管理后台")
+		return nil
+	}
+	hash, err := auth.HashPassword(cfg.Auth.BootstrapPassword)
+	if err != nil {
+		return fmt.Errorf("生成初始管理员密码哈希失败：%w", err)
+	}
+	if err := store.EnsureBootstrapAdmin(ctx, cfg.Auth.BootstrapUsername, hash, cfg.Auth.BootstrapDisplayName); err != nil {
+		return fmt.Errorf("初始化管理员账号失败：%w", err)
+	}
+	return nil
 }
 
 // shutdownServer 在限定时间内优雅关闭 HTTP 服务。
@@ -437,14 +502,22 @@ func (a *App) shutdownServer() error {
 	return nil
 }
 
-// health 检查数据库连接并返回服务健康状态。
+// livez 返回进程存活探针状态，不检查外部依赖。
+func (a *App) livez(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "ok",
+		"time":   time.Now().In(a.timezoneOrUTC()).Format(time.RFC3339),
+	})
+}
+
+// health 检查数据库连接与链上组件就绪状态，余额偏低仅作为告警而不返回 503。
 func (a *App) health(w http.ResponseWriter, _ *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	status := http.StatusOK
 	response := map[string]string{
 		"status": "ok",
-		"time":   time.Now().In(a.config.Timezone).Format(time.RFC3339),
+		"time":   time.Now().In(a.timezoneOrUTC()).Format(time.RFC3339),
 	}
 	if err := a.pool.Ping(ctx); err != nil {
 		status = http.StatusServiceUnavailable
@@ -458,6 +531,7 @@ func (a *App) health(w http.ResponseWriter, _ *http.Request) {
 	response["scan_height"] = fmt.Sprintf("%d", chainHealth.ScanHeight)
 	if chainHealth.Status == "DOWN" {
 		status = http.StatusServiceUnavailable
+		response["status"] = "unavailable"
 	}
 	if a.tokenScanner != nil {
 		tokenHealth := a.tokenScanner.Snapshot()
@@ -470,6 +544,7 @@ func (a *App) health(w http.ResponseWriter, _ *http.Request) {
 		}
 		if tokenHealth.Status == "DOWN" {
 			status = http.StatusServiceUnavailable
+			response["status"] = "unavailable"
 		}
 	}
 	if a.gasStation != nil {
@@ -480,7 +555,7 @@ func (a *App) health(w http.ResponseWriter, _ *http.Request) {
 		if gasHealth.LastError != "" {
 			response["gas_station_last_error"] = gasHealth.LastError
 		}
-		if gasHealth.Status == "DOWN" || gasHealth.Status == "LOW_BALANCE" {
+		if gasHealth.Status == "DOWN" {
 			status = http.StatusServiceUnavailable
 			response["status"] = "unavailable"
 		}
@@ -495,6 +570,18 @@ func (a *App) health(w http.ResponseWriter, _ *http.Request) {
 		if sweepHealth.Status == "DOWN" {
 			status = http.StatusServiceUnavailable
 			response["status"] = "unavailable"
+		}
+	}
+	if a.bitcoinClient != nil {
+		height, btcErr := a.bitcoinClient.BlockCount(ctx)
+		if btcErr != nil {
+			response["bitcoin_status"] = "DOWN"
+			response["bitcoin_last_error"] = btcErr.Error()
+			status = http.StatusServiceUnavailable
+			response["status"] = "unavailable"
+		} else {
+			response["bitcoin_status"] = "HEALTHY"
+			response["bitcoin_network_height"] = fmt.Sprintf("%d", height)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")

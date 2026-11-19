@@ -16,6 +16,7 @@ import (
 // settings 使用 Viper 统一读取环境变量，同时保留现有的大写下划线命名约定。
 var settings = newViper()
 
+// newViper 创建并初始化支持环境变量自动映射的 Viper 实例。
 func newViper() *viper.Viper {
 	v := viper.New()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -66,9 +67,28 @@ type BitcoinConfig struct {
 	SweepFeeRateSatVB            int64
 }
 
+// AuthConfig 描述管理后台 JWT 鉴权、自动化 API Key 与首个管理员初始化配置。
+type AuthConfig struct {
+	JWTSecret            string
+	JWTTTL               time.Duration
+	APIKey               string
+	BootstrapUsername    string
+	BootstrapPassword    string
+	BootstrapDisplayName string
+}
+
+// HTTPConfig 描述 HTTP 服务器读写与空闲超时配置。
+type HTTPConfig struct {
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	IdleTimeout  time.Duration
+}
+
 type Config struct {
 	AppEnv                 string
 	HTTPAddr               string
+	HTTP                   HTTPConfig
+	Auth                   AuthConfig
 	Timezone               *time.Location
 	DatabaseURL            string
 	CustodyKeyStoreFile    string
@@ -157,8 +177,21 @@ func load(requireCustody bool) (Config, error) {
 	}
 
 	cfg := Config{
-		AppEnv:                 envOrDefault("APP_ENV", "development"),
-		HTTPAddr:               envOrDefault("HTTP_ADDR", ":8080"),
+		AppEnv:   envOrDefault("APP_ENV", "development"),
+		HTTPAddr: envOrDefault("HTTP_ADDR", ":8080"),
+		HTTP: HTTPConfig{
+			ReadTimeout:  durationOrDefault("HTTP_READ_TIMEOUT", 15*time.Second),
+			WriteTimeout: durationOrDefault("HTTP_WRITE_TIMEOUT", 30*time.Second),
+			IdleTimeout:  durationOrDefault("HTTP_IDLE_TIMEOUT", time.Minute),
+		},
+		Auth: AuthConfig{
+			JWTSecret:            strings.TrimSpace(settings.GetString("JWT_SECRET")),
+			JWTTTL:               durationOrDefault("JWT_TTL", 24*time.Hour),
+			APIKey:               strings.TrimSpace(settings.GetString("API_KEY")),
+			BootstrapUsername:    envOrDefault("ADMIN_BOOTSTRAP_USERNAME", "admin"),
+			BootstrapPassword:    settings.GetString("ADMIN_BOOTSTRAP_PASSWORD"),
+			BootstrapDisplayName: envOrDefault("ADMIN_BOOTSTRAP_DISPLAY_NAME", "系统管理员"),
+		},
 		Timezone:               timezone,
 		DatabaseURL:            strings.TrimSpace(settings.GetString("DATABASE_URL")),
 		CustodyKeyStoreFile:    strings.TrimSpace(settings.GetString("CUSTODY_KEYSTORE_FILE")),
@@ -243,6 +276,18 @@ func (c Config) validate(requireCustody bool) error {
 	}
 	if c.Timezone == nil {
 		return errors.New("必须配置时区")
+	}
+	if c.HTTP.ReadTimeout <= 0 || c.HTTP.WriteTimeout <= 0 || c.HTTP.IdleTimeout <= 0 {
+		return errors.New("HTTP 超时配置无效")
+	}
+	if c.Auth.JWTTTL <= 0 {
+		return errors.New("JWT_TTL 必须大于零")
+	}
+	if c.Auth.JWTSecret != "" && len(c.Auth.JWTSecret) < 32 {
+		return errors.New("JWT_SECRET 长度不能少于 32 字节")
+	}
+	if strings.EqualFold(c.AppEnv, "production") && len(c.Auth.JWTSecret) < 32 {
+		return errors.New("生产环境必须配置至少 32 字节的 JWT_SECRET")
 	}
 	if c.SepoliaRPCTimeout <= 0 || c.SepoliaRPCMaxAttempts <= 0 || c.SepoliaRPCBaseDelay < 0 || c.SepoliaRPCMaxDelay < c.SepoliaRPCBaseDelay {
 		return errors.New("Sepolia RPC 重试配置无效")

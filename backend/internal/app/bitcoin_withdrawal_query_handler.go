@@ -3,16 +3,16 @@ package app
 import (
 	"errors"
 	"net/http"
-	"strconv"
 
+	"github.com/xiaoqi/mini-custody/backend/internal/btc"
+	"github.com/xiaoqi/mini-custody/backend/internal/logging"
 	"github.com/xiaoqi/mini-custody/backend/internal/store/postgres"
 )
 
 // getBitcoinWithdrawal 返回 BTC 提币状态。
 func (a *App) getBitcoinWithdrawal(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("withdrawal_id"), 10, 64)
-	if err != nil || id <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_WITHDRAWAL_ID", "提币 ID 无效")
+	id, ok := parsePositivePathID(w, r, "withdrawal_id", "INVALID_WITHDRAWAL_ID", "提币 ID 无效")
+	if !ok {
 		return
 	}
 	item, err := a.store.BTCWithdrawalByID(r.Context(), id)
@@ -21,7 +21,8 @@ func (a *App) getBitcoinWithdrawal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "BITCOIN_UNAVAILABLE", "BTC 提币查询失败")
+		logging.WithContext(a.logger, r.Context()).Error("查询 BTC 提币失败", "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "服务器内部错误")
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
@@ -29,23 +30,23 @@ func (a *App) getBitcoinWithdrawal(w http.ResponseWriter, r *http.Request) {
 
 // listBitcoinWithdrawals 返回用户 BTC 提币列表。
 func (a *App) listBitcoinWithdrawals(w http.ResponseWriter, r *http.Request) {
-	userID, err := strconv.ParseInt(r.PathValue("user_id"), 10, 64)
-	if err != nil || userID <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_USER_ID", "用户 ID 无效")
+	userID, ok := parseUserID(w, r)
+	if !ok {
 		return
 	}
-	_, pageSize, offset, ok := parsePage(w, r)
+	page, pageSize, offset, ok := parsePage(w, r)
 	if !ok {
 		return
 	}
 	items, err := a.store.ListBTCWithdrawalsPage(r.Context(), userID, pageSize+1, offset)
 	if err != nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "BITCOIN_UNAVAILABLE", "BTC 提币查询失败")
+		logging.WithContext(a.logger, r.Context()).Error("分页查询 BTC 提币失败", "error", err)
+		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "服务器内部错误")
 		return
 	}
 	hasMore := len(items) > pageSize
 	if hasMore {
 		items = items[:pageSize]
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "page_size": pageSize, "has_more": hasMore})
+	writeJSON(w, http.StatusOK, pageResponse[btc.Withdrawal]{Items: items, Page: page, PageSize: pageSize, HasMore: hasMore})
 }

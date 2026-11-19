@@ -87,13 +87,37 @@ var (
 	ErrPendingBalance       = errors.New("待处理余额小于待结算金额")
 	ErrActualFeeExceedsHold = errors.New("实际网络费超过预留网络费")
 	ErrAssetConfigMismatch  = errors.New("数据库资产配置与启动配置不一致")
+	ErrUserDisabled         = errors.New("用户已被禁用")
+	ErrUserAlreadyExists    = errors.New("用户编码已存在")
+	ErrInvalidUserInput     = errors.New("用户参数无效")
+)
+
+const (
+	UserStatusActive   = "ACTIVE"
+	UserStatusDisabled = "DISABLED"
+	AdminRole          = "ADMIN"
 )
 
 type User struct {
 	ID          int64
 	Code        string
 	DisplayName string
+	Status      string
+	Note        string
 	CreatedAt   time.Time
+}
+
+// AdminUser 描述管理后台管理员账户。
+type AdminUser struct {
+	ID           int64
+	Username     string
+	PasswordHash string
+	DisplayName  string
+	Role         string
+	Disabled     bool
+	LastLoginAt  *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type WalletAddress struct {

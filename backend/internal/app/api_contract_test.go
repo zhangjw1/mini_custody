@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"math/big"
@@ -11,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xiaoqi/mini-custody/backend/internal/auth"
 	"github.com/xiaoqi/mini-custody/backend/internal/config"
 	"github.com/xiaoqi/mini-custody/backend/internal/store/postgres"
+	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 )
 
 // contractStore 为 HTTP API 契约测试提供固定数据。
@@ -30,7 +34,7 @@ func (c *contractStore) ListAssets(context.Context) ([]postgres.Asset, error) {
 
 // ListUsers 返回一个测试用户。
 func (c *contractStore) ListUsers(context.Context) ([]postgres.User, error) {
-	return []postgres.User{{ID: 1, Code: "demo-alice", DisplayName: "演示用户 Alice", CreatedAt: c.createdAt}}, nil
+	return []postgres.User{{ID: 1, Code: "alice", DisplayName: "Alice", Status: postgres.UserStatusActive, CreatedAt: c.createdAt}}, nil
 }
 
 // UserByID 返回测试用户或未找到错误。
@@ -38,7 +42,44 @@ func (c *contractStore) UserByID(_ context.Context, id int64) (postgres.User, er
 	if id != 1 {
 		return postgres.User{}, postgres.ErrNotFound
 	}
-	return postgres.User{ID: 1, Code: "demo-alice", DisplayName: "演示用户 Alice", CreatedAt: c.createdAt}, nil
+	return postgres.User{ID: 1, Code: "alice", DisplayName: "Alice", Status: postgres.UserStatusActive, CreatedAt: c.createdAt}, nil
+}
+
+// AdminByUsername 返回测试管理员记录。
+func (c *contractStore) AdminByUsername(_ context.Context, username string) (postgres.AdminUser, error) {
+	if username != "admin" {
+		return postgres.AdminUser{}, postgres.ErrNotFound
+	}
+	hash, _ := auth.HashPassword("Admin@2026")
+	return postgres.AdminUser{
+		ID: 1, Username: "admin", PasswordHash: hash, DisplayName: "系统管理员",
+		Role: postgres.AdminRole, CreatedAt: c.createdAt, UpdatedAt: c.createdAt,
+	}, nil
+}
+
+// AdminByID 返回测试管理员记录。
+func (c *contractStore) AdminByID(_ context.Context, id int64) (postgres.AdminUser, error) {
+	if id != 1 {
+		return postgres.AdminUser{}, postgres.ErrNotFound
+	}
+	return c.AdminByUsername(context.Background(), "admin")
+}
+
+// UpdateAdminLastLogin 在契约测试中空操作返回 nil。
+func (c *contractStore) UpdateAdminLastLogin(context.Context, int64) error { return nil }
+
+// CreateManagedUser 返回新建托管用户及确定性测试地址。
+func (c *contractStore) CreateManagedUser(_ context.Context, code, displayName, note string, _ wallet.KeyProvider, _ *wallet.MnemonicKeyProvider) (postgres.User, postgres.WalletAddress, error) {
+	return postgres.User{ID: 2, Code: code, DisplayName: displayName, Status: postgres.UserStatusActive, Note: note, CreatedAt: c.createdAt},
+		postgres.WalletAddress{ID: 2, UserID: 2, Address: "0x2222222222222222222222222222222222222222"}, nil
+}
+
+// UpdateManagedUser 返回更新后的测试用户。
+func (c *contractStore) UpdateManagedUser(_ context.Context, id int64, displayName, note, status string) (postgres.User, error) {
+	if id != 1 {
+		return postgres.User{}, postgres.ErrNotFound
+	}
+	return postgres.User{ID: 1, Code: "alice", DisplayName: displayName, Note: note, Status: status, CreatedAt: c.createdAt}, nil
 }
 
 // WalletAddressByUser 返回测试托管地址。
@@ -165,11 +206,12 @@ func (c *contractStore) withdrawal() postgres.Withdrawal {
 // TestAPIContractReturnsPreciseAmountsLinksAndRequestID 验证主要查询接口的金额、链接、时间和请求标识契约。
 func TestAPIContractReturnsPreciseAmountsLinksAndRequestID(t *testing.T) {
 	handler := contractHandler(t)
+	token := loginForContractToken(t, handler)
 	tests := []struct {
 		path string
 		want string
 	}{
-		{"/api/v1/users", `"code":"demo-alice"`},
+		{"/api/v1/users", `"code":"alice"`},
 		{"/api/v1/assets", `"symbol":"USDC"`},
 		{"/api/v1/users/1/balances", `"available":"1.5"`},
 		{"/api/v1/users/1/wallet", `"available_wei":"976580409736000"`},
@@ -181,6 +223,7 @@ func TestAPIContractReturnsPreciseAmountsLinksAndRequestID(t *testing.T) {
 	}
 	for _, test := range tests {
 		request := httptest.NewRequest(http.MethodGet, test.path, nil)
+		request.Header.Set("Authorization", "Bearer "+token)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 		body := response.Body.String()
@@ -204,7 +247,9 @@ func TestAPIContractReturnsPreciseAmountsLinksAndRequestID(t *testing.T) {
 // TestAPIContractErrorContainsMatchingRequestID 验证错误 JSON 和响应头使用相同 request_id。
 func TestAPIContractErrorContainsMatchingRequestID(t *testing.T) {
 	handler := contractHandler(t)
+	token := loginForContractToken(t, handler)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/users/999/wallet", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	requestID := response.Header().Get("X-Request-ID")
@@ -216,7 +261,9 @@ func TestAPIContractErrorContainsMatchingRequestID(t *testing.T) {
 // TestAPIContractRejectsInvalidPagination 验证非法分页不会进入数据库查询。
 func TestAPIContractRejectsInvalidPagination(t *testing.T) {
 	handler := contractHandler(t)
+	token := loginForContractToken(t, handler)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/transactions?page_size=101", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "INVALID_PAGINATION") {
@@ -227,6 +274,7 @@ func TestAPIContractRejectsInvalidPagination(t *testing.T) {
 // TestPhase8QueryEndpointsDoNotExposeSensitiveFields 验证 Token 和运维查询路由可用且不返回敏感字段。
 func TestPhase8QueryEndpointsDoNotExposeSensitiveFields(t *testing.T) {
 	handler := contractHandler(t)
+	token := loginForContractToken(t, handler)
 	paths := []string{
 		"/api/v1/users/1/token-deposits",
 		"/api/v1/users/1/token-withdrawals",
@@ -237,6 +285,7 @@ func TestPhase8QueryEndpointsDoNotExposeSensitiveFields(t *testing.T) {
 	}
 	for _, path := range paths {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("Authorization", "Bearer "+token)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 		if response.Code != http.StatusOK {
@@ -250,7 +299,109 @@ func TestPhase8QueryEndpointsDoNotExposeSensitiveFields(t *testing.T) {
 	}
 }
 
-// contractHandler 装配包含 request_id 中间件的 API 契约测试路由。
+// TestAdminAuthMiddlewareAndUserManagement 验证未认证请求返回 401、JWT 与 APIKey 认证、用户管理及错误脱敏。
+func TestAdminAuthMiddlewareAndUserManagement(t *testing.T) {
+	handler := contractHandler(t)
+
+	// 未携带认证凭证访问业务接口必须返回 401。
+	unauth := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+	unauthResp := httptest.NewRecorder()
+	handler.ServeHTTP(unauthResp, unauth)
+	if unauthResp.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want 401", unauthResp.Code)
+	}
+
+	// /livez 无需鉴权即可返回 200。
+	liveReq := httptest.NewRequest(http.MethodGet, "/livez", nil)
+	liveResp := httptest.NewRecorder()
+	handler.ServeHTTP(liveResp, liveReq)
+	if liveResp.Code != http.StatusOK {
+		t.Fatalf("/livez status = %d, want 200", liveResp.Code)
+	}
+
+	// 错误密码登录返回 401。
+	badLogin := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"wrong-password"}`))
+	badLoginResp := httptest.NewRecorder()
+	handler.ServeHTTP(badLoginResp, badLogin)
+	if badLoginResp.Code != http.StatusUnauthorized {
+		t.Fatalf("bad login status = %d, want 401", badLoginResp.Code)
+	}
+
+	// 携带配置的 X-API-Key 允许访问管理员接口。
+	apiKeyReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
+	apiKeyReq.Header.Set("X-API-Key", "test-api-key")
+	apiKeyResp := httptest.NewRecorder()
+	handler.ServeHTTP(apiKeyResp, apiKeyReq)
+	if apiKeyResp.Code != http.StatusOK {
+		t.Fatalf("api key /me status = %d, body = %s", apiKeyResp.Code, apiKeyResp.Body.String())
+	}
+
+	// JWT 登录后可新建并更新托管用户。
+	token := loginForContractToken(t, handler)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(`{"code":"custody-charlie","display_name":"Charlie","note":"VIP"}`))
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createResp := httptest.NewRecorder()
+	handler.ServeHTTP(createResp, createReq)
+	if createResp.Code != http.StatusCreated || !strings.Contains(createResp.Body.String(), `"code":"custody-charlie"`) {
+		t.Fatalf("create user status = %d, body = %s", createResp.Code, createResp.Body.String())
+	}
+
+	updateReq := httptest.NewRequest(http.MethodPatch, "/api/v1/users/1", strings.NewReader(`{"display_name":"Alice v2","note":"已停用","status":"DISABLED"}`))
+	updateReq.Header.Set("Authorization", "Bearer "+token)
+	updateResp := httptest.NewRecorder()
+	handler.ServeHTTP(updateResp, updateReq)
+	if updateResp.Code != http.StatusOK || !strings.Contains(updateResp.Body.String(), `"status":"DISABLED"`) {
+		t.Fatalf("update user status = %d, body = %s", updateResp.Code, updateResp.Body.String())
+	}
+}
+
+// TestBitcoinWithdrawalErrorMappingRedactsSQLState 验证 BTC 提币错误映射状态码准确且绝不暴露 SQLSTATE。
+func TestBitcoinWithdrawalErrorMappingRedactsSQLState(t *testing.T) {
+	application := &App{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{"insufficient", postgres.ErrInsufficientBalance, http.StatusConflict, "INSUFFICIENT_BALANCE"},
+		{"idempotency", postgres.ErrIdempotencyConflict, http.StatusConflict, "IDEMPOTENCY_CONFLICT"},
+		{"disabled", postgres.ErrUserDisabled, http.StatusForbidden, "USER_DISABLED"},
+		{"notfound", postgres.ErrNotFound, http.StatusNotFound, "USER_OR_ASSET_NOT_FOUND"},
+		{"internal", errors.New(`数据库错误：ERROR: duplicate key value violates unique constraint "x" (SQLSTATE 23505)`), http.StatusInternalServerError, "INTERNAL_ERROR"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			application.writeBitcoinWithdrawalError(context.Background(), rec, tc.err)
+			body := rec.Body.String()
+			if rec.Code != tc.wantStatus || !strings.Contains(body, tc.wantCode) {
+				t.Fatalf("status=%d body=%s, want status=%d code=%s", rec.Code, body, tc.wantStatus, tc.wantCode)
+			}
+			if strings.Contains(body, "SQLSTATE") || strings.Contains(body, "constraint") {
+				t.Fatalf("error response leaked internal DB details: %s", body)
+			}
+		})
+	}
+}
+
+// loginForContractToken 调用登录接口获取契约测试使用的有效 JWT。
+func loginForContractToken(t *testing.T, handler http.Handler) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"Admin@2026"}`))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("login status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var payload loginResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil || payload.Token == "" {
+		t.Fatalf("decode login response err=%v token=%q", err, payload.Token)
+	}
+	return payload.Token
+}
+
+// contractHandler 装配包含 request_id 与管理员 JWT 鉴权中间件的 API 契约测试路由。
 func contractHandler(t *testing.T) http.Handler {
 	t.Helper()
 	location, err := time.LoadLocation("Asia/Shanghai")
@@ -258,25 +409,43 @@ func contractHandler(t *testing.T) http.Handler {
 		t.Fatalf("LoadLocation() error = %v", err)
 	}
 	createdAt := time.Date(2026, 8, 15, 11, 10, 0, 0, location)
+	store := &contractStore{createdAt: createdAt}
+	provider, err := wallet.NewMnemonicKeyProvider("tag volcano eight thank tide danger coast health above argue embrace heavy")
+	if err != nil {
+		t.Fatalf("NewMnemonicKeyProvider() error = %v", err)
+	}
 	application := &App{
-		config: config.Config{Timezone: location, SepoliaExplorerBaseURL: "https://sepolia.etherscan.io"},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), apiStore: &contractStore{createdAt: createdAt},
+		config: config.Config{
+			Timezone:               location,
+			SepoliaExplorerBaseURL: "https://sepolia.etherscan.io",
+			Auth:                   config.AuthConfig{JWTTTL: time.Hour, APIKey: "test-api-key"},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		apiStore:  store,
+		authStore: store,
+		jwtSecret: []byte("0123456789abcdef0123456789abcdef"),
+		keys:      provider,
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/users", application.listUsers)
-	mux.HandleFunc("GET /api/v1/assets", application.listAssets)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/wallet", application.getWallet)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/balances", application.listUserBalances)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/deposits", application.listDeposits)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/token-deposits", application.listTokenDeposits)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/withdrawals", application.listWithdrawals)
-	mux.HandleFunc("GET /api/v1/users/{user_id}/token-withdrawals", application.listTokenWithdrawals)
-	mux.HandleFunc("GET /api/v1/withdrawals/{withdrawal_id}", application.getWithdrawal)
-	mux.HandleFunc("GET /api/v1/token-withdrawals/{withdrawal_id}", application.getTokenWithdrawal)
-	mux.HandleFunc("GET /api/v1/transactions", application.listTransactions)
-	mux.HandleFunc("GET /api/v1/sweeps", application.listTokenSweeps)
-	mux.HandleFunc("GET /api/v1/internal-transfers", application.listInternalTransfers)
-	mux.HandleFunc("GET /api/v1/system/platform-wallet", application.getPlatformWalletStatus)
-	mux.HandleFunc("GET /api/v1/worker-errors", application.listWorkerErrors)
+	mux.HandleFunc("GET /livez", application.livez)
+	mux.HandleFunc("POST /api/v1/auth/login", application.login)
+	mux.HandleFunc("GET /api/v1/auth/me", application.requireAdminAuth(application.me))
+	mux.HandleFunc("GET /api/v1/users", application.requireAdminAuth(application.listUsers))
+	mux.HandleFunc("POST /api/v1/users", application.requireAdminAuth(application.createUser))
+	mux.HandleFunc("PATCH /api/v1/users/{user_id}", application.requireAdminAuth(application.updateUser))
+	mux.HandleFunc("GET /api/v1/assets", application.requireAdminAuth(application.listAssets))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/wallet", application.requireAdminAuth(application.getWallet))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/balances", application.requireAdminAuth(application.listUserBalances))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/deposits", application.requireAdminAuth(application.listDeposits))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/token-deposits", application.requireAdminAuth(application.listTokenDeposits))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/withdrawals", application.requireAdminAuth(application.listWithdrawals))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/token-withdrawals", application.requireAdminAuth(application.listTokenWithdrawals))
+	mux.HandleFunc("GET /api/v1/withdrawals/{withdrawal_id}", application.requireAdminAuth(application.getWithdrawal))
+	mux.HandleFunc("GET /api/v1/token-withdrawals/{withdrawal_id}", application.requireAdminAuth(application.getTokenWithdrawal))
+	mux.HandleFunc("GET /api/v1/transactions", application.requireAdminAuth(application.listTransactions))
+	mux.HandleFunc("GET /api/v1/sweeps", application.requireAdminAuth(application.listTokenSweeps))
+	mux.HandleFunc("GET /api/v1/internal-transfers", application.requireAdminAuth(application.listInternalTransfers))
+	mux.HandleFunc("GET /api/v1/system/platform-wallet", application.requireAdminAuth(application.getPlatformWalletStatus))
+	mux.HandleFunc("GET /api/v1/worker-errors", application.requireAdminAuth(application.listWorkerErrors))
 	return application.requestContext(mux)
 }

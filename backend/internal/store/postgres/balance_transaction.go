@@ -312,6 +312,9 @@ func (s *Store) ReserveWithdrawal(ctx context.Context, request WithdrawalRequest
 	if err != nil {
 		return Withdrawal{}, false, err
 	}
+	if err := ensureUserActiveInTx(ctx, tx, request.UserID); err != nil {
+		return Withdrawal{}, false, err
+	}
 
 	var withdrawalID int64
 	err = tx.QueryRow(ctx, `

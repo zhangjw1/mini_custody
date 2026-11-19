@@ -1,7 +1,11 @@
 package app
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/xiaoqi/mini-custody/backend/internal/logging"
@@ -53,4 +57,29 @@ func (a *App) requestContext(next http.Handler) http.Handler {
 			"duration_ms", time.Since(startedAt).Milliseconds(),
 		)
 	})
+}
+
+// decodeJSONBody 限制请求体积、拒绝未知字段并确保仅包含单个 JSON 对象。
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_BODY", "请求体格式无效")
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_BODY", "请求体只能包含一个 JSON 对象")
+		return false
+	}
+	return true
+}
+
+// parsePositivePathID 解析并校验路由中的正整数路径参数。
+func parsePositivePathID(w http.ResponseWriter, r *http.Request, param, code, message string) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue(param), 10, 64)
+	if err != nil || id <= 0 {
+		writeAPIError(w, http.StatusBadRequest, code, message)
+		return 0, false
+	}
+	return id, true
 }

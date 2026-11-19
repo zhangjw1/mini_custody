@@ -83,9 +83,11 @@ func optionalString(value pgtype.Text) string {
 // scanUser 从查询结果读取用户模型。
 func (s *Store) scanUser(row rowScanner) (User, error) {
 	var item User
-	if err := row.Scan(&item.ID, &item.Code, &item.DisplayName, &item.CreatedAt); err != nil {
+	var note pgtype.Text
+	if err := row.Scan(&item.ID, &item.Code, &item.DisplayName, &item.Status, &note, &item.CreatedAt); err != nil {
 		return User{}, err
 	}
+	item.Note = optionalString(note)
 	item.CreatedAt = s.localTime(item.CreatedAt)
 	return item, nil
 }

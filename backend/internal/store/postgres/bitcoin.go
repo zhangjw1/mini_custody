@@ -573,6 +573,9 @@ func (s *Store) CreateBTCWithdrawal(ctx context.Context, userID int64, key, addr
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return btc.Withdrawal{}, false, err
 	}
+	if err = ensureUserActiveInTx(ctx, tx, userID); err != nil {
+		return btc.Withdrawal{}, false, err
+	}
 	var balanceID, assetID int64
 	var available string
 	if err = tx.QueryRow(ctx, `SELECT id,asset_id,available_wei::text FROM asset_balances WHERE user_id=$1 AND asset='BTC' FOR UPDATE`, userID).Scan(&balanceID, &assetID, &available); err != nil {

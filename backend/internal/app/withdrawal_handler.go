@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -69,20 +67,12 @@ type apiErrorResponse struct {
 
 // createWithdrawal 校验请求并通过提币服务完成费用预留和幂等创建。
 func (a *App) createWithdrawal(w http.ResponseWriter, r *http.Request) {
-	userID, err := strconv.ParseInt(r.PathValue("user_id"), 10, 64)
-	if err != nil || userID <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_USER_ID", "用户 ID 无效")
+	userID, ok := parseUserID(w, r)
+	if !ok {
 		return
 	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	decoder.DisallowUnknownFields()
 	var request createWithdrawalRequest
-	if err := decoder.Decode(&request); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_BODY", "请求体格式无效")
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_BODY", "请求体只能包含一个 JSON 对象")
+	if !decodeJSONBody(w, r, &request) {
 		return
 	}
 	result, err := a.withdrawals.Create(r.Context(), withdrawal.CreateRequest{
@@ -133,20 +123,12 @@ func (a *App) createWithdrawal(w http.ResponseWriter, r *http.Request) {
 
 // quoteWithdrawal 校验参数并返回不占用余额的当前最大网络费估算。
 func (a *App) quoteWithdrawal(w http.ResponseWriter, r *http.Request) {
-	userID, err := strconv.ParseInt(r.PathValue("user_id"), 10, 64)
-	if err != nil || userID <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_USER_ID", "用户 ID 无效")
+	userID, ok := parseUserID(w, r)
+	if !ok {
 		return
 	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	decoder.DisallowUnknownFields()
 	var request createWithdrawalRequest
-	if err := decoder.Decode(&request); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_BODY", "请求体格式无效")
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_BODY", "请求体只能包含一个 JSON 对象")
+	if !decodeJSONBody(w, r, &request) {
 		return
 	}
 	result, err := a.withdrawals.Quote(r.Context(), withdrawal.QuoteRequest{
@@ -181,6 +163,8 @@ func (a *App) writeWithdrawalError(ctx context.Context, w http.ResponseWriter, e
 		writeAPIError(w, http.StatusBadRequest, "INVALID_WITHDRAWAL", err.Error())
 	case errors.Is(err, postgres.ErrNotFound):
 		writeAPIError(w, http.StatusNotFound, "USER_NOT_FOUND", "用户或托管地址不存在")
+	case errors.Is(err, postgres.ErrUserDisabled):
+		writeAPIError(w, http.StatusForbidden, "USER_DISABLED", "该托管用户已被禁用，禁止提币")
 	case errors.Is(err, postgres.ErrInsufficientBalance):
 		writeAPIError(w, http.StatusConflict, "INSUFFICIENT_BALANCE", "可用余额不足以支付提币金额和最大网络费")
 	case errors.Is(err, postgres.ErrIdempotencyConflict):

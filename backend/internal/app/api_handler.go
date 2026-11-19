@@ -50,11 +50,13 @@ type pageResponse[T any] struct {
 	HasMore  bool `json:"has_more"`
 }
 
-// userResponse 描述后台页面可选择的演示用户。
+// userResponse 描述后台管理页面展示的托管用户信息。
 type userResponse struct {
 	ID          int64     `json:"id"`
 	Code        string    `json:"code"`
 	DisplayName string    `json:"display_name"`
+	Status      string    `json:"status"`
+	Note        string    `json:"note,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -131,20 +133,28 @@ type workerErrorResponse struct {
 	LastOccurredAt  time.Time `json:"last_occurred_at"`
 }
 
+// chainCapabilitiesResponse 描述当前服务端启用的链与资产能力开关。
+type chainCapabilitiesResponse struct {
+	ERC20Enabled   bool   `json:"erc20_enabled"`
+	BitcoinEnabled bool   `json:"bitcoin_enabled"`
+	BitcoinNetwork string `json:"bitcoin_network,omitempty"`
+}
+
 // chainResponse 描述 Sepolia RPC 和扫描器状态。
 type chainResponse struct {
-	Network        string                  `json:"network"`
-	Status         string                  `json:"status"`
-	Endpoint       string                  `json:"endpoint"`
-	ChainID        string                  `json:"chain_id"`
-	NetworkHeight  uint64                  `json:"network_height"`
-	ScanHeight     uint64                  `json:"scan_height"`
-	Lag            uint64                  `json:"lag"`
-	LastError      string                  `json:"last_error,omitempty"`
-	CheckedAt      time.Time               `json:"checked_at"`
-	TokenScanner   *tokenScannerResponse   `json:"token_scanner,omitempty"`
-	GasStation     *gasStationResponse     `json:"gas_station,omitempty"`
-	TokenInventory *tokenInventoryResponse `json:"token_inventory,omitempty"`
+	Network        string                     `json:"network"`
+	Status         string                     `json:"status"`
+	Endpoint       string                     `json:"endpoint"`
+	ChainID        string                     `json:"chain_id"`
+	NetworkHeight  uint64                     `json:"network_height"`
+	ScanHeight     uint64                     `json:"scan_height"`
+	Lag            uint64                     `json:"lag"`
+	LastError      string                     `json:"last_error,omitempty"`
+	CheckedAt      time.Time                  `json:"checked_at"`
+	Capabilities   *chainCapabilitiesResponse `json:"capabilities,omitempty"`
+	TokenScanner   *tokenScannerResponse      `json:"token_scanner,omitempty"`
+	GasStation     *gasStationResponse        `json:"gas_station,omitempty"`
+	TokenInventory *tokenInventoryResponse    `json:"token_inventory,omitempty"`
 }
 
 // tokenScannerResponse 描述 ERC-20 充值扫描器的独立进度和错误状态。
@@ -179,7 +189,7 @@ type tokenInventoryResponse struct {
 	CheckedAt    time.Time `json:"checked_at"`
 }
 
-// listUsers 返回全部演示用户。
+// listUsers 返回全部托管用户。
 func (a *App) listUsers(w http.ResponseWriter, r *http.Request) {
 	items, err := a.apiStore.ListUsers(r.Context())
 	if err != nil {
@@ -188,7 +198,14 @@ func (a *App) listUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	response := make([]userResponse, 0, len(items))
 	for _, item := range items {
-		response = append(response, userResponse{ID: item.ID, Code: item.Code, DisplayName: item.DisplayName, CreatedAt: item.CreatedAt})
+		status := item.Status
+		if status == "" {
+			status = postgres.UserStatusActive
+		}
+		response = append(response, userResponse{
+			ID: item.ID, Code: item.Code, DisplayName: item.DisplayName,
+			Status: status, Note: item.Note, CreatedAt: item.CreatedAt,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": response})
 }
@@ -289,9 +306,8 @@ func (a *App) listWithdrawals(w http.ResponseWriter, r *http.Request) {
 
 // getWithdrawal 根据自增主键返回单笔提币状态。
 func (a *App) getWithdrawal(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("withdrawal_id"), 10, 64)
-	if err != nil || id <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_WITHDRAWAL_ID", "提币 ID 无效")
+	id, ok := parsePositivePathID(w, r, "withdrawal_id", "INVALID_WITHDRAWAL_ID", "提币 ID 无效")
+	if !ok {
 		return
 	}
 	item, err := a.apiStore.WithdrawalByID(r.Context(), id)
@@ -354,10 +370,18 @@ func (a *App) getChainStatus(w http.ResponseWriter, _ *http.Request) {
 	if health.NetworkHeight > health.ScanHeight {
 		lag = health.NetworkHeight - health.ScanHeight
 	}
+	capabilities := &chainCapabilitiesResponse{
+		ERC20Enabled:   a.config.ERC20.Enabled,
+		BitcoinEnabled: a.config.Bitcoin.Enabled,
+	}
+	if a.config.Bitcoin.Enabled {
+		capabilities.BitcoinNetwork = a.config.Bitcoin.Network
+	}
 	response := chainResponse{
 		Network: postgres.NetworkSepolia, Status: health.Status, Endpoint: health.Endpoint,
 		ChainID: health.ChainID, NetworkHeight: health.NetworkHeight, ScanHeight: health.ScanHeight,
 		Lag: lag, LastError: health.LastError, CheckedAt: health.CheckedAt,
+		Capabilities: capabilities,
 	}
 	if a.tokenScanner != nil {
 		tokenHealth := a.tokenScanner.Snapshot()
@@ -418,12 +442,7 @@ func (a *App) listWorkerErrors(w http.ResponseWriter, r *http.Request) {
 
 // parseUserID 解析路由中的正整数用户 ID。
 func parseUserID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	userID, err := strconv.ParseInt(r.PathValue("user_id"), 10, 64)
-	if err != nil || userID <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_USER_ID", "用户 ID 无效")
-		return 0, false
-	}
-	return userID, true
+	return parsePositivePathID(w, r, "user_id", "INVALID_USER_ID", "用户 ID 无效")
 }
 
 // parsePage 校验页码参数并计算数据库偏移量。

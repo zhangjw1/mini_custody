@@ -135,3 +135,22 @@ func TestBitcoinFixesMigrationContainsRawTxAndManualReview(t *testing.T) {
 		}
 	}
 }
+
+// TestAdminAuthMigrationDocumentsEveryNewColumn 验证 000005 迁移的表与字段都有中文注释。
+func TestAdminAuthMigrationDocumentsEveryNewColumn(t *testing.T) {
+	sqlBytes, err := migrationFiles.ReadFile("000005_admin_auth_and_users.up.sql")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	sql := string(sqlBytes)
+	for _, col := range []string{"id", "username", "password_hash", "display_name", "role", "disabled", "last_login_at", "created_at", "updated_at"} {
+		if !strings.Contains(sql, "COMMENT ON COLUMN admin_users."+col+" IS") {
+			t.Errorf("column admin_users.%s has no comment", col)
+		}
+	}
+	for _, col := range []string{"status", "note"} {
+		if !strings.Contains(sql, "COMMENT ON COLUMN users."+col+" IS") {
+			t.Errorf("column users.%s has no comment", col)
+		}
+	}
+}

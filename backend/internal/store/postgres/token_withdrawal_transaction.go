@@ -66,6 +66,9 @@ func (s *Store) ReserveTokenWithdrawal(ctx context.Context, request TokenWithdra
 	if err != nil {
 		return TokenWithdrawal{}, false, err
 	}
+	if err := ensureUserActiveInTx(ctx, tx, request.UserID); err != nil {
+		return TokenWithdrawal{}, false, err
+	}
 	var assetType string
 	if err := tx.QueryRow(ctx, `SELECT asset_type FROM assets WHERE id = $1 AND enabled FOR SHARE`, request.AssetID).Scan(&assetType); err != nil {
 		return TokenWithdrawal{}, false, mapNotFound(err)

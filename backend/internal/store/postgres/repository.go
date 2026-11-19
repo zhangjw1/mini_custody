@@ -4,14 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 )
 
 const (
-	userColumns        = `id, code, display_name, created_at`
+	userCreationLockID int64 = 0x4d494e4955534552
+	userColumns              = `id, code, display_name, status, note, created_at`
+	adminColumns             = `id, username, password_hash, display_name, role, disabled, last_login_at, created_at, updated_at`
 	walletColumns      = `id, user_id, network, address, derivation_index, derivation_path, next_nonce::text, created_at`
 	balanceColumns     = `id, user_id, asset_id, asset, available_wei::text, pending_deposit_wei::text, pending_withdrawal_wei::text, version, updated_at`
 	entryColumns       = `id, user_id, asset_id, asset, entry_type, amount_wei::text, reference_type, reference_id, created_at`
@@ -42,6 +46,216 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 // UserByID 根据自增主键查询用户。
 func (s *Store) UserByID(ctx context.Context, id int64) (User, error) {
 	item, err := s.scanUser(s.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE id = $1`, id))
+	return item, mapNotFound(err)
+}
+
+var userCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{2,63}$`)
+
+// EnsureBootstrapAdmin 在管理员表为空时幂等写入首个管理员账户，已存在管理员则不覆盖密码。
+func (s *Store) EnsureBootstrapAdmin(ctx context.Context, username, passwordHash, displayName string) error {
+	username = strings.TrimSpace(username)
+	displayName = strings.TrimSpace(displayName)
+	if username == "" || passwordHash == "" || displayName == "" {
+		return errors.New("初始化管理员参数无效")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("开启管理员初始化事务失败：%w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var count int64
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM admin_users`).Scan(&count); err != nil {
+		return fmt.Errorf("查询管理员数量失败：%w", err)
+	}
+	if count == 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO admin_users (username, password_hash, display_name, role)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (username) DO NOTHING`,
+			username, passwordHash, displayName, AdminRole,
+		); err != nil {
+			return fmt.Errorf("写入首个管理员失败：%w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("提交管理员初始化事务失败：%w", err)
+	}
+	return nil
+}
+
+// AdminByUsername 根据登录用户名查询管理员账户。
+func (s *Store) AdminByUsername(ctx context.Context, username string) (AdminUser, error) {
+	var item AdminUser
+	err := s.pool.QueryRow(ctx, `SELECT `+adminColumns+` FROM admin_users WHERE username = $1`, strings.TrimSpace(username)).Scan(
+		&item.ID, &item.Username, &item.PasswordHash, &item.DisplayName, &item.Role,
+		&item.Disabled, &item.LastLoginAt, &item.CreatedAt, &item.UpdatedAt,
+	)
+	if err != nil {
+		return AdminUser{}, mapNotFound(err)
+	}
+	item.CreatedAt = s.localTime(item.CreatedAt)
+	item.UpdatedAt = s.localTime(item.UpdatedAt)
+	if item.LastLoginAt != nil {
+		local := s.localTime(*item.LastLoginAt)
+		item.LastLoginAt = &local
+	}
+	return item, nil
+}
+
+// AdminByID 根据主键查询管理员账户。
+func (s *Store) AdminByID(ctx context.Context, id int64) (AdminUser, error) {
+	var item AdminUser
+	err := s.pool.QueryRow(ctx, `SELECT `+adminColumns+` FROM admin_users WHERE id = $1`, id).Scan(
+		&item.ID, &item.Username, &item.PasswordHash, &item.DisplayName, &item.Role,
+		&item.Disabled, &item.LastLoginAt, &item.CreatedAt, &item.UpdatedAt,
+	)
+	if err != nil {
+		return AdminUser{}, mapNotFound(err)
+	}
+	item.CreatedAt = s.localTime(item.CreatedAt)
+	item.UpdatedAt = s.localTime(item.UpdatedAt)
+	if item.LastLoginAt != nil {
+		local := s.localTime(*item.LastLoginAt)
+		item.LastLoginAt = &local
+	}
+	return item, nil
+}
+
+// UpdateAdminLastLogin 更新管理员最近登录时间。
+func (s *Store) UpdateAdminLastLogin(ctx context.Context, id int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE admin_users SET last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, id)
+	return err
+}
+
+// CreateManagedUser 在事务内串行分配派生索引，创建托管用户并派生 EVM（及可选 BTC）托管地址与初始余额行。
+func (s *Store) CreateManagedUser(
+	ctx context.Context,
+	code, displayName, note string,
+	evmProvider wallet.KeyProvider,
+	btcProvider *wallet.MnemonicKeyProvider,
+) (User, WalletAddress, error) {
+	code = strings.TrimSpace(code)
+	displayName = strings.TrimSpace(displayName)
+	note = strings.TrimSpace(note)
+	if !userCodePattern.MatchString(code) || displayName == "" || evmProvider == nil {
+		return User{}, WalletAddress{}, ErrInvalidUserInput
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return User{}, WalletAddress{}, fmt.Errorf("开启创建托管用户事务失败：%w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, userCreationLockID); err != nil {
+		return User{}, WalletAddress{}, fmt.Errorf("获取用户开户锁失败：%w", err)
+	}
+
+	var nextEVMIndex int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(derivation_index), 0) + 1
+		FROM wallet_addresses
+		WHERE network = $1`, NetworkSepolia,
+	).Scan(&nextEVMIndex); err != nil {
+		return User{}, WalletAddress{}, fmt.Errorf("计算 EVM 派生索引失败：%w", err)
+	}
+	if nextEVMIndex <= 0 || nextEVMIndex > int64(^uint32(0)) {
+		return User{}, WalletAddress{}, errors.New("EVM 派生索引超出范围")
+	}
+
+	evmIndex := uint32(nextEVMIndex)
+	evmPath := wallet.UserPath(evmIndex)
+	derivedAddr, err := evmProvider.Address(ctx, evmPath)
+	if err != nil {
+		return User{}, WalletAddress{}, fmt.Errorf("派生 EVM 托管地址失败：%w", err)
+	}
+
+	user, err := s.scanUser(tx.QueryRow(ctx, `
+		INSERT INTO users (code, display_name, status, note)
+		VALUES ($1, $2, $3, NULLIF($4, ''))
+		RETURNING `+userColumns,
+		code, displayName, UserStatusActive, note,
+	))
+	if err != nil {
+		if isUniqueViolation(err) {
+			return User{}, WalletAddress{}, ErrUserAlreadyExists
+		}
+		return User{}, WalletAddress{}, fmt.Errorf("写入托管用户失败：%w", err)
+	}
+
+	walletRow, err := s.scanWalletAddress(tx.QueryRow(ctx, `
+		INSERT INTO wallet_addresses (user_id, network, address, derivation_index, derivation_path)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING `+walletColumns,
+		user.ID, NetworkSepolia, strings.ToLower(derivedAddr.Hex()), evmIndex, evmPath,
+	))
+	if err != nil {
+		return User{}, WalletAddress{}, fmt.Errorf("写入 EVM 托管地址失败：%w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO asset_balances (user_id, asset_id, asset)
+		SELECT $1, id, symbol
+		FROM assets
+		WHERE enabled = TRUE
+		ON CONFLICT (user_id, asset_id) DO NOTHING`, user.ID,
+	); err != nil {
+		return User{}, WalletAddress{}, fmt.Errorf("初始化托管用户余额失败：%w", err)
+	}
+
+	if btcProvider != nil {
+		var nextBTCIndex int64
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(MAX(derivation_index), 0) + 1
+			FROM btc_addresses
+			WHERE network = $1 AND purpose = 'USER_DEPOSIT'`, NetworkBitcoinSignet,
+		).Scan(&nextBTCIndex); err != nil {
+			return User{}, WalletAddress{}, fmt.Errorf("计算 BTC 派生索引失败：%w", err)
+		}
+		if nextBTCIndex <= 0 || nextBTCIndex > int64(^uint32(0)) {
+			return User{}, WalletAddress{}, errors.New("BTC 派生索引超出范围")
+		}
+		btcIndex := uint32(nextBTCIndex)
+		btcPath := wallet.BitcoinUserPath(btcIndex)
+		btcAddr, err := btcProvider.BitcoinAddress(ctx, btcPath)
+		if err != nil {
+			return User{}, WalletAddress{}, fmt.Errorf("派生 BTC 托管地址失败：%w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO btc_addresses (user_id, network, purpose, address, script_pub_key, derivation_index, derivation_path)
+			VALUES ($1, $2, 'USER_DEPOSIT', $3, $4, $5, $6)
+			ON CONFLICT (user_id) WHERE purpose = 'USER_DEPOSIT' DO NOTHING`,
+			user.ID, NetworkBitcoinSignet, btcAddr.Address, fmt.Sprintf("%x", btcAddr.ScriptPubKey), btcIndex, btcPath,
+		); err != nil {
+			return User{}, WalletAddress{}, fmt.Errorf("写入 BTC 托管地址失败：%w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return User{}, WalletAddress{}, fmt.Errorf("提交创建托管用户事务失败：%w", err)
+	}
+	return user, walletRow, nil
+}
+
+// UpdateManagedUser 更新托管用户的展示名称、备注与启用状态。
+func (s *Store) UpdateManagedUser(ctx context.Context, id int64, displayName, note, status string) (User, error) {
+	if id <= 0 {
+		return User{}, ErrInvalidUserInput
+	}
+	displayName = strings.TrimSpace(displayName)
+	note = strings.TrimSpace(note)
+	status = strings.ToUpper(strings.TrimSpace(status))
+	if displayName == "" || (status != UserStatusActive && status != UserStatusDisabled) {
+		return User{}, ErrInvalidUserInput
+	}
+	item, err := s.scanUser(s.pool.QueryRow(ctx, `
+		UPDATE users
+		SET display_name = $2, note = NULLIF($3, ''), status = $4
+		WHERE id = $1
+		RETURNING `+userColumns,
+		id, displayName, note, status,
+	))
 	return item, mapNotFound(err)
 }
 
@@ -438,6 +652,18 @@ func mapNotFound(err error) error {
 		return ErrNotFound
 	}
 	return err
+}
+
+// ensureUserActiveInTx 在事务内校验托管用户存在且处于启用状态。
+func ensureUserActiveInTx(ctx context.Context, tx pgx.Tx, userID int64) error {
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM users WHERE id = $1 FOR SHARE`, userID).Scan(&status); err != nil {
+		return mapNotFound(err)
+	}
+	if status != UserStatusActive {
+		return ErrUserDisabled
+	}
+	return nil
 }
 
 // isUniqueViolation 判断 PostgreSQL 错误是否为唯一约束冲突。

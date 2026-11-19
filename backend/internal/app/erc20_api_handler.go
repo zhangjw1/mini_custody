@@ -4,7 +4,6 @@ import (
 	"errors"
 	"math/big"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -253,9 +252,8 @@ func (a *App) listTokenWithdrawals(w http.ResponseWriter, r *http.Request) {
 
 // getTokenWithdrawal 根据自增主键返回单笔 Token 提币状态。
 func (a *App) getTokenWithdrawal(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("withdrawal_id"), 10, 64)
-	if err != nil || id <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "INVALID_TOKEN_WITHDRAWAL_ID", "Token 提币 ID 无效")
+	id, ok := parsePositivePathID(w, r, "withdrawal_id", "INVALID_TOKEN_WITHDRAWAL_ID", "Token 提币 ID 无效")
+	if !ok {
 		return
 	}
 	item, err := a.apiStore.TokenWithdrawalByID(r.Context(), id)

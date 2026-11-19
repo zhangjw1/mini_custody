@@ -361,6 +361,71 @@ func TestIntegrationBTCManualReviewKeepsBalanceAndUTXO(t *testing.T) {
 	}
 }
 
+// TestIntegrationManagedUserCreationAndDisable 验证并发创建托管用户派生索引不冲突、禁用用户禁止提币及管理员初始化幂等性。
+func TestIntegrationManagedUserCreationAndDisable(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// 验证首个管理员初始化幂等不覆盖既有账户。
+	if err := store.EnsureBootstrapAdmin(ctx, "admin", "$2a$10$abcdefghijklmnopqrstuvwx1234567890abcdefghijklmnop", "系统管理员"); err != nil {
+		t.Fatalf("EnsureBootstrapAdmin() #1 error = %v", err)
+	}
+	if err := store.EnsureBootstrapAdmin(ctx, "other-admin", "$2a$10$zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "第二管理员"); err != nil {
+		t.Fatalf("EnsureBootstrapAdmin() #2 error = %v", err)
+	}
+	if _, err := store.AdminByUsername(ctx, "other-admin"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second bootstrap admin should not be created when admin_users not empty, err=%v", err)
+	}
+
+	provider, err := wallet.NewMnemonicKeyProvider(integrationTestMnemonic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 并发创建 3 个托管用户，验证 derivation_index 严格递增无碰撞。
+	type createdResult struct {
+		user   User
+		wallet WalletAddress
+		err    error
+	}
+	ch := make(chan createdResult, 3)
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			u, w, createErr := store.CreateManagedUser(ctx, fmt.Sprintf("managed-u%d", idx), fmt.Sprintf("User %d", idx), "并发测试", provider, nil)
+			ch <- createdResult{u, w, createErr}
+		}(i)
+	}
+	wg.Wait()
+	close(ch)
+	seenIndexes := make(map[uint32]bool)
+	var lastCreatedUser User
+	var lastCreatedWallet WalletAddress
+	for item := range ch {
+		if item.err != nil {
+			t.Fatalf("CreateManagedUser() concurrent error = %v", item.err)
+		}
+		if seenIndexes[item.wallet.DerivationIndex] {
+			t.Fatalf("duplicate derivation index %d", item.wallet.DerivationIndex)
+		}
+		seenIndexes[item.wallet.DerivationIndex] = true
+		lastCreatedUser = item.user
+		lastCreatedWallet = item.wallet
+	}
+
+	// 充值后禁用用户，验证禁用状态拒绝创建提币。
+	fundWallet(t, store, lastCreatedUser.ID, lastCreatedWallet.ID, 500, 10_000)
+	updated, err := store.UpdateManagedUser(ctx, lastCreatedUser.ID, "User Disabled", "风控冻结", UserStatusDisabled)
+	if err != nil || updated.Status != UserStatusDisabled {
+		t.Fatalf("UpdateManagedUser() = %+v, err=%v", updated, err)
+	}
+	if _, _, err := store.ReserveWithdrawal(ctx, withdrawalRequest("disabled-withdraw-1", lastCreatedUser.ID, lastCreatedWallet.ID, 1_000, 100)); !errors.Is(err, ErrUserDisabled) {
+		t.Fatalf("ReserveWithdrawal for disabled user err = %v, want ErrUserDisabled", err)
+	}
+}
+
 // TestIntegrationDepositIsIdempotentAndCreditsOnce 验证充值发现和入账的数据库幂等性。
 func TestIntegrationDepositIsIdempotentAndCreditsOnce(t *testing.T) {
 	store, cleanup := integrationStore(t)
