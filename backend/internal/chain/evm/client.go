@@ -720,7 +720,7 @@ func (c *Client) snapshotLocked() HealthSnapshot {
 	}
 }
 
-// isBusinessError 判断错误是否为链上业务结果（如 NotFound、revert、nonce 冲突），不应切换端点或标为 DEGRADED。
+// isBusinessError 判断错误是否为链上业务结果（如 NotFound、revert、nonce 冲突、余额不足），不应切换端点或标为 DEGRADED。
 func isBusinessError(err error) bool {
 	if err == nil {
 		return false
@@ -728,30 +728,62 @@ func isBusinessError(err error) bool {
 	if errors.Is(err, ethereum.NotFound) || errors.Is(err, context.Canceled) {
 		return true
 	}
-	var httpErr rpc.HTTPError
-	if errors.As(err, &httpErr) {
-		return false
-	}
-	var pointerHTTPError *rpc.HTTPError
-	if errors.As(err, &pointerHTTPError) && pointerHTTPError != nil {
-		return false
-	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return false
+	}
+	var httpErr rpc.HTTPError
+	if errors.As(err, &httpErr) {
+		return isBusinessErrorMessage(string(httpErr.Body))
+	}
+	var pointerHTTPError *rpc.HTTPError
+	if errors.As(err, &pointerHTTPError) && pointerHTTPError != nil {
+		return isBusinessErrorMessage(string(pointerHTTPError.Body))
 	}
 	var rpcErr rpc.Error
 	if errors.As(err, &rpcErr) {
 		if rpcErr.ErrorCode() == rpcErrCodeRateLimitOrTimeout || rpcErr.ErrorCode() == rpcErrCodeLimitExceeded {
 			return false
 		}
-		msg := strings.ToLower(rpcErr.Error())
-		for _, infraFragment := range []string{"rate limit", "too many requests", "timeout", "timed out", "try again", "overloaded", "unavailable"} {
-			if strings.Contains(msg, infraFragment) {
-				return false
-			}
+		if isInfraErrorMessage(rpcErr.Error()) {
+			return false
 		}
 		return true
+	}
+	return isBusinessErrorMessage(err.Error())
+}
+
+// isInfraErrorMessage 判断 RPC 错误文本是否属于限流、超时等基础设施瞬时故障。
+func isInfraErrorMessage(message string) bool {
+	msg := strings.ToLower(message)
+	for _, infraFragment := range []string{"rate limit", "too many requests", "timeout", "timed out", "try again", "overloaded", "unavailable"} {
+		if strings.Contains(msg, infraFragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBusinessErrorMessage 判断文本是否明确指向链上业务校验失败（余额不足、Nonce 冲突、交易低价或执行回滚）。
+func isBusinessErrorMessage(message string) bool {
+	msg := strings.ToLower(message)
+	if msg == "" || isInfraErrorMessage(msg) {
+		return false
+	}
+	for _, fragment := range []string{
+		"insufficient funds",
+		"nonce too low",
+		"nonce is too low",
+		"already known",
+		"known transaction",
+		"replacement transaction underpriced",
+		"transaction underpriced",
+		"intrinsic gas too low",
+		"execution reverted",
+	} {
+		if strings.Contains(msg, fragment) {
+			return true
+		}
 	}
 	return false
 }

@@ -35,13 +35,16 @@ type fakeChain struct {
 	receiptErr     error
 	sendErrors     []error
 	sentRaw        [][]byte
+	headerCalls    int
+	tipCalls       int
 }
 
 // BlockNumber 返回测试最新区块高度。
 func (f *fakeChain) BlockNumber(context.Context) (uint64, error) { return f.latest, nil }
 
-// HeaderByNumber 返回测试 EIP-1559 区块头。
+// HeaderByNumber 返回测试 EIP-1559 区块头并累计调用次数。
 func (f *fakeChain) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
+	f.headerCalls++
 	return f.header, nil
 }
 
@@ -64,8 +67,9 @@ func (f *fakeChain) NonceAt(context.Context, common.Address, *big.Int) (uint64, 
 	return f.confirmedNonce, nil
 }
 
-// SuggestGasTipCap 返回测试建议优先费。
+// SuggestGasTipCap 返回测试建议优先费并累计调用次数。
 func (f *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	f.tipCalls++
 	return new(big.Int).Set(f.tip), nil
 }
 
@@ -164,13 +168,16 @@ func (f *fakeStore) PlatformWalletByRole(context.Context, string, string) (postg
 	return f.platform, nil
 }
 
-// AllocateTokenSweepNonce 固定测试归集金额和 Nonce 并进入签名状态。
-func (f *fakeStore) AllocateTokenSweepNonce(_ context.Context, _ int64, amountUnits *big.Int, nonce uint64) (postgres.TokenSweep, bool, error) {
+// AllocateTokenSweepNonce 固定测试归集金额、Nonce 和 Gas 参数并进入签名状态。
+func (f *fakeStore) AllocateTokenSweepNonce(_ context.Context, _ int64, amountUnits *big.Int, nonce uint64, gas postgres.PreparedGasParams) (postgres.TokenSweep, bool, error) {
 	if f.sweep.Nonce != nil {
 		return f.sweep, false, nil
 	}
 	f.sweep.SweepAmountUnits = new(big.Int).Set(amountUnits)
 	f.sweep.Nonce = new(big.Int).SetUint64(nonce)
+	f.sweep.GasLimit = int64Pointer(int64(gas.GasLimit))
+	f.sweep.MaxFeePerGasWei = new(big.Int).Set(gas.MaxFeePerGasWei)
+	f.sweep.MaxPriorityFeePerGasWei = new(big.Int).Set(gas.MaxPriorityFeePerGasWei)
 	f.sweep.Status = postgres.TokenSweepSigning
 	return f.sweep, true, nil
 }
@@ -182,6 +189,7 @@ func (f *fakeStore) SaveSignedTokenSweep(_ context.Context, signed postgres.Sign
 	f.sweep.MaxPriorityFeePerGasWei = new(big.Int).Set(signed.MaxPriorityFeePerGasWei)
 	f.sweep.RawTx = append([]byte(nil), signed.RawTx...)
 	f.sweep.TxHash = signed.TxHash
+	f.sweep.SigningRetryCount = 0
 	f.sweep.Status = postgres.TokenSweepSigned
 	f.attempts = append([]postgres.EVMTxAttempt{{
 		BusinessType:            postgres.EVMBusinessTokenSweep,
@@ -211,6 +219,8 @@ func (f *fakeStore) ReplaceTokenSweepTx(_ context.Context, replacement postgres.
 	f.sweep.RawTx = append([]byte(nil), replacement.RawTx...)
 	f.sweep.TxHash = replacement.TxHash
 	f.sweep.BumpCount++
+	f.sweep.BumpBlockedAt = nil
+	f.sweep.BumpBlockedReason = ""
 	now := time.Now()
 	f.sweep.LastBroadcastAt = &now
 	f.attempts = append([]postgres.EVMTxAttempt{{
@@ -285,6 +295,37 @@ func (f *fakeStore) FailWaitingTokenSweep(_ context.Context, _ int64, _, _ strin
 	f.sweep.Status = postgres.TokenSweepFailed
 	f.failed = true
 	return f.sweep, true, nil
+}
+
+// RecordEVMSigningFailure 记录 Token 归集签名失败并在达到上限后转入人工核查且仅告警一次。
+func (f *fakeStore) RecordEVMSigningFailure(_ context.Context, _ string, _ int64, maxRetries int, worker, refType string, refID int64, errorCode, errorMessage string) (bool, error) {
+	f.sweep.SigningRetryCount++
+	if int(f.sweep.SigningRetryCount) >= maxRetries && f.sweep.Status == postgres.TokenSweepSigning {
+		f.sweep.Status = postgres.TokenSweepManualReview
+		f.sweep.ErrorCode = errorCode
+		f.sweep.ErrorMessage = errorMessage
+		f.errors = append(f.errors, postgres.WorkerError{
+			Worker: worker, Stage: "sign", ReferenceType: refType, ReferenceID: &refID,
+			ErrorCode: errorCode, ErrorMessage: errorMessage,
+		})
+		return true, nil
+	}
+	return false, nil
+}
+
+// RecordEVMBumpBlocked 持久化首次加价阻塞原因并去重写入告警。
+func (f *fakeStore) RecordEVMBumpBlocked(_ context.Context, _ string, _ int64, worker, refType string, refID int64, reasonCode, reasonMessage string) (time.Time, bool, error) {
+	if f.sweep.BumpBlockedAt == nil {
+		now := time.Now()
+		f.sweep.BumpBlockedAt = &now
+		f.sweep.BumpBlockedReason = reasonMessage
+		f.errors = append(f.errors, postgres.WorkerError{
+			Worker: worker, Stage: "bump", ReferenceType: refType, ReferenceID: &refID,
+			ErrorCode: reasonCode, ErrorMessage: reasonMessage,
+		})
+		return now, true, nil
+	}
+	return *f.sweep.BumpBlockedAt, false, nil
 }
 
 // RecordWorkerError 保存测试 Worker 错误。
@@ -529,5 +570,94 @@ func TestWorkerMovesNonceGapSweepToManualReview(t *testing.T) {
 	}
 	if store.sweep.Status != postgres.TokenSweepManualReview || len(store.errors) == 0 || store.errors[0].ErrorCode != "EVM_TX_MANUAL_REVIEW" {
 		t.Fatalf("status = %s, errors = %+v", store.sweep.Status, store.errors)
+	}
+}
+
+// TestWorkerSignsSweepWithoutExtraFeeRPC 验证归集 SIGNING 阶段仅使用持久化 Gas 参数而不调用费率 RPC。
+func TestWorkerSignsSweepWithoutExtraFeeRPC(t *testing.T) {
+	chain, contractChain, store, worker := newTestWorker(t)
+	contractChain.balances[common.HexToAddress(store.address.Address)] = big.NewInt(1_000)
+	store.sweep.Status = postgres.TokenSweepSigning
+	store.sweep.Nonce = new(big.Int).SetUint64(7)
+	store.sweep.SweepAmountUnits = big.NewInt(1_000)
+	store.sweep.GasLimit = int64Pointer(50_000)
+	store.sweep.MaxFeePerGasWei = big.NewInt(202)
+	store.sweep.MaxPriorityFeePerGasWei = big.NewInt(2)
+	chain.header = nil
+
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if chain.headerCalls != 0 || chain.tipCalls != 0 {
+		t.Fatalf("unexpected fee RPC calls during sign: header=%d tip=%d", chain.headerCalls, chain.tipCalls)
+	}
+	if store.sweep.Status != postgres.TokenSweepBroadcasted || len(chain.sentRaw) != 1 {
+		t.Fatalf("status = %s, sends = %d", store.sweep.Status, len(chain.sentRaw))
+	}
+}
+
+// TestWorkerCapsSweepEffectiveMaxBumpsByGasSafetyAndHandlesBlockedBump 验证归集按安全余量限制有效加价次数并在余额不足时去重告警与重播。
+func TestWorkerCapsSweepEffectiveMaxBumpsByGasSafetyAndHandlesBlockedBump(t *testing.T) {
+	if got := evm.MaxCoveredSweepBumps(2_000, 15); got != 1 {
+		t.Fatalf("MaxCoveredSweepBumps(2000, 15) = %d, want 1", got)
+	}
+	chain, contractChain, store, worker := newTestWorker(t)
+	worker.config.RebroadcastAfter = 10 * time.Second
+	worker.config.BumpAfter = 30 * time.Second
+	worker.config.BumpPercent = 15
+	worker.config.MaxBumps = 5
+	worker.config.GasSafetyBPS = 2_000
+
+	from := common.HexToAddress(store.address.Address)
+	contractChain.balances[from] = big.NewInt(1_000)
+	chain.balances[from] = big.NewInt(12_120_000)
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+
+	stale := time.Now().Add(-time.Minute)
+	store.sweep.BroadcastedAt = &stale
+	store.sweep.LastBroadcastAt = &stale
+	// 余额仅够覆盖 202->233 第一次 15% 加价，且受 GasSafetyBPS=2000 限制最多只允许加价 1 次。
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("first bump Process() error = %v", err)
+	}
+	if store.sweep.BumpCount != 1 {
+		t.Fatalf("bump_count = %d, want 1", store.sweep.BumpCount)
+	}
+
+	// 即使 MaxBumps=5，后续超阈值也只能重播而不再发起第二次加价。
+	store.sweep.LastBroadcastAt = &stale
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("capped rebroadcast Process() error = %v", err)
+	}
+	if store.sweep.BumpCount != 1 || len(chain.sentRaw) != 3 {
+		t.Fatalf("bump_count = %d, sends = %d", store.sweep.BumpCount, len(chain.sentRaw))
+	}
+
+	// 验证来源地址 ETH 不足触发 H1 阻塞时仅告警一次并重播。
+	chain2, contractChain2, store2, worker2 := newTestWorker(t)
+	worker2.config.RebroadcastAfter = 10 * time.Second
+	worker2.config.BumpAfter = 30 * time.Second
+	worker2.config.BumpPercent = 15
+	worker2.config.MaxBumps = 3
+	worker2.config.GasSafetyBPS = 2_000
+	from2 := common.HexToAddress(store2.address.Address)
+	contractChain2.balances[from2] = big.NewInt(1_000)
+	chain2.balances[from2] = big.NewInt(10_500_000)
+	if err := worker2.Process(context.Background(), store2.sweep.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	store2.sweep.BroadcastedAt = &stale
+	store2.sweep.LastBroadcastAt = &stale
+	if err := worker2.Process(context.Background(), store2.sweep.ID); err != nil {
+		t.Fatalf("first blocked bump Process() error = %v", err)
+	}
+	store2.sweep.LastBroadcastAt = &stale
+	if err := worker2.Process(context.Background(), store2.sweep.ID); err != nil {
+		t.Fatalf("second blocked bump Process() error = %v", err)
+	}
+	if len(store2.errors) != 1 || store2.errors[0].ErrorCode != "CHAIN_BALANCE_INSUFFICIENT" || len(chain2.sentRaw) != 3 {
+		t.Fatalf("errors = %+v, sends = %d", store2.errors, len(chain2.sentRaw))
 	}
 }

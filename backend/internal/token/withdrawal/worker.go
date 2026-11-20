@@ -50,7 +50,7 @@ type WorkerStore interface {
 	ListProcessableTokenWithdrawals(ctx context.Context, limit int) ([]postgres.TokenWithdrawal, error)
 	ListEVMTxAttempts(ctx context.Context, businessType string, businessID int64) ([]postgres.EVMTxAttempt, error)
 	PlatformWalletByRole(ctx context.Context, network, role string) (postgres.PlatformWallet, error)
-	AllocateTokenWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64) (postgres.TokenWithdrawal, bool, error)
+	AllocateTokenWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64, gas postgres.PreparedGasParams) (postgres.TokenWithdrawal, bool, error)
 	SaveSignedTokenWithdrawal(ctx context.Context, signed postgres.SignedTokenWithdrawal) (postgres.TokenWithdrawal, bool, error)
 	ReplaceTokenWithdrawalTx(ctx context.Context, replacement postgres.SignedTokenWithdrawal) (postgres.TokenWithdrawal, bool, error)
 	TouchTokenWithdrawalBroadcast(ctx context.Context, withdrawalID int64) (postgres.TokenWithdrawal, error)
@@ -58,19 +58,22 @@ type WorkerStore interface {
 	TransitionTokenWithdrawal(ctx context.Context, withdrawalID int64, target string) (postgres.TokenWithdrawal, error)
 	UpdateTokenWithdrawalConfirmations(ctx context.Context, withdrawalID, confirmations int64) (postgres.TokenWithdrawal, error)
 	FinalizeTokenWithdrawal(ctx context.Context, settlement postgres.TokenWithdrawalSettlement) (postgres.TokenWithdrawal, bool, error)
+	RecordEVMSigningFailure(ctx context.Context, businessType string, businessID int64, maxRetries int, worker, refType string, refID int64, errorCode, errorMessage string) (bool, error)
+	RecordEVMBumpBlocked(ctx context.Context, businessType string, businessID int64, worker, refType string, refID int64, reasonCode, reasonMessage string) (time.Time, bool, error)
 	RecordWorkerError(ctx context.Context, item postgres.WorkerError) (int64, error)
 }
 
 // WorkerConfig 定义 Token 提币轮询间隔、确认数、卡单重播加价策略和 Sepolia Chain ID。
 type WorkerConfig struct {
-	Interval         time.Duration
-	Confirmations    uint64
-	ChainID          *big.Int
-	RebroadcastAfter time.Duration
-	BumpAfter        time.Duration
-	BumpPercent      uint64
-	MaxBumps         int
-	MaxFeeCapWei     *big.Int
+	Interval                     time.Duration
+	Confirmations                uint64
+	ChainID                      *big.Int
+	RebroadcastAfter             time.Duration
+	BumpAfter                    time.Duration
+	BumpBlockedManualReviewAfter time.Duration
+	BumpPercent                  uint64
+	MaxBumps                     int
+	MaxFeeCapWei                 *big.Int
 }
 
 // Worker 负责平台热钱包 Token 提币签名、幂等广播、恢复和账本结算。
@@ -84,7 +87,6 @@ type Worker struct {
 	fees        evm.FeeEstimator
 	broadcaster evm.Broadcaster
 	confirmer   evm.Confirmer
-	signing     *evm.SigningFailureTracker
 }
 
 // NewWorker 创建并校验 Token 提币 Worker。
@@ -104,7 +106,6 @@ func NewWorker(chain Chain, contract TokenContract, store WorkerStore, keys wall
 		fees:        evm.NewFeeEstimator(chain),
 		broadcaster: evm.NewBroadcaster(chain),
 		confirmer:   evm.NewConfirmer(chain),
-		signing:     evm.NewSigningFailureTracker(evm.DefaultMaxSigningRetryCount),
 	}, nil
 }
 
@@ -124,13 +125,8 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, item := range items {
-		if w.signing.IsPaused(item.ID) {
-			continue
-		}
 		if err := w.Process(ctx, item.ID); err != nil {
-			if !w.signing.IsPaused(item.ID) {
-				w.recordError(ctx, item.ID, "process", "TOKEN_WITHDRAWAL_PROCESS_FAILED", err)
-			}
+			w.recordError(ctx, item.ID, "process", "TOKEN_WITHDRAWAL_PROCESS_FAILED", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -159,9 +155,9 @@ func (w *Worker) Process(ctx context.Context, withdrawalID int64) error {
 	}
 }
 
-// prepare 校验平台 Token 库存和 ETH Gas 后原子分配共享平台 Nonce。
+// prepare 校验平台 Token 库存和 ETH Gas 后原子分配共享平台 Nonce 并落库准备阶段 Gas 参数。
 func (w *Worker) prepare(ctx context.Context, item postgres.TokenWithdrawal) error {
-	platform, _, err := w.checkBalancesAndQuote(ctx, item)
+	platform, quote, err := w.checkBalancesAndQuote(ctx, item)
 	if err != nil {
 		return err
 	}
@@ -169,17 +165,25 @@ func (w *Worker) prepare(ctx context.Context, item postgres.TokenWithdrawal) err
 	if err != nil {
 		return fmt.Errorf("查询 Token 提币平台钱包 Pending Nonce 失败：%w", err)
 	}
-	item, _, err = w.store.AllocateTokenWithdrawalNonce(ctx, item.ID, chainNonce)
+	item, _, err = w.store.AllocateTokenWithdrawalNonce(ctx, item.ID, chainNonce, postgres.PreparedGasParams{
+		GasLimit:                quote.GasLimit,
+		MaxFeePerGasWei:         quote.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: quote.MaxPriorityFeePerGasWei,
+	})
 	if err != nil {
 		return fmt.Errorf("分配 Token 提币平台 Nonce 失败：%w", err)
 	}
 	return w.sign(ctx, item)
 }
 
-// sign 在已分配平台 Nonce 后直接构建并持久化交易，不再因库存/余额波动无限阻断。
+// sign 在已分配平台 Nonce 后直接读取已落库 Gas 参数构建并持久化交易，不再调用会失败的链上 RPC。
 func (w *Worker) sign(ctx context.Context, item postgres.TokenWithdrawal) error {
 	if item.Nonce == nil || !item.Nonce.IsUint64() || item.AmountUnits == nil || item.AmountUnits.Sign() <= 0 {
 		return w.handleSigningFailure(ctx, item.ID, errors.New("Token 提币 Nonce 或金额无效"))
+	}
+	if item.GasLimit == nil || *item.GasLimit <= 0 || item.MaxFeePerGasWei == nil ||
+		item.MaxFeePerGasWei.Sign() <= 0 || item.MaxPriorityFeePerGasWei == nil || item.MaxPriorityFeePerGasWei.Sign() < 0 {
+		return w.handleSigningFailure(ctx, item.ID, errors.New("已分配 Nonce 的 Token 提币缺少有效 Gas 参数"))
 	}
 	platform, err := w.platformFor(ctx, item)
 	if err != nil {
@@ -187,18 +191,17 @@ func (w *Worker) sign(ctx context.Context, item postgres.TokenWithdrawal) error 
 	}
 	from := common.HexToAddress(platform.Address)
 	to := common.HexToAddress(item.ToAddress)
-	fee, err := estimateFee(ctx, w.chain, w.contract, from, to, item.AmountUnits)
-	if err != nil {
-		return w.handleSigningFailure(ctx, item.ID, err)
-	}
+	gasLimit := uint64(*item.GasLimit)
+	maxFee := new(big.Int).Set(item.MaxFeePerGasWei)
+	maxTip := new(big.Int).Set(item.MaxPriorityFeePerGasWei)
 	calldata, err := w.contract.EncodeTransfer(to, item.AmountUnits)
 	if err != nil {
 		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("编码 Token 提币 calldata 失败：%w", err))
 	}
 	contractAddress := w.contract.Address()
 	transaction := types.NewTx(&types.DynamicFeeTx{
-		ChainID: w.config.ChainID, Nonce: item.Nonce.Uint64(), GasTipCap: fee.MaxPriorityFeePerGasWei,
-		GasFeeCap: fee.MaxFeePerGasWei, Gas: fee.GasLimit, To: &contractAddress,
+		ChainID: w.config.ChainID, Nonce: item.Nonce.Uint64(), GasTipCap: maxTip,
+		GasFeeCap: maxFee, Gas: gasLimit, To: &contractAddress,
 		Value: new(big.Int), Data: calldata,
 	})
 	if err := w.validateTransaction(transaction, item); err != nil {
@@ -220,21 +223,27 @@ func (w *Worker) sign(ctx context.Context, item postgres.TokenWithdrawal) error 
 		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("编码已签名 Token 提币交易失败：%w", err))
 	}
 	item, _, err = w.store.SaveSignedTokenWithdrawal(ctx, postgres.SignedTokenWithdrawal{
-		WithdrawalID: item.ID, GasLimit: fee.GasLimit, MaxFeePerGasWei: fee.MaxFeePerGasWei,
-		MaxPriorityFeePerGasWei: fee.MaxPriorityFeePerGasWei, RawTx: raw, TxHash: signed.Hash().Hex(),
+		WithdrawalID: item.ID, GasLimit: gasLimit, MaxFeePerGasWei: maxFee,
+		MaxPriorityFeePerGasWei: maxTip, RawTx: raw, TxHash: signed.Hash().Hex(),
 	})
 	if err != nil {
 		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("持久化已签名 Token 提币失败：%w", err))
 	}
-	w.signing.Clear(item.ID)
 	return w.broadcast(ctx, item)
 }
 
-// handleSigningFailure 统计分配 Nonce 后的连续签名失败次数，超限后写人工介入错误并暂停自动重复写入。
+// handleSigningFailure 持久化累计分配 Nonce 后的连续签名失败次数，超限后转入 MANUAL_REVIEW 并写一次告警。
 func (w *Worker) handleSigningFailure(ctx context.Context, id int64, err error) error {
-	w.signing.RecordFailure(id, func() {
-		w.recordError(ctx, id, "signing", "TOKEN_SIGNING_MANUAL_INTERVENTION", err)
-	})
+	escalated, recErr := w.store.RecordEVMSigningFailure(
+		ctx, postgres.EVMBusinessTokenWithdrawal, id, evm.DefaultMaxSigningRetryCount,
+		"token-withdrawal-worker", "TOKEN_WITHDRAWAL", id,
+		"TOKEN_SIGNING_MANUAL_INTERVENTION", err.Error(),
+	)
+	if recErr != nil {
+		w.logger.Error("记录 Token 提币签名失败计数异常", "withdrawal_id", id, "error", recErr)
+	} else if escalated {
+		w.logger.Warn("Token 提币连续签名失败超限，已转入人工核查状态", "withdrawal_id", id)
+	}
 	return err
 }
 
@@ -456,17 +465,19 @@ func (w *Worker) recordError(ctx context.Context, withdrawalID int64, stage, cod
 // normalizeReplacementConfig 校验并填充 Token 提币重播与 Gas 加价配置默认值。
 func normalizeReplacementConfig(cfg *WorkerConfig) error {
 	settings := evm.ReplacementSettings{
-		RebroadcastAfter: cfg.RebroadcastAfter,
-		BumpAfter:        cfg.BumpAfter,
-		BumpPercent:      cfg.BumpPercent,
-		MaxBumps:         cfg.MaxBumps,
-		MaxFeeCapWei:     cfg.MaxFeeCapWei,
+		RebroadcastAfter:             cfg.RebroadcastAfter,
+		BumpAfter:                    cfg.BumpAfter,
+		BumpBlockedManualReviewAfter: cfg.BumpBlockedManualReviewAfter,
+		BumpPercent:                  cfg.BumpPercent,
+		MaxBumps:                     cfg.MaxBumps,
+		MaxFeeCapWei:                 cfg.MaxFeeCapWei,
 	}
 	if err := evm.NormalizeReplacementSettings(&settings); err != nil {
 		return err
 	}
 	cfg.RebroadcastAfter = settings.RebroadcastAfter
 	cfg.BumpAfter = settings.BumpAfter
+	cfg.BumpBlockedManualReviewAfter = settings.BumpBlockedManualReviewAfter
 	cfg.BumpPercent = settings.BumpPercent
 	cfg.MaxBumps = settings.MaxBumps
 	cfg.MaxFeeCapWei = settings.MaxFeeCapWei
@@ -571,11 +582,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.TokenWithdr
 	}
 	bumpedFeeCap, bumpedTip, ok := evm.ComputeBumpedFees(prevFeeCap, prevTip, baseFee, fee.MaxPriorityFeePerGasWei, w.config.BumpPercent, w.config.MaxFeeCapWei)
 	if !ok {
-		w.recordError(ctx, item.ID, "bump", "EVM_BUMP_FEE_CAP_EXCEEDED", errors.New("Token 提币加价后手续费上限超过配置最大值，停止继续加价"))
-		if item.LastBroadcastAt != nil && time.Since(*item.LastBroadcastAt) >= w.config.RebroadcastAfter {
-			return w.rebroadcast(ctx, item)
-		}
-		return nil
+		return w.handleBumpBlocked(ctx, item, "EVM_BUMP_FEE_CAP_EXCEEDED", "Token 提币加价后手续费上限超过配置最大值，停止继续加价")
 	}
 	requiredFee := new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), bumpedFeeCap)
 	ethBalance, err := w.chain.BalanceAt(ctx, from, nil)
@@ -583,8 +590,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.TokenWithdr
 		return fmt.Errorf("Token 提币加价查询平台热钱包 ETH 余额失败：%w", err)
 	}
 	if ethBalance == nil || ethBalance.Cmp(requiredFee) < 0 {
-		w.recordError(ctx, item.ID, "bump", "HOT_WALLET_GAS_INSUFFICIENT", ErrHotWalletGasInsufficient)
-		return nil
+		return w.handleBumpBlocked(ctx, item, "HOT_WALLET_GAS_INSUFFICIENT", ErrHotWalletGasInsufficient.Error())
 	}
 	calldata, err := w.contract.EncodeTransfer(to, item.AmountUnits)
 	if err != nil {
@@ -677,4 +683,31 @@ func replacementTierStart(bumpCount int32, broadcastedAt, lastBroadcastAt *time.
 		latestAttemptAt = &attempts[0].CreatedAt
 	}
 	return evm.ReplacementTierStart(bumpCount, broadcastedAt, lastBroadcastAt, latestAttemptAt)
+}
+
+// handleBumpBlocked 统一持久化 Token 提币加价阻塞原因、按间隔重播原交易并在超时后转人工核查。
+func (w *Worker) handleBumpBlocked(ctx context.Context, item postgres.TokenWithdrawal, code, message string) error {
+	return evm.HandleBumpBlocked(ctx, evm.BumpBlockedAction{
+		RecordBlocked: func(c context.Context, cCode, cMsg string) (time.Time, error) {
+			at, _, err := w.store.RecordEVMBumpBlocked(c, postgres.EVMBusinessTokenWithdrawal, item.ID, "token-withdrawal-worker", "TOKEN_WITHDRAWAL", item.ID, cCode, cMsg)
+			return at, err
+		},
+		MarkManualReview: func(c context.Context, cCode, cMsg string) error {
+			_, changed, err := w.store.MarkTokenWithdrawalManualReview(c, item.ID, cCode, cMsg)
+			if err != nil {
+				return err
+			}
+			if changed {
+				w.recordError(c, item.ID, "bump", cCode, errors.New(cMsg))
+				w.logger.Warn("Token 提币加价长期受阻，已转入人工核查", "withdrawal_id", item.ID, "reason", code)
+			}
+			return nil
+		},
+		Rebroadcast:       func(c context.Context) error { return w.rebroadcast(c, item) },
+		LastBroadcastAt:   item.LastBroadcastAt,
+		RebroadcastAfter:  w.config.RebroadcastAfter,
+		ManualReviewAfter: w.config.BumpBlockedManualReviewAfter,
+		ReasonCode:        code,
+		ReasonMessage:     message,
+	})
 }

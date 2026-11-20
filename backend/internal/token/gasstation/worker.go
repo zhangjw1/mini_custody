@@ -60,22 +60,25 @@ type Store interface {
 	TransitionInternalTransfer(ctx context.Context, transferID int64, target string) (postgres.InternalTransfer, error)
 	UpdateInternalTransferConfirmations(ctx context.Context, transferID, confirmations int64) (postgres.InternalTransfer, error)
 	FinalizeInternalTransfer(ctx context.Context, settlement postgres.InternalTransferSettlement) (postgres.InternalTransfer, bool, error)
+	RecordEVMSigningFailure(ctx context.Context, businessType string, businessID int64, maxRetries int, worker, refType string, refID int64, errorCode, errorMessage string) (bool, error)
+	RecordEVMBumpBlocked(ctx context.Context, businessType string, businessID int64, worker, refType string, refID int64, reasonCode, reasonMessage string) (time.Time, bool, error)
 	RecordWorkerError(ctx context.Context, item postgres.WorkerError) (int64, error)
 }
 
 // Config 定义 Gas Station 的轮询、确认、卡单重播加价策略和风险控制参数。
 type Config struct {
-	Interval              time.Duration
-	Confirmations         uint64
-	ChainID               *big.Int
-	GasSafetyBPS          uint64
-	GasTopupMaxWei        *big.Int
-	PlatformMinBalanceWei *big.Int
-	RebroadcastAfter      time.Duration
-	BumpAfter             time.Duration
-	BumpPercent           uint64
-	MaxBumps              int
-	MaxFeeCapWei          *big.Int
+	Interval                     time.Duration
+	Confirmations                uint64
+	ChainID                      *big.Int
+	GasSafetyBPS                 uint64
+	GasTopupMaxWei               *big.Int
+	PlatformMinBalanceWei        *big.Int
+	RebroadcastAfter             time.Duration
+	BumpAfter                    time.Duration
+	BumpBlockedManualReviewAfter time.Duration
+	BumpPercent                  uint64
+	MaxBumps                     int
+	MaxFeeCapWei                 *big.Int
 }
 
 // HealthSnapshot 描述平台 Gas 钱包的余额和告警状态。
@@ -102,7 +105,6 @@ type Worker struct {
 	fees        evm.FeeEstimator
 	broadcaster evm.Broadcaster
 	confirmer   evm.Confirmer
-	signing     *evm.SigningFailureTracker
 }
 
 // NewWorker 创建并校验 Gas Station Worker。
@@ -128,7 +130,6 @@ func NewWorker(chain Chain, contract TokenContract, store Store, keys wallet.Key
 		fees:        evm.NewFeeEstimator(chain),
 		broadcaster: evm.NewBroadcaster(chain),
 		confirmer:   evm.NewConfirmer(chain),
-		signing:     evm.NewSigningFailureTracker(evm.DefaultMaxSigningRetryCount),
 	}, nil
 }
 
@@ -151,13 +152,8 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("查询 Gas Station 任务失败：%w", err)
 	}
 	for _, item := range items {
-		if w.signing.IsPaused(item.ID) {
-			continue
-		}
 		if err := w.Process(ctx, item.ID); err != nil {
-			if !w.signing.IsPaused(item.ID) {
-				w.recordError(ctx, item.ID, "process", "GAS_TOPUP_PROCESS_FAILED", err)
-			}
+			w.recordError(ctx, item.ID, "process", "GAS_TOPUP_PROCESS_FAILED", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -223,12 +219,18 @@ func (w *Worker) prepare(ctx context.Context, sweep postgres.TokenSweep) error {
 	if topup.Cmp(w.config.GasTopupMaxWei) > 0 {
 		return fmt.Errorf("%w：需要 %s Wei，上限 %s Wei", ErrTopupLimitExceeded, topup.String(), w.config.GasTopupMaxWei.String())
 	}
+	transferQuote, err := w.quoteTransfer(ctx, to, from, topup)
+	if err != nil {
+		return err
+	}
 	platformBalance, err := w.chain.BalanceAt(ctx, to, nil)
 	if err != nil {
 		return fmt.Errorf("查询平台热钱包 ETH 余额失败：%w", err)
 	}
 	w.updateHealth(platform, platformBalance, err)
-	if platformBalance == nil || platformBalance.Cmp(w.config.PlatformMinBalanceWei) < 0 {
+	requiredPlatform := new(big.Int).Add(topup, transferQuote.ReservedFeeWei)
+	requiredPlatform.Add(requiredPlatform, w.config.PlatformMinBalanceWei)
+	if platformBalance == nil || platformBalance.Cmp(requiredPlatform) < 0 {
 		return ErrPlatformBalanceLow
 	}
 	chainNonce, err := w.chain.PendingNonceAt(ctx, to)
@@ -238,6 +240,9 @@ func (w *Worker) prepare(ctx context.Context, sweep postgres.TokenSweep) error {
 	transfer, _, err := w.store.CreateOrGetGasTopup(ctx, postgres.GasTopupRequest{
 		SweepID: sweep.ID, PlatformWalletID: platform.ID, FromAddress: platform.Address,
 		ToAddress: address.Address, AmountWei: topup, ChainPendingNonce: chainNonce,
+		GasLimit:                transferQuote.GasLimit,
+		MaxFeePerGasWei:         transferQuote.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: transferQuote.MaxPriorityFeePerGasWei,
 	})
 	if err != nil {
 		return fmt.Errorf("创建 Gas 补充内部转账失败：%w", err)
@@ -261,56 +266,64 @@ func (w *Worker) processTransfer(ctx context.Context, transfer postgres.Internal
 	}
 }
 
-// sign 在已分配平台 Nonce 后直接构建 EIP-1559 补气交易并持久化，不再因余额波动无限阻断。
+// sign 在已分配平台 Nonce 后直接读取已落库 Gas 参数构建 EIP-1559 补气交易并持久化，不再调用会失败的链上 RPC。
 func (w *Worker) sign(ctx context.Context, transfer postgres.InternalTransfer) error {
 	if transfer.Nonce == nil || !transfer.Nonce.IsUint64() {
-		return w.handleSigningFailure(ctx, transfer.SweepID, errors.New("Gas 补充 Nonce 无效"))
+		return w.handleSigningFailure(ctx, transfer.ID, transfer.SweepID, errors.New("Gas 补充 Nonce 无效"))
+	}
+	if transfer.GasLimit == nil || *transfer.GasLimit <= 0 || transfer.MaxFeePerGasWei == nil ||
+		transfer.MaxFeePerGasWei.Sign() <= 0 || transfer.MaxPriorityFeePerGasWei == nil || transfer.MaxPriorityFeePerGasWei.Sign() < 0 {
+		return w.handleSigningFailure(ctx, transfer.ID, transfer.SweepID, errors.New("已分配 Nonce 的 Gas 补充交易缺少有效 Gas 参数"))
 	}
 	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
 		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
 	})
 	if err != nil {
-		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("查询平台热钱包失败：%w", err))
+		return w.handleSigningFailure(ctx, transfer.ID, transfer.SweepID, fmt.Errorf("查询平台热钱包失败：%w", err))
 	}
 	if platform.ID != transfer.PlatformWalletID || platform.Address != transfer.FromAddress {
-		return w.handleSigningFailure(ctx, transfer.SweepID, postgres.ErrWalletKeyMismatch)
+		return w.handleSigningFailure(ctx, transfer.ID, transfer.SweepID, postgres.ErrWalletKeyMismatch)
 	}
-	from := common.HexToAddress(transfer.FromAddress)
 	to := common.HexToAddress(transfer.ToAddress)
-	quote, err := w.quoteTransfer(ctx, from, to, transfer.AmountWei)
-	if err != nil {
-		return w.handleSigningFailure(ctx, transfer.SweepID, err)
-	}
+	gasLimit := uint64(*transfer.GasLimit)
+	maxFee := new(big.Int).Set(transfer.MaxFeePerGasWei)
+	maxTip := new(big.Int).Set(transfer.MaxPriorityFeePerGasWei)
 	transaction := types.NewTx(&types.DynamicFeeTx{
 		ChainID: new(big.Int).Set(w.config.ChainID), Nonce: transfer.Nonce.Uint64(),
-		GasTipCap: quote.MaxPriorityFeePerGasWei, GasFeeCap: quote.MaxFeePerGasWei,
-		Gas: quote.GasLimit, To: &to, Value: new(big.Int).Set(transfer.AmountWei),
+		GasTipCap: maxTip, GasFeeCap: maxFee,
+		Gas: gasLimit, To: &to, Value: new(big.Int).Set(transfer.AmountWei),
 	})
 	signed, err := w.keys.SignTx(ctx, platform.DerivationPath, transaction, w.config.ChainID)
 	if err != nil {
-		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("签署 Gas 补充交易失败：%w", err))
+		return w.handleSigningFailure(ctx, transfer.ID, transfer.SweepID, fmt.Errorf("签署 Gas 补充交易失败：%w", err))
 	}
 	raw, err := signed.MarshalBinary()
 	if err != nil {
-		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("编码已签名 Gas 补充交易失败：%w", err))
+		return w.handleSigningFailure(ctx, transfer.ID, transfer.SweepID, fmt.Errorf("编码已签名 Gas 补充交易失败：%w", err))
 	}
 	transfer, _, err = w.store.SaveSignedInternalTransfer(ctx, postgres.SignedInternalTransfer{
-		TransferID: transfer.ID, GasLimit: quote.GasLimit, MaxFeePerGasWei: quote.MaxFeePerGasWei,
-		MaxPriorityFeePerGasWei: quote.MaxPriorityFeePerGasWei, RawTx: raw,
+		TransferID: transfer.ID, GasLimit: gasLimit, MaxFeePerGasWei: maxFee,
+		MaxPriorityFeePerGasWei: maxTip, RawTx: raw,
 		TxHash: strings.ToLower(signed.Hash().Hex()),
 	})
 	if err != nil {
-		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("持久化已签名 Gas 补充交易失败：%w", err))
+		return w.handleSigningFailure(ctx, transfer.ID, transfer.SweepID, fmt.Errorf("持久化已签名 Gas 补充交易失败：%w", err))
 	}
-	w.signing.Clear(transfer.SweepID)
 	return w.broadcast(ctx, transfer)
 }
 
-// handleSigningFailure 统计分配 Nonce 后的连续签名失败次数，超限后记入人工介入错误并暂停自动重复写入。
-func (w *Worker) handleSigningFailure(ctx context.Context, sweepID int64, err error) error {
-	w.signing.RecordFailure(sweepID, func() {
-		w.recordError(ctx, sweepID, "signing", "GAS_TOPUP_SIGNING_MANUAL_INTERVENTION", err)
-	})
+// handleSigningFailure 持久化累计分配 Nonce 后的连续签名失败次数，超限后转入 MANUAL_REVIEW 并写一次告警。
+func (w *Worker) handleSigningFailure(ctx context.Context, transferID, sweepID int64, err error) error {
+	escalated, recErr := w.store.RecordEVMSigningFailure(
+		ctx, postgres.EVMBusinessInternalTransfer, transferID, evm.DefaultMaxSigningRetryCount,
+		"gas-station-worker", "TOKEN_SWEEP", sweepID,
+		"GAS_TOPUP_SIGNING_MANUAL_INTERVENTION", err.Error(),
+	)
+	if recErr != nil {
+		w.logger.Error("记录 Gas 补充签名失败计数异常", "transfer_id", transferID, "sweep_id", sweepID, "error", recErr)
+	} else if escalated {
+		w.logger.Warn("Gas 补充连续签名失败超限，已转入人工核查状态", "transfer_id", transferID, "sweep_id", sweepID)
+	}
 	return err
 }
 
@@ -519,17 +532,19 @@ func valueOrZero(value *big.Int) *big.Int {
 // normalizeReplacementConfig 校验并填充 Gas 补充重播与 Gas 加价配置默认值。
 func normalizeReplacementConfig(cfg *Config) error {
 	settings := evm.ReplacementSettings{
-		RebroadcastAfter: cfg.RebroadcastAfter,
-		BumpAfter:        cfg.BumpAfter,
-		BumpPercent:      cfg.BumpPercent,
-		MaxBumps:         cfg.MaxBumps,
-		MaxFeeCapWei:     cfg.MaxFeeCapWei,
+		RebroadcastAfter:             cfg.RebroadcastAfter,
+		BumpAfter:                    cfg.BumpAfter,
+		BumpBlockedManualReviewAfter: cfg.BumpBlockedManualReviewAfter,
+		BumpPercent:                  cfg.BumpPercent,
+		MaxBumps:                     cfg.MaxBumps,
+		MaxFeeCapWei:                 cfg.MaxFeeCapWei,
 	}
 	if err := evm.NormalizeReplacementSettings(&settings); err != nil {
 		return err
 	}
 	cfg.RebroadcastAfter = settings.RebroadcastAfter
 	cfg.BumpAfter = settings.BumpAfter
+	cfg.BumpBlockedManualReviewAfter = settings.BumpBlockedManualReviewAfter
 	cfg.BumpPercent = settings.BumpPercent
 	cfg.MaxBumps = settings.MaxBumps
 	cfg.MaxFeeCapWei = settings.MaxFeeCapWei
@@ -635,11 +650,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, transfer postgres.Interna
 	}
 	bumpedFeeCap, bumpedTip, ok := evm.ComputeBumpedFees(prevFeeCap, prevTip, baseFee, quote.MaxPriorityFeePerGasWei, w.config.BumpPercent, w.config.MaxFeeCapWei)
 	if !ok {
-		w.recordError(ctx, transfer.SweepID, "bump", "EVM_BUMP_FEE_CAP_EXCEEDED", errors.New("Gas 补充加价后手续费上限超过配置最大值，停止继续加价"))
-		if transfer.LastBroadcastAt != nil && time.Since(*transfer.LastBroadcastAt) >= w.config.RebroadcastAfter {
-			return w.rebroadcast(ctx, transfer)
-		}
-		return nil
+		return w.handleBumpBlocked(ctx, transfer, "EVM_BUMP_FEE_CAP_EXCEEDED", "Gas 补充加价后手续费上限超过配置最大值，停止继续加价")
 	}
 	requiredTotal := new(big.Int).Add(transfer.AmountWei, new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), bumpedFeeCap))
 	platformBalance, err := w.chain.BalanceAt(ctx, from, nil)
@@ -647,8 +658,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, transfer postgres.Interna
 		return fmt.Errorf("Gas 补充加价查询平台余额失败：%w", err)
 	}
 	if platformBalance == nil || platformBalance.Cmp(requiredTotal) < 0 {
-		w.recordError(ctx, transfer.SweepID, "bump", "PLATFORM_BALANCE_LOW", ErrPlatformBalanceLow)
-		return nil
+		return w.handleBumpBlocked(ctx, transfer, "PLATFORM_BALANCE_LOW", ErrPlatformBalanceLow.Error())
 	}
 	transaction := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   new(big.Int).Set(w.config.ChainID),
@@ -722,4 +732,31 @@ func replacementTierStart(bumpCount int32, broadcastedAt, lastBroadcastAt *time.
 		latestAttemptAt = &attempts[0].CreatedAt
 	}
 	return evm.ReplacementTierStart(bumpCount, broadcastedAt, lastBroadcastAt, latestAttemptAt)
+}
+
+// handleBumpBlocked 统一持久化 Gas 补充加价阻塞原因、按间隔重播原交易并在超时后转人工核查。
+func (w *Worker) handleBumpBlocked(ctx context.Context, transfer postgres.InternalTransfer, code, message string) error {
+	return evm.HandleBumpBlocked(ctx, evm.BumpBlockedAction{
+		RecordBlocked: func(c context.Context, cCode, cMsg string) (time.Time, error) {
+			at, _, err := w.store.RecordEVMBumpBlocked(c, postgres.EVMBusinessInternalTransfer, transfer.ID, "gas-station-worker", "TOKEN_SWEEP", transfer.SweepID, cCode, cMsg)
+			return at, err
+		},
+		MarkManualReview: func(c context.Context, cCode, cMsg string) error {
+			_, changed, err := w.store.MarkInternalTransferManualReview(c, transfer.ID, cCode, cMsg)
+			if err != nil {
+				return err
+			}
+			if changed {
+				w.recordError(c, transfer.SweepID, "bump", cCode, errors.New(cMsg))
+				w.logger.Warn("Gas 补充加价长期受阻，已转入人工核查", "transfer_id", transfer.ID, "sweep_id", transfer.SweepID, "reason", code)
+			}
+			return nil
+		},
+		Rebroadcast:       func(c context.Context) error { return w.rebroadcast(c, transfer) },
+		LastBroadcastAt:   transfer.LastBroadcastAt,
+		RebroadcastAfter:  w.config.RebroadcastAfter,
+		ManualReviewAfter: w.config.BumpBlockedManualReviewAfter,
+		ReasonCode:        code,
+		ReasonMessage:     message,
+	})
 }

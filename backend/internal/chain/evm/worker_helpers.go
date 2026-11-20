@@ -16,15 +16,16 @@ import (
 )
 
 const (
-	DefaultWorkerBatchSize      = 100
-	DefaultConfirmBatchSize     = 200
-	DefaultMaxSigningRetryCount = 5
-	DefaultRebroadcastAge       = 60 * time.Second
-	DefaultBumpAge              = 180 * time.Second
-	DefaultBumpPercent          = 15
-	DefaultMaxFeeCapWei         = 100_000_000_000
-	BaseFeeMultiplier           = 2
-	MinBumpPercent              = 10
+	DefaultWorkerBatchSize             = 100
+	DefaultConfirmBatchSize            = 200
+	DefaultMaxSigningRetryCount        = 5
+	DefaultRebroadcastAge              = 60 * time.Second
+	DefaultBumpAge                     = 180 * time.Second
+	DefaultBumpBlockedManualReviewAfter = 30 * time.Minute
+	DefaultBumpPercent                 = 15
+	DefaultMaxFeeCapWei                = 100_000_000_000
+	BaseFeeMultiplier                  = 2
+	MinBumpPercent                     = 10
 
 	rpcErrCodeRateLimitOrTimeout = -32002
 	rpcErrCodeLimitExceeded      = -32005
@@ -40,11 +41,12 @@ type EIP1559FeeQuote struct {
 
 // ReplacementSettings 描述 EVM 卡单重播与 Gas 加价替换策略参数。
 type ReplacementSettings struct {
-	RebroadcastAfter time.Duration
-	BumpAfter        time.Duration
-	BumpPercent      uint64
-	MaxBumps         int
-	MaxFeeCapWei     *big.Int
+	RebroadcastAfter           time.Duration
+	BumpAfter                  time.Duration
+	BumpBlockedManualReviewAfter time.Duration
+	BumpPercent                uint64
+	MaxBumps                   int
+	MaxFeeCapWei               *big.Int
 }
 
 // FeeEstimatorChain 定义 FeeEstimator 查询最新区块头和建议优先费所需的链能力。
@@ -103,7 +105,7 @@ func (e FeeEstimator) QuoteWithGasLimit(ctx context.Context, gasLimit uint64) (E
 
 // NormalizeReplacementSettings 校验并填充重播与 Gas 加价替换策略的默认值。
 func NormalizeReplacementSettings(cfg *ReplacementSettings) error {
-	if cfg.RebroadcastAfter < 0 || cfg.BumpAfter < 0 || cfg.MaxBumps < 0 {
+	if cfg.RebroadcastAfter < 0 || cfg.BumpAfter < 0 || cfg.BumpBlockedManualReviewAfter < 0 || cfg.MaxBumps < 0 {
 		return errors.New("卡单重播与 Gas 加价参数不能为负数")
 	}
 	if cfg.RebroadcastAfter == 0 {
@@ -111,6 +113,9 @@ func NormalizeReplacementSettings(cfg *ReplacementSettings) error {
 	}
 	if cfg.BumpAfter == 0 {
 		cfg.BumpAfter = DefaultBumpAge
+	}
+	if cfg.BumpBlockedManualReviewAfter == 0 {
+		cfg.BumpBlockedManualReviewAfter = DefaultBumpBlockedManualReviewAfter
 	}
 	if cfg.BumpPercent == 0 {
 		cfg.BumpPercent = DefaultBumpPercent
@@ -419,4 +424,64 @@ func RunPollLoop(ctx context.Context, interval time.Duration, step func(context.
 		case <-ticker.C:
 		}
 	}
+}
+
+// MaxCoveredSweepBumps 计算给定补气安全余量基点与单次加价比例下可安全覆盖的最大归集加价次数。
+func MaxCoveredSweepBumps(gasSafetyBPS, bumpPercent uint64) int {
+	if gasSafetyBPS == 0 || bumpPercent == 0 {
+		return 0
+	}
+	limitNum := new(big.Int).SetUint64(10_000 + gasSafetyBPS)
+	stepNum := new(big.Int).SetUint64(100 + bumpPercent)
+	stepDen := big.NewInt(100)
+	curNum := big.NewInt(1)
+	curDen := big.NewInt(1)
+	bpsScale := big.NewInt(10_000)
+
+	count := 0
+	for i := 0; i < 32; i++ {
+		nextNum := new(big.Int).Mul(curNum, stepNum)
+		nextDen := new(big.Int).Mul(curDen, stepDen)
+		lhs := new(big.Int).Mul(nextNum, bpsScale)
+		rhs := new(big.Int).Mul(limitNum, nextDen)
+		if lhs.Cmp(rhs) > 0 {
+			break
+		}
+		curNum = nextNum
+		curDen = nextDen
+		count++
+	}
+	return count
+}
+
+// BumpBlockedAction 定义 EVM 加价替换因余额或费率上限受阻后的统一处置策略。
+type BumpBlockedAction struct {
+	RecordBlocked     func(ctx context.Context, code, message string) (time.Time, error)
+	MarkManualReview  func(ctx context.Context, code, message string) error
+	Rebroadcast       func(ctx context.Context) error
+	LastBroadcastAt   *time.Time
+	RebroadcastAfter  time.Duration
+	ManualReviewAfter time.Duration
+	ReasonCode        string
+	ReasonMessage     string
+}
+
+// HandleBumpBlocked 统一持久化首次阻塞原因并去重告警，持续受阻超阈值时转人工核查，否则按重播间隔退回重播原交易。
+func HandleBumpBlocked(ctx context.Context, action BumpBlockedAction) error {
+	var blockedAt time.Time
+	if action.RecordBlocked != nil {
+		recordedAt, err := action.RecordBlocked(ctx, action.ReasonCode, action.ReasonMessage)
+		if err != nil {
+			return err
+		}
+		blockedAt = recordedAt
+	}
+	if action.ManualReviewAfter > 0 && !blockedAt.IsZero() && time.Since(blockedAt) >= action.ManualReviewAfter && action.MarkManualReview != nil {
+		msg := fmt.Sprintf("Gas 加价替换连续受阻超过 %s（原因：%s），需人工核查", action.ManualReviewAfter, action.ReasonCode)
+		return action.MarkManualReview(ctx, "EVM_BUMP_BLOCKED_MANUAL_REVIEW", msg)
+	}
+	if action.Rebroadcast != nil && action.LastBroadcastAt != nil && time.Since(*action.LastBroadcastAt) >= action.RebroadcastAfter {
+		return action.Rebroadcast(ctx)
+	}
+	return nil
 }

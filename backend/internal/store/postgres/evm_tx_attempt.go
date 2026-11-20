@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx/v5"
@@ -135,6 +136,8 @@ func (s *Store) ReplaceWithdrawalTx(ctx context.Context, replacement SignedWithd
 			raw_tx = $6,
 			tx_hash = $7,
 			bump_count = bump_count + 1,
+			bump_blocked_at = NULL,
+			bump_blocked_reason = NULL,
 			last_broadcast_at = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+withdrawalColumns,
@@ -210,6 +213,8 @@ func (s *Store) ReplaceTokenWithdrawalTx(ctx context.Context, replacement Signed
 			raw_tx = $5,
 			tx_hash = $6,
 			bump_count = bump_count + 1,
+			bump_blocked_at = NULL,
+			bump_blocked_reason = NULL,
 			last_broadcast_at = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+tokenWithdrawalColumns,
@@ -285,6 +290,8 @@ func (s *Store) ReplaceTokenSweepTx(ctx context.Context, replacement SignedToken
 			raw_tx = $5,
 			tx_hash = $6,
 			bump_count = bump_count + 1,
+			bump_blocked_at = NULL,
+			bump_blocked_reason = NULL,
 			last_broadcast_at = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+tokenSweepColumns,
@@ -356,6 +363,8 @@ func (s *Store) ReplaceInternalTransferTx(ctx context.Context, replacement Signe
 			raw_tx = $5,
 			tx_hash = $6,
 			bump_count = bump_count + 1,
+			bump_blocked_at = NULL,
+			bump_blocked_reason = NULL,
 			last_broadcast_at = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+internalTransferColumns,
@@ -456,7 +465,7 @@ func (s *Store) MarkWithdrawalManualReview(ctx context.Context, withdrawalID int
 		return item, false, nil
 	}
 	switch item.Status {
-	case WithdrawalSigned, WithdrawalBroadcasting, WithdrawalBroadcastUnknown, WithdrawalBroadcasted, WithdrawalConfirming:
+	case WithdrawalSigning, WithdrawalSigned, WithdrawalBroadcasting, WithdrawalBroadcastUnknown, WithdrawalBroadcasted, WithdrawalConfirming:
 	default:
 		return Withdrawal{}, false, ErrInvalidState
 	}
@@ -502,7 +511,7 @@ func (s *Store) MarkTokenWithdrawalManualReview(ctx context.Context, withdrawalI
 		return item, false, nil
 	}
 	switch item.Status {
-	case WithdrawalSigned, WithdrawalBroadcasted, WithdrawalConfirming:
+	case WithdrawalSigning, WithdrawalSigned, WithdrawalBroadcasted, WithdrawalConfirming:
 	default:
 		return TokenWithdrawal{}, false, ErrInvalidState
 	}
@@ -548,7 +557,7 @@ func (s *Store) MarkTokenSweepManualReview(ctx context.Context, sweepID int64, e
 		return item, false, nil
 	}
 	switch item.Status {
-	case TokenSweepSigned, TokenSweepBroadcasted, TokenSweepConfirming:
+	case TokenSweepSigning, TokenSweepSigned, TokenSweepBroadcasted, TokenSweepConfirming:
 	default:
 		return TokenSweep{}, false, ErrInvalidState
 	}
@@ -594,7 +603,7 @@ func (s *Store) MarkInternalTransferManualReview(ctx context.Context, transferID
 		return item, false, nil
 	}
 	switch item.Status {
-	case InternalTransferSigned, InternalTransferSent, InternalTransferChecking:
+	case InternalTransferSigning, InternalTransferSigned, InternalTransferSent, InternalTransferChecking:
 	default:
 		return InternalTransfer{}, false, ErrInvalidState
 	}
@@ -706,10 +715,209 @@ func validateSignedTxParams(id int64, gasLimit uint64, maxFee, maxTip *big.Int, 
 
 // isValidEVMBusinessType 校验 EVM 交易尝试记录的业务类型是否受支持。
 func isValidEVMBusinessType(value string) bool {
-	switch value {
-	case EVMBusinessWithdrawal, EVMBusinessTokenWithdrawal, EVMBusinessTokenSweep, EVMBusinessInternalTransfer:
-		return true
-	default:
-		return false
+	_, ok := evmBusinessTables[value]
+	return ok
+}
+
+type evmBusinessTableMeta struct {
+	table           string
+	signingStatus   string
+	bumpStatus      string
+	manualStatus    string
+	defaultRefType  string
+}
+
+var evmBusinessTables = map[string]evmBusinessTableMeta{
+	EVMBusinessWithdrawal: {
+		table:          "withdrawals",
+		signingStatus:  WithdrawalSigning,
+		bumpStatus:     WithdrawalBroadcasted,
+		manualStatus:   WithdrawalManualReview,
+		defaultRefType: EVMBusinessWithdrawal,
+	},
+	EVMBusinessTokenWithdrawal: {
+		table:          "token_withdrawals",
+		signingStatus:  WithdrawalSigning,
+		bumpStatus:     WithdrawalBroadcasted,
+		manualStatus:   WithdrawalManualReview,
+		defaultRefType: EVMBusinessTokenWithdrawal,
+	},
+	EVMBusinessTokenSweep: {
+		table:          "token_sweeps",
+		signingStatus:  TokenSweepSigning,
+		bumpStatus:     TokenSweepBroadcasted,
+		manualStatus:   TokenSweepManualReview,
+		defaultRefType: EVMBusinessTokenSweep,
+	},
+	EVMBusinessInternalTransfer: {
+		table:          "internal_transfers",
+		signingStatus:  InternalTransferSigning,
+		bumpStatus:     InternalTransferSent,
+		manualStatus:   InternalTransferManualReview,
+		defaultRefType: EVMBusinessTokenSweep,
+	},
+}
+
+// RecordEVMSigningFailure 持久化累计分配 Nonce 后的签名失败次数，达到上限后自动转入 MANUAL_REVIEW 并写一次告警。
+func (s *Store) RecordEVMSigningFailure(
+	ctx context.Context,
+	businessType string,
+	businessID int64,
+	maxRetries int,
+	worker, refType string,
+	refID int64,
+	errorCode, errorMessage string,
+) (bool, error) {
+	businessType = strings.ToUpper(strings.TrimSpace(businessType))
+	meta, ok := evmBusinessTables[businessType]
+	if !ok || businessID <= 0 || maxRetries <= 0 {
+		return false, errors.New("记录 EVM 签名失败参数无效")
 	}
+	if strings.TrimSpace(refType) == "" {
+		refType = meta.defaultRefType
+	}
+	if refID <= 0 {
+		refID = businessID
+	}
+	errorCode = strings.TrimSpace(errorCode)
+	errorMessage = strings.TrimSpace(errorMessage)
+	if errorCode == "" {
+		errorCode = "SIGNING_MANUAL_INTERVENTION"
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("开启 EVM 签名失败累计事务失败：%w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var status string
+	var currentCount int32
+	if err := tx.QueryRow(ctx, `SELECT status, signing_retry_count FROM `+meta.table+` WHERE id = $1 FOR UPDATE`, businessID).
+		Scan(&status, &currentCount); errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	} else if err != nil {
+		return false, fmt.Errorf("锁定 EVM 待签名记录失败：%w", err)
+	}
+	if status == meta.manualStatus {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if status != meta.signingStatus {
+		return false, ErrInvalidState
+	}
+
+	nextCount := currentCount + 1
+	escalated := int(nextCount) >= maxRetries
+	if escalated {
+		if _, err := tx.Exec(ctx, `
+			UPDATE `+meta.table+`
+			SET signing_retry_count = $2, status = $3, error_code = $4, error_message = $5, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1`,
+			businessID, nextCount, meta.manualStatus, errorCode, errorMessage,
+		); err != nil {
+			return false, fmt.Errorf("签名失败超限转入人工核查失败：%w", err)
+		}
+		if err := insertWorkerErrorInTx(ctx, tx, WorkerError{
+			Worker:        strings.TrimSpace(worker),
+			Stage:         "signing",
+			ReferenceType: refType,
+			ReferenceID:   &refID,
+			ErrorCode:     errorCode,
+			ErrorMessage:  errorMessage,
+		}); err != nil {
+			return false, err
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			UPDATE `+meta.table+`
+			SET signing_retry_count = $2, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1`,
+			businessID, nextCount,
+		); err != nil {
+			return false, fmt.Errorf("更新 EVM 签名失败计数失败：%w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("提交 EVM 签名失败累计事务失败：%w", err)
+	}
+	return escalated, nil
+}
+
+// RecordEVMBumpBlocked 持久化加价阻塞时间和原因，保证同一原因只写入一次 worker_errors。
+func (s *Store) RecordEVMBumpBlocked(
+	ctx context.Context,
+	businessType string,
+	businessID int64,
+	worker, refType string,
+	refID int64,
+	reasonCode, reasonMessage string,
+) (time.Time, bool, error) {
+	businessType = strings.ToUpper(strings.TrimSpace(businessType))
+	meta, ok := evmBusinessTables[businessType]
+	reasonCode = strings.TrimSpace(reasonCode)
+	reasonMessage = strings.TrimSpace(reasonMessage)
+	if !ok || businessID <= 0 || reasonCode == "" {
+		return time.Time{}, false, errors.New("记录 EVM 加价阻塞参数无效")
+	}
+	if strings.TrimSpace(refType) == "" {
+		refType = meta.defaultRefType
+	}
+	if refID <= 0 {
+		refID = businessID
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("开启 EVM 加价阻塞记录事务失败：%w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var status, existingReason string
+	var blockedAt *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT status, bump_blocked_at, COALESCE(bump_blocked_reason, '')
+		FROM `+meta.table+` WHERE id = $1 FOR UPDATE`, businessID,
+	).Scan(&status, &blockedAt, &existingReason); errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, ErrNotFound
+	} else if err != nil {
+		return time.Time{}, false, fmt.Errorf("锁定待记录加价阻塞的 EVM 记录失败：%w", err)
+	}
+	if status != meta.bumpStatus {
+		return time.Time{}, false, ErrInvalidState
+	}
+
+	shouldAlert := blockedAt == nil || existingReason != reasonCode
+	var resolvedAt time.Time
+	if shouldAlert {
+		if err := tx.QueryRow(ctx, `
+			UPDATE `+meta.table+`
+			SET bump_blocked_at = COALESCE(bump_blocked_at, CURRENT_TIMESTAMP),
+			    bump_blocked_reason = $2,
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1
+			RETURNING bump_blocked_at`,
+			businessID, reasonCode,
+		).Scan(&resolvedAt); err != nil {
+			return time.Time{}, false, fmt.Errorf("更新 EVM 加价阻塞状态失败：%w", err)
+		}
+		if err := insertWorkerErrorInTx(ctx, tx, WorkerError{
+			Worker:        strings.TrimSpace(worker),
+			Stage:         "bump",
+			ReferenceType: refType,
+			ReferenceID:   &refID,
+			ErrorCode:     reasonCode,
+			ErrorMessage:  reasonMessage,
+		}); err != nil {
+			return time.Time{}, false, err
+		}
+	} else {
+		resolvedAt = *blockedAt
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return time.Time{}, false, fmt.Errorf("提交 EVM 加价阻塞记录事务失败：%w", err)
+	}
+	return s.localTime(resolvedAt), shouldAlert, nil
 }

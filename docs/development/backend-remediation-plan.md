@@ -409,7 +409,7 @@ G、H、J 可以并行；I 的 EVM 部分可以并行，BTC 部分等 G 合并�
     - 持久化 `bump_blocked_at` 和原因，同一原因只写一次 worker_errors；
     - 持续阻塞超过配置阈值后转 MANUAL_REVIEW。
   - 四条链路都要改，优先在 `worker_helpers.go` 里统一实现。
-- **H2 归集加价补气**：归集需要加价而地址 ETH 不足时，先创建一笔追加补气任务（复用 Gas Station 流程），补气到账后再加价；或者把归集的最大加价次数限制在补气安全余量能覆盖的范围内，二选一，并在本节写明选择。
+- **H2 归集加价补气**：归集需要加价而地址 ETH 不足时，先创建一笔追加补气任务（复用 Gas Station 流程），补气到账后再加价；或者把归集的最大加价次数限制在补气安全余量能覆盖的范围内，二选一，并在本节写明选择。**选择说明**：已选择方案二——将 Token 归集的有效最大加价次数约束在补气安全余量 `GasSafetyBPS` 可覆盖的范围内（按 `(1 + BumpPercent/100)^k <= (1 + GasSafetyBPS/10000)` 动态计算覆盖上限，默认 `GasSafetyBPS=2000` / `BumpPercent=15` 对应最多 1 次安全加价），避免修改已广播归集单据的补气状态机并发边界；若因链上 Base Fee 暴涨仍出现 ETH 不足，则统一走 H1 的 `bump_blocked_at` 单次告警、重播退回与超时人工核查。
 - **H3 分配 nonce 后不再调用会失败的 RPC**
   - 问题：`withdrawal/worker.go:180`、`token/withdrawal/worker.go:190`、`token/sweep/worker.go:244` 在 `sign()` 里重新调用 EstimateGas。
   - 方案：

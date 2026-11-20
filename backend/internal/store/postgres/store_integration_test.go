@@ -444,7 +444,9 @@ func TestIntegrationReleaseWithdrawalRejectsAllocatedNonce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocated, _, err := store.AllocateWithdrawalNonce(ctx, item.ID, 0)
+	allocated, _, err := store.AllocateWithdrawalNonce(ctx, item.ID, 0, PreparedGasParams{
+		GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
 	if err != nil || allocated.Nonce == nil || allocated.Status != WithdrawalSigning {
 		t.Fatalf("AllocateWithdrawalNonce() = %+v, err=%v", allocated, err)
 	}
@@ -766,7 +768,9 @@ func TestIntegrationConcurrentNonceAllocationIsUnique(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			item, _, err := store.AllocateWithdrawalNonce(context.Background(), id, 5)
+			item, _, err := store.AllocateWithdrawalNonce(context.Background(), id, 5, PreparedGasParams{
+				GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20), MaxPriorityFeePerGasWei: big.NewInt(2),
+			})
 			results <- result{item: item, err: err}
 		}()
 	}
@@ -1204,7 +1208,9 @@ func TestIntegrationTokenWithdrawalPreventsOverspendAndSettlesBothResults(t *tes
 	if err != nil || created || duplicate.ID != winner.ID {
 		t.Fatalf("duplicate reserve id = %d, created = %v, error = %v", duplicate.ID, created, err)
 	}
-	failed, _, err := store.AllocateTokenWithdrawalNonce(ctx, winner.ID, 5)
+	failed, _, err := store.AllocateTokenWithdrawalNonce(ctx, winner.ID, 5, PreparedGasParams{
+		GasLimit: 50_000, MaxFeePerGasWei: big.NewInt(202), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
 	if err != nil || failed.Nonce == nil || failed.Nonce.Uint64() != 5 {
 		t.Fatalf("AllocateTokenWithdrawalNonce() nonce = %v, error = %v", failed.Nonce, err)
 	}
@@ -1233,7 +1239,9 @@ func TestIntegrationTokenWithdrawalPreventsOverspendAndSettlesBothResults(t *tes
 	if err != nil {
 		t.Fatalf("ReserveTokenWithdrawal(success) error = %v", err)
 	}
-	success, _, err = store.AllocateTokenWithdrawalNonce(ctx, success.ID, 5)
+	success, _, err = store.AllocateTokenWithdrawalNonce(ctx, success.ID, 5, PreparedGasParams{
+		GasLimit: 50_000, MaxFeePerGasWei: big.NewInt(202), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
 	if err != nil || success.Nonce == nil || success.Nonce.Uint64() != 6 {
 		t.Fatalf("shared platform nonce = %v, error = %v", success.Nonce, err)
 	}
@@ -1272,6 +1280,7 @@ func TestIntegrationGasTopupAllocatesOnePlatformNonce(t *testing.T) {
 	request := GasTopupRequest{
 		SweepID: sweep.ID, PlatformWalletID: platform.ID, FromAddress: platform.Address,
 		ToAddress: address.Address, AmountWei: big.NewInt(12_000_000), ChainPendingNonce: 7,
+		GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(202), MaxPriorityFeePerGasWei: big.NewInt(2),
 	}
 	type result struct {
 		item    InternalTransfer
@@ -1332,6 +1341,7 @@ func TestIntegrationInternalGasTopupDoesNotChangeUserETHBalance(t *testing.T) {
 	transfer, _, err := store.CreateOrGetGasTopup(ctx, GasTopupRequest{
 		SweepID: sweep.ID, PlatformWalletID: platform.ID, FromAddress: platform.Address,
 		ToAddress: address.Address, AmountWei: big.NewInt(12_000_000), ChainPendingNonce: 3,
+		GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(202), MaxPriorityFeePerGasWei: big.NewInt(2),
 	})
 	if err != nil {
 		t.Fatalf("CreateOrGetGasTopup() error = %v", err)
@@ -1420,7 +1430,9 @@ func TestIntegrationTokenSweepMergesDepositAndCreatesSuccessor(t *testing.T) {
 	if _, _, err := store.MarkTokenSweepGasReady(ctx, sweep.ID); err != nil {
 		t.Fatalf("MarkTokenSweepGasReady() error = %v", err)
 	}
-	sweep, _, err = store.AllocateTokenSweepNonce(ctx, sweep.ID, big.NewInt(1_000_000), 7)
+	sweep, _, err = store.AllocateTokenSweepNonce(ctx, sweep.ID, big.NewInt(1_000_000), 7, PreparedGasParams{
+		GasLimit: 50_000, MaxFeePerGasWei: big.NewInt(202), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
 	if err != nil {
 		t.Fatalf("AllocateTokenSweepNonce() error = %v", err)
 	}
@@ -1494,7 +1506,9 @@ func TestIntegrationTokenSweepAllocatesOneUserNonce(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			item, changed, err := store.AllocateTokenSweepNonce(ctx, sweep.ID, big.NewInt(1_000_000), 9)
+			item, changed, err := store.AllocateTokenSweepNonce(ctx, sweep.ID, big.NewInt(1_000_000), 9, PreparedGasParams{
+				GasLimit: 50_000, MaxFeePerGasWei: big.NewInt(202), MaxPriorityFeePerGasWei: big.NewInt(2),
+			})
 			results <- result{item: item, changed: changed, err: err}
 		}()
 	}
@@ -1538,7 +1552,9 @@ func TestIntegrationFailedTokenSweepDoesNotChangeUserTokenBalance(t *testing.T) 
 	if _, _, err := store.MarkTokenSweepGasReady(ctx, sweep.ID); err != nil {
 		t.Fatalf("MarkTokenSweepGasReady() error = %v", err)
 	}
-	sweep, _, err = store.AllocateTokenSweepNonce(ctx, sweep.ID, big.NewInt(1_000_000), 3)
+	sweep, _, err = store.AllocateTokenSweepNonce(ctx, sweep.ID, big.NewInt(1_000_000), 3, PreparedGasParams{
+		GasLimit: 50_000, MaxFeePerGasWei: big.NewInt(202), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
 	if err != nil {
 		t.Fatalf("AllocateTokenSweepNonce() error = %v", err)
 	}
@@ -1771,13 +1787,15 @@ func TestIntegrationEVMReplacementAttemptsFeeReserveAndManualReview(t *testing.T
 	if err != nil {
 		t.Fatalf("ReserveWithdrawal() error = %v", err)
 	}
-	item, _, err = store.AllocateWithdrawalNonce(ctx, item.ID, 4)
+	item, _, err = store.AllocateWithdrawalNonce(ctx, item.ID, 4, PreparedGasParams{
+		GasLimit: 10, MaxFeePerGasWei: big.NewInt(20), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
 	if err != nil {
 		t.Fatalf("AllocateWithdrawalNonce() error = %v", err)
 	}
 	firstHash := fmt.Sprintf("0x%064x", 8801)
 	item, _, err = store.SaveSignedWithdrawal(ctx, SignedWithdrawal{
-		WithdrawalID: item.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20),
+		WithdrawalID: item.ID, GasLimit: 10, MaxFeePerGasWei: big.NewInt(20),
 		MaxPriorityFeePerGasWei: big.NewInt(2), RawTx: []byte{1, 2, 3}, TxHash: firstHash,
 	})
 	if err != nil {
@@ -1842,12 +1860,14 @@ func TestIntegrationEVMReplacementAttemptsFeeReserveAndManualReview(t *testing.T
 	if err != nil {
 		t.Fatalf("ReserveWithdrawal(manual) error = %v", err)
 	}
-	manualItem, _, err = store.AllocateWithdrawalNonce(ctx, manualItem.ID, 5)
+	manualItem, _, err = store.AllocateWithdrawalNonce(ctx, manualItem.ID, 5, PreparedGasParams{
+		GasLimit: 2, MaxFeePerGasWei: big.NewInt(20), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
 	if err != nil {
 		t.Fatalf("AllocateWithdrawalNonce(manual) error = %v", err)
 	}
 	manualItem, _, err = store.SaveSignedWithdrawal(ctx, SignedWithdrawal{
-		WithdrawalID: manualItem.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20),
+		WithdrawalID: manualItem.ID, GasLimit: 2, MaxFeePerGasWei: big.NewInt(20),
 		MaxPriorityFeePerGasWei: big.NewInt(2), RawTx: []byte{7, 7, 7}, TxHash: fmt.Sprintf("0x%064x", 8804),
 	})
 	if err != nil {
@@ -1872,6 +1892,7 @@ func TestIntegrationInternalTransferReplacementMatchesAttemptHashes(t *testing.T
 	transfer, _, err := store.CreateOrGetGasTopup(ctx, GasTopupRequest{
 		SweepID: sweep.ID, PlatformWalletID: platform.ID, FromAddress: platform.Address,
 		ToAddress: address.Address, AmountWei: big.NewInt(12_000_000), ChainPendingNonce: 11,
+		GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20), MaxPriorityFeePerGasWei: big.NewInt(2),
 	})
 	if err != nil {
 		t.Fatalf("CreateOrGetGasTopup() error = %v", err)
@@ -2062,6 +2083,7 @@ func TestIntegrationBatchEPerformanceQueriesAndBTCTransactions(t *testing.T) {
 	transfer, _, err := store.CreateOrGetGasTopup(ctx, GasTopupRequest{
 		SweepID: sweep.ID, PlatformWalletID: platform.ID, FromAddress: platform.Address,
 		ToAddress: address.Address, AmountWei: big.NewInt(1_000_000), ChainPendingNonce: 20,
+		GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20), MaxPriorityFeePerGasWei: big.NewInt(2),
 	})
 	if err != nil {
 		t.Fatalf("CreateOrGetGasTopup() error = %v", err)
@@ -2334,5 +2356,229 @@ func TestIntegrationBTCBatchGFixesAndAssertions(t *testing.T) {
 	_ = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM worker_errors WHERE reference_type='BTC_WITHDRAWAL' AND reference_id=$1`, wScoped.ID).Scan(&wErrCount)
 	if wErrCount != 1 {
 		t.Fatalf("worker_errors count for bad withdrawal = %d, want 1", wErrCount)
+	}
+}
+
+// TestIntegrationBatchHSigningFailureBumpBlockedAndFeeClamp 验证 Batch H 签名前费用校验、连续签名失败升级与加价阻塞去重持久化。
+func TestIntegrationBatchHSigningFailureBumpBlockedAndFeeClamp(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	user, address := firstDemoWallet(t, store)
+	fundWallet(t, store, user.ID, address.ID, 100, 10_000)
+
+	// 1. 验证 AllocateWithdrawalNonce 持久化 Gas 参数，且 SaveSignedWithdrawal 拒绝超过 ReservedFeeWei 的费率。
+	wClamp, _, err := store.ReserveWithdrawal(ctx, withdrawalRequest("h4-clamp", user.ID, address.ID, 500, 200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wClamp, _, err = store.AllocateWithdrawalNonce(ctx, wClamp.ID, 1, PreparedGasParams{
+		GasLimit: 10, MaxFeePerGasWei: big.NewInt(20), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
+	if err != nil || wClamp.GasLimit == nil || *wClamp.GasLimit != 10 || wClamp.MaxFeePerGasWei.Cmp(big.NewInt(20)) != 0 {
+		t.Fatalf("allocated gas params = %+v, err = %v", wClamp, err)
+	}
+	if _, _, err = store.SaveSignedWithdrawal(ctx, SignedWithdrawal{
+		WithdrawalID: wClamp.ID, GasLimit: 10, MaxFeePerGasWei: big.NewInt(25),
+		MaxPriorityFeePerGasWei: big.NewInt(2), RawTx: []byte{1, 2, 3}, TxHash: fmt.Sprintf("0x%064x", 7101),
+	}); !errors.Is(err, ErrActualFeeExceedsHold) {
+		t.Fatalf("over-reserved SaveSignedWithdrawal() err = %v, want ErrActualFeeExceedsHold", err)
+	}
+
+	// 2. 验证连续签名失败达到上限后转入 MANUAL_REVIEW、保留 Nonce 且仅写一条告警。
+	for i := 0; i < 4; i++ {
+		escalated, recErr := store.RecordEVMSigningFailure(ctx, EVMBusinessWithdrawal, wClamp.ID, 5, "withdrawal-worker", EVMBusinessWithdrawal, wClamp.ID, "SIGNING_MANUAL_INTERVENTION", "测试签名失败")
+		if recErr != nil || escalated {
+			t.Fatalf("attempt %d escalated=%v err=%v", i+1, escalated, recErr)
+		}
+	}
+	escalated, err := store.RecordEVMSigningFailure(ctx, EVMBusinessWithdrawal, wClamp.ID, 5, "withdrawal-worker", EVMBusinessWithdrawal, wClamp.ID, "SIGNING_MANUAL_INTERVENTION", "测试签名失败")
+	if err != nil || !escalated {
+		t.Fatalf("5th RecordEVMSigningFailure() escalated=%v err=%v", escalated, err)
+	}
+	gotClamp, err := store.WithdrawalByID(ctx, wClamp.ID)
+	if err != nil || gotClamp.Status != WithdrawalManualReview || gotClamp.Nonce == nil {
+		t.Fatalf("after 5th failure: %+v, err=%v", gotClamp, err)
+	}
+
+	// 3. 验证 RecordEVMBumpBlocked 去重记录首次阻塞原因并仅写一条告警，成功替换后清除阻塞字段。
+	wBump, _, err := store.ReserveWithdrawal(ctx, withdrawalRequest("h1-bump-block", user.ID, address.ID, 500, 200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wBump, _, err = store.AllocateWithdrawalNonce(ctx, wBump.ID, 1, PreparedGasParams{
+		GasLimit: 10, MaxFeePerGasWei: big.NewInt(20), MaxPriorityFeePerGasWei: big.NewInt(2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wBump, _, err = store.SaveSignedWithdrawal(ctx, SignedWithdrawal{
+		WithdrawalID: wBump.ID, GasLimit: 10, MaxFeePerGasWei: big.NewInt(20),
+		MaxPriorityFeePerGasWei: big.NewInt(2), RawTx: []byte{4, 5, 6}, TxHash: fmt.Sprintf("0x%064x", 7102),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.TransitionWithdrawal(ctx, wBump.ID, WithdrawalBroadcasting); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.TransitionWithdrawal(ctx, wBump.ID, WithdrawalBroadcasted); err != nil {
+		t.Fatal(err)
+	}
+	firstBlockedAt, recordedFirst, err := store.RecordEVMBumpBlocked(ctx, EVMBusinessWithdrawal, wBump.ID, "withdrawal-worker", EVMBusinessWithdrawal, wBump.ID, "FEE_RESERVE_INSUFFICIENT", "余额不足以加价")
+	if err != nil || !recordedFirst || firstBlockedAt.IsZero() {
+		t.Fatalf("first RecordEVMBumpBlocked() = %v recorded=%v err=%v", firstBlockedAt, recordedFirst, err)
+	}
+	secondBlockedAt, recordedSecond, err := store.RecordEVMBumpBlocked(ctx, EVMBusinessWithdrawal, wBump.ID, "withdrawal-worker", EVMBusinessWithdrawal, wBump.ID, "FEE_RESERVE_INSUFFICIENT", "余额不足以加价")
+	if err != nil || recordedSecond || !secondBlockedAt.Equal(firstBlockedAt) {
+		t.Fatalf("second RecordEVMBumpBlocked() = %v recorded=%v err=%v", secondBlockedAt, recordedSecond, err)
+	}
+	var bumpErrCount int
+	_ = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM worker_errors WHERE reference_type=$1 AND reference_id=$2 AND error_code='FEE_RESERVE_INSUFFICIENT'`, EVMBusinessWithdrawal, wBump.ID).Scan(&bumpErrCount)
+	if bumpErrCount != 1 {
+		t.Fatalf("bump blocked worker_errors count = %d, want 1", bumpErrCount)
+	}
+	replaced, changed, err := store.ReplaceWithdrawalTx(ctx, SignedWithdrawal{
+		WithdrawalID: wBump.ID, GasLimit: 10, MaxFeePerGasWei: big.NewInt(25),
+		MaxPriorityFeePerGasWei: big.NewInt(3), RawTx: []byte{7, 8, 9}, TxHash: fmt.Sprintf("0x%064x", 7103),
+	}, big.NewInt(250))
+	if err != nil || !changed || replaced.BumpBlockedAt != nil || replaced.BumpBlockedReason != "" {
+		t.Fatalf("ReplaceWithdrawalTx() = %+v, changed=%v, err=%v", replaced, changed, err)
+	}
+}
+
+// TestIntegrationMigration000009BackfillAndRollback 验证 000009 历史尝试回填、广播时间补齐及回滚仅删除回填行。
+func TestIntegrationMigration000009BackfillAndRollback(t *testing.T) {
+	databaseURL, configErr := config.TestDatabaseURL()
+	if configErr != nil {
+		t.Fatalf("load test config: %v", configErr)
+	}
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	timezone, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminPool, err := Open(ctx, databaseURL, timezone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := fmt.Sprintf("mini_custody_m9_%d_%d", os.Getpid(), time.Now().UnixNano())
+	schemaID := pgx.Identifier{schema}.Sanitize()
+	if _, err := adminPool.Exec(ctx, `CREATE SCHEMA `+schemaID); err != nil {
+		adminPool.Close()
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = adminPool.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schemaID+` CASCADE`)
+		adminPool.Close()
+	}()
+	pool, err := OpenInSchema(ctx, databaseURL, timezone, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	runner := migrations.NewRunner(pool)
+	if err := runner.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 回退到 000008 以模拟升级前存在历史已广播记录与既有尝试记录的数据库状态。
+	if err := runner.Down(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var userID, addrID, assetID, platformID, depositID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO users(code, display_name) VALUES('legacy-u1', '历史用户1') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO wallet_addresses(user_id, network, address, derivation_index, derivation_path) VALUES($1, 'ethereum-sepolia', '0x1111111111111111111111111111111111111111', 1, 'm/44''/60''/0''/0/1') RETURNING id`, userID).Scan(&addrID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO assets(network, asset_type, symbol, contract_address, decimals, enabled) VALUES('ethereum-sepolia', 'ERC20', 'USDC', '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', 6, TRUE) RETURNING id`).Scan(&assetID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO platform_wallets(network, role, address, derivation_path) VALUES('ethereum-sepolia', 'HOT', '0x9999999999999999999999999999999999999999', 'm/44''/60''/0''/0/0') RETURNING id`).Scan(&platformID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO token_deposits(user_id, address_id, asset_id, tx_hash, log_index, block_number, block_hash, from_address, to_address, amount_units, confirmations, status)
+		VALUES($1, $2, $3, $4, 0, 10, $5, '0x3333333333333333333333333333333333333333', '0x1111111111111111111111111111111111111111', 500, 3, 'CREDITED')
+		RETURNING id`, userID, addrID, assetID, fmt.Sprintf("0x%064x", 89999), fmt.Sprintf("0x%064x", 89998)).Scan(&depositID); err != nil {
+		t.Fatal(err)
+	}
+
+	var wLegacyID, wExistingID, twLegacyID, tsLegacyID, itLegacyID int64
+	legacyHash := fmt.Sprintf("0x%064x", 90001)
+	existingHash := fmt.Sprintf("0x%064x", 90002)
+	twHash := fmt.Sprintf("0x%064x", 90003)
+	tsHash := fmt.Sprintf("0x%064x", 90004)
+	itHash := fmt.Sprintf("0x%064x", 90005)
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO withdrawals(idempotency_key, user_id, address_id, to_address, amount_wei, reserved_fee_wei, nonce, gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei, raw_tx, tx_hash, status)
+		VALUES('leg-w1', $1, $2, '0x2222222222222222222222222222222222222222', 100, 1000, 1, 21000, 20, 2, '\x0102', $3, 'BROADCASTED')
+		RETURNING id`, userID, addrID, legacyHash).Scan(&wLegacyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO withdrawals(idempotency_key, user_id, address_id, to_address, amount_wei, reserved_fee_wei, nonce, gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei, raw_tx, tx_hash, status)
+		VALUES('leg-w2', $1, $2, '0x2222222222222222222222222222222222222222', 100, 1000, 2, 21000, 20, 2, '\x0304', $3, 'BROADCASTED')
+		RETURNING id`, userID, addrID, existingHash).Scan(&wExistingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO evm_tx_attempts(business_type, business_id, from_address, nonce, attempt_no, tx_hash, raw_tx, gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei)
+		VALUES('WITHDRAWAL', $1, '0x1111111111111111111111111111111111111111', 2, 1, $2, '\x0304', 21000, 20, 2)`, wExistingID, existingHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO token_withdrawals(idempotency_key, user_id, asset_id, platform_wallet_id, to_address, amount_units, nonce, gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei, raw_tx, tx_hash, status)
+		VALUES('leg-tw1', $1, $2, $3, '0x2222222222222222222222222222222222222222', 500, 3, 50000, 20, 2, '\x0506', $4, 'BROADCASTED')
+		RETURNING id`, userID, assetID, platformID, twHash).Scan(&twLegacyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO token_sweeps(user_id, address_id, asset_id, trigger_deposit_id, recognized_amount_units, sweep_amount_units, nonce, gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei, raw_tx, tx_hash, status)
+		VALUES($1, $2, $3, $4, 500, 500, 4, 50000, 20, 2, '\x0708', $5, 'SIGNED')
+		RETURNING id`, userID, addrID, assetID, depositID, tsHash).Scan(&tsLegacyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO internal_transfers(platform_wallet_id, sweep_id, transfer_type, from_address, to_address, amount_wei, nonce, gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei, raw_tx, tx_hash, status)
+		VALUES($1, $2, 'GAS_TOPUP', '0x9999999999999999999999999999999999999999', '0x1111111111111111111111111111111111111111', 1000, 5, 21000, 20, 2, '\x090a', $3, 'BROADCASTED')
+		RETURNING id`, platformID, tsLegacyID, itHash).Scan(&itLegacyID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 应用 000009 升级并校验 4 张表回填与广播时间补齐。
+	if err := runner.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var backfilledCount, preservedFalseCount int
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM evm_tx_attempts WHERE backfilled = TRUE`).Scan(&backfilledCount)
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM evm_tx_attempts WHERE business_type='WITHDRAWAL' AND business_id=$1 AND backfilled = FALSE`, wExistingID).Scan(&preservedFalseCount)
+	if backfilledCount != 4 || preservedFalseCount != 1 {
+		t.Fatalf("backfilledCount=%d (want 4), preservedFalseCount=%d (want 1)", backfilledCount, preservedFalseCount)
+	}
+	var nullBroadcastCount int
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM withdrawals WHERE id=$1 AND (broadcasted_at IS NULL OR last_broadcast_at IS NULL)`, wLegacyID).Scan(&nullBroadcastCount)
+	if nullBroadcastCount != 0 {
+		t.Fatalf("legacy broadcasted withdrawal still has null broadcast timestamps")
+	}
+
+	// 回退 000009 时只能删除 backfilled=TRUE 的回填行，既有 attempts 必须完整保留。
+	if err := runner.Down(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var remainingAttempts int
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM evm_tx_attempts`).Scan(&remainingAttempts)
+	if remainingAttempts != 1 {
+		t.Fatalf("remaining evm_tx_attempts after 000009 down = %d, want 1", remainingAttempts)
+	}
+	if err := runner.Up(ctx); err != nil {
+		t.Fatal(err)
 	}
 }

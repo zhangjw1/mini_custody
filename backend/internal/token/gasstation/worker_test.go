@@ -33,13 +33,17 @@ type fakeChain struct {
 	receiptErr     error
 	sendErrors     []error
 	sentRaw        [][]byte
+	headerCalls    int
+	tipCalls       int
+	estimateCalls  int
 }
 
 // BlockNumber 返回测试最新区块高度。
 func (f *fakeChain) BlockNumber(context.Context) (uint64, error) { return f.latest, nil }
 
-// HeaderByNumber 返回测试 EIP-1559 区块头。
+// HeaderByNumber 返回测试 EIP-1559 区块头并累计调用次数。
 func (f *fakeChain) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
+	f.headerCalls++
 	return f.header, nil
 }
 
@@ -62,13 +66,15 @@ func (f *fakeChain) NonceAt(context.Context, common.Address, *big.Int) (uint64, 
 	return f.confirmedNonce, nil
 }
 
-// SuggestGasTipCap 返回测试建议优先费。
+// SuggestGasTipCap 返回测试建议优先费并累计调用次数。
 func (f *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	f.tipCalls++
 	return new(big.Int).Set(f.tip), nil
 }
 
-// EstimateGas 返回普通 ETH 补气转账的测试 Gas Limit。
+// EstimateGas 返回普通 ETH 补气转账的测试 Gas Limit 并累计调用次数。
 func (f *fakeChain) EstimateGas(context.Context, ethereum.CallMsg) (uint64, error) {
+	f.estimateCalls++
 	return f.transferGas, nil
 }
 
@@ -150,16 +156,20 @@ func (f *fakeStore) MarkTokenSweepGasReady(context.Context, int64) (postgres.Tok
 	return f.sweep, true, nil
 }
 
-// CreateOrGetGasTopup 幂等创建测试内部转账并分配链上 Nonce。
+// CreateOrGetGasTopup 幂等创建测试内部转账并保存 Nonce 与 Gas 参数。
 func (f *fakeStore) CreateOrGetGasTopup(_ context.Context, request postgres.GasTopupRequest) (postgres.InternalTransfer, bool, error) {
 	if f.transfer != nil {
 		return *f.transfer, false, nil
 	}
+	gasLimit := int64(request.GasLimit)
 	f.transfer = &postgres.InternalTransfer{
 		ID: 9, PlatformWalletID: request.PlatformWalletID, SweepID: request.SweepID,
 		TransferType: postgres.InternalTransferGasTopup, FromAddress: request.FromAddress,
 		ToAddress: request.ToAddress, AmountWei: new(big.Int).Set(request.AmountWei),
-		Nonce: new(big.Int).SetUint64(request.ChainPendingNonce), Status: postgres.InternalTransferSigning,
+		Nonce: new(big.Int).SetUint64(request.ChainPendingNonce), GasLimit: &gasLimit,
+		MaxFeePerGasWei:         new(big.Int).Set(request.MaxFeePerGasWei),
+		MaxPriorityFeePerGasWei: new(big.Int).Set(request.MaxPriorityFeePerGasWei),
+		Status:                  postgres.InternalTransferSigning,
 	}
 	f.sweep.Status = postgres.TokenSweepWaitingGas
 	f.sweep.GasTopupTransferID = int64Pointer(f.transfer.ID)
@@ -173,6 +183,7 @@ func (f *fakeStore) SaveSignedInternalTransfer(_ context.Context, signed postgre
 	f.transfer.MaxPriorityFeePerGasWei = new(big.Int).Set(signed.MaxPriorityFeePerGasWei)
 	f.transfer.RawTx = append([]byte(nil), signed.RawTx...)
 	f.transfer.TxHash = signed.TxHash
+	f.transfer.SigningRetryCount = 0
 	f.transfer.Status = postgres.InternalTransferSigned
 	f.attempts = append([]postgres.EVMTxAttempt{{
 		BusinessType:            postgres.EVMBusinessInternalTransfer,
@@ -202,6 +213,8 @@ func (f *fakeStore) ReplaceInternalTransferTx(_ context.Context, replacement pos
 	f.transfer.RawTx = append([]byte(nil), replacement.RawTx...)
 	f.transfer.TxHash = replacement.TxHash
 	f.transfer.BumpCount++
+	f.transfer.BumpBlockedAt = nil
+	f.transfer.BumpBlockedReason = ""
 	now := time.Now()
 	f.transfer.LastBroadcastAt = &now
 	f.attempts = append([]postgres.EVMTxAttempt{{
@@ -270,6 +283,37 @@ func (f *fakeStore) FinalizeInternalTransfer(_ context.Context, settlement postg
 		f.transfer.TxHash = settlement.TxHash
 	}
 	return *f.transfer, true, nil
+}
+
+// RecordEVMSigningFailure 记录补气交易签名失败并在达到上限后转入人工核查且仅告警一次。
+func (f *fakeStore) RecordEVMSigningFailure(_ context.Context, _ string, _ int64, maxRetries int, worker, refType string, refID int64, errorCode, errorMessage string) (bool, error) {
+	f.transfer.SigningRetryCount++
+	if int(f.transfer.SigningRetryCount) >= maxRetries && f.transfer.Status == postgres.InternalTransferSigning {
+		f.transfer.Status = postgres.InternalTransferManualReview
+		f.transfer.ErrorCode = errorCode
+		f.transfer.ErrorMessage = errorMessage
+		f.errors = append(f.errors, postgres.WorkerError{
+			Worker: worker, Stage: "sign", ReferenceType: refType, ReferenceID: &refID,
+			ErrorCode: errorCode, ErrorMessage: errorMessage,
+		})
+		return true, nil
+	}
+	return false, nil
+}
+
+// RecordEVMBumpBlocked 持久化首次加价阻塞原因并去重写入告警。
+func (f *fakeStore) RecordEVMBumpBlocked(_ context.Context, _ string, _ int64, worker, refType string, refID int64, reasonCode, reasonMessage string) (time.Time, bool, error) {
+	if f.transfer.BumpBlockedAt == nil {
+		now := time.Now()
+		f.transfer.BumpBlockedAt = &now
+		f.transfer.BumpBlockedReason = reasonMessage
+		f.errors = append(f.errors, postgres.WorkerError{
+			Worker: worker, Stage: "bump", ReferenceType: refType, ReferenceID: &refID,
+			ErrorCode: reasonCode, ErrorMessage: reasonMessage,
+		})
+		return now, true, nil
+	}
+	return *f.transfer.BumpBlockedAt, false, nil
 }
 
 // RecordWorkerError 保存测试 Worker 错误。
@@ -487,5 +531,46 @@ func TestWorkerMovesNonceGapTopupToManualReview(t *testing.T) {
 	}
 	if store.transfer.Status != postgres.InternalTransferManualReview || len(store.errors) == 0 || store.errors[0].ErrorCode != "EVM_TX_MANUAL_REVIEW" {
 		t.Fatalf("status = %s, errors = %+v", store.transfer.Status, store.errors)
+	}
+}
+
+// TestWorkerRejectsTopupWhenPlatformBalanceCannotCoverTopupAndFee 验证平台热钱包余额不足以覆盖补气、手续费与最低保留金时不分配 Nonce。
+func TestWorkerRejectsTopupWhenPlatformBalanceCannotCoverTopupAndFee(t *testing.T) {
+	chain, store, worker := newTestWorker(t)
+	chain.balances[common.HexToAddress(store.address.Address)] = new(big.Int)
+	// 需补气 12,120,000 + 手续费 4,242,000 + 最低保留 1 = 16,362,001；设置 16,000,000 应触发 H6 保护。
+	chain.balances[common.HexToAddress(store.platform.Address)] = big.NewInt(16_000_000)
+
+	err := worker.Process(context.Background(), store.sweep.ID)
+	if !errors.Is(err, ErrPlatformBalanceLow) || store.transfer != nil || len(chain.sentRaw) != 0 {
+		t.Fatalf("error = %v, transfer = %+v, sends = %d", err, store.transfer, len(chain.sentRaw))
+	}
+}
+
+// TestWorkerSignsTopupWithoutExtraFeeRPC 验证补气 SIGNING 阶段只读取持久化 Gas 参数而不调用费率 RPC。
+func TestWorkerSignsTopupWithoutExtraFeeRPC(t *testing.T) {
+	chain, store, worker := newTestWorker(t)
+	gasLimit := int64(21_000)
+	transferID := int64(9)
+	store.sweep.Status = postgres.TokenSweepWaitingGas
+	store.sweep.GasTopupTransferID = &transferID
+	store.transfer = &postgres.InternalTransfer{
+		ID: transferID, PlatformWalletID: store.platform.ID, SweepID: store.sweep.ID,
+		TransferType: postgres.InternalTransferGasTopup, FromAddress: store.platform.Address,
+		ToAddress: store.address.Address, AmountWei: big.NewInt(10_000_000),
+		Nonce: new(big.Int).SetUint64(7), GasLimit: &gasLimit,
+		MaxFeePerGasWei: big.NewInt(202), MaxPriorityFeePerGasWei: big.NewInt(2),
+		Status: postgres.InternalTransferSigning,
+	}
+	chain.header = nil
+
+	if err := worker.Process(context.Background(), store.sweep.ID); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if chain.headerCalls != 0 || chain.tipCalls != 0 || chain.estimateCalls != 0 {
+		t.Fatalf("unexpected fee RPC calls during sign: header=%d tip=%d estimate=%d", chain.headerCalls, chain.tipCalls, chain.estimateCalls)
+	}
+	if store.transfer.Status != postgres.InternalTransferSent || len(chain.sentRaw) != 1 {
+		t.Fatalf("status = %s, sends = %d", store.transfer.Status, len(chain.sentRaw))
 	}
 }

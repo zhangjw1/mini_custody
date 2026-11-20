@@ -34,13 +34,17 @@ type fakeChain struct {
 	sendErrors     []error
 	sentHashes     []common.Hash
 	sentRaw        [][]byte
+	headerCalls    int
+	tipCalls       int
+	estimateCalls  int
 }
 
 // BlockNumber 返回测试最新高度。
 func (f *fakeChain) BlockNumber(context.Context) (uint64, error) { return f.latest, nil }
 
-// HeaderByNumber 返回测试区块头。
+// HeaderByNumber 返回测试区块头并累计调用次数。
 func (f *fakeChain) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
+	f.headerCalls++
 	return f.header, nil
 }
 
@@ -59,13 +63,17 @@ func (f *fakeChain) NonceAt(context.Context, common.Address, *big.Int) (uint64, 
 	return f.confirmedNonce, nil
 }
 
-// SuggestGasTipCap 返回测试建议优先费。
+// SuggestGasTipCap 返回测试建议优先费并累计调用次数。
 func (f *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	f.tipCalls++
 	return new(big.Int).Set(f.tip), nil
 }
 
-// EstimateGas 返回测试 Gas Limit。
-func (f *fakeChain) EstimateGas(context.Context, ethereum.CallMsg) (uint64, error) { return f.gas, nil }
+// EstimateGas 返回测试 Gas Limit 并累计调用次数。
+func (f *fakeChain) EstimateGas(context.Context, ethereum.CallMsg) (uint64, error) {
+	f.estimateCalls++
+	return f.gas, nil
+}
 
 // SendTransaction 记录广播交易哈希并按顺序返回测试错误。
 func (f *fakeChain) SendTransaction(_ context.Context, transaction *types.Transaction) error {
@@ -93,11 +101,12 @@ func (f *fakeChain) TransactionReceipt(_ context.Context, hash common.Hash) (*ty
 
 // fakeStore 在内存中模拟提币状态机和结算调用。
 type fakeStore struct {
-	item       postgres.Withdrawal
-	address    postgres.WalletAddress
-	attempts   []postgres.EVMTxAttempt
-	settlement *postgres.WithdrawalSettlement
-	errors     []postgres.WorkerError
+	item         postgres.Withdrawal
+	address      postgres.WalletAddress
+	availableWei *big.Int
+	attempts     []postgres.EVMTxAttempt
+	settlement   *postgres.WithdrawalSettlement
+	errors       []postgres.WorkerError
 }
 
 // WithdrawalByID 返回内存提币记录。
@@ -110,37 +119,71 @@ func (f *fakeStore) WalletAddressByUser(context.Context, int64) (postgres.Wallet
 	return f.address, nil
 }
 
-// ListProcessableWithdrawals 返回当前内存提币。
-func (f *fakeStore) ListProcessableWithdrawals(context.Context, int) ([]postgres.Withdrawal, error) {
-	return []postgres.Withdrawal{f.item}, nil
-}
-
-// IncreaseWithdrawalFee 更新内存最大预留费用。
-func (f *fakeStore) IncreaseWithdrawalFee(_ context.Context, _ int64, value *big.Int) (postgres.Withdrawal, bool, error) {
-	changed := value.Cmp(f.item.ReservedFeeWei) > 0
-	if changed {
-		f.item.ReservedFeeWei = new(big.Int).Set(value)
+// BalanceByUser 返回内存用户可用与冻结余额。
+func (f *fakeStore) BalanceByUser(_ context.Context, userID int64) (postgres.AssetBalance, error) {
+	available := big.NewInt(1_000_000_000)
+	if f.availableWei != nil {
+		available = new(big.Int).Set(f.availableWei)
 	}
-	return f.item, changed, nil
+	return postgres.AssetBalance{
+		UserID:       userID,
+		AvailableWei: available,
+	}, nil
 }
 
-// AllocateWithdrawalNonce 保存测试 Nonce 并进入签名中状态。
-func (f *fakeStore) AllocateWithdrawalNonce(_ context.Context, _ int64, nonce uint64) (postgres.Withdrawal, bool, error) {
+// ListProcessableWithdrawals 返回当前可推进的内存提币（模拟数据库过滤终态和人工核查状态）。
+func (f *fakeStore) ListProcessableWithdrawals(context.Context, int) ([]postgres.Withdrawal, error) {
+	switch f.item.Status {
+	case postgres.WithdrawalCompleted, postgres.WithdrawalFailed, postgres.WithdrawalManualReview:
+		return nil, nil
+	default:
+		return []postgres.Withdrawal{f.item}, nil
+	}
+}
+
+// IncreaseWithdrawalFee 更新内存最大预留费用并在可用余额不足时返回余额不足错误。
+func (f *fakeStore) IncreaseWithdrawalFee(_ context.Context, _ int64, value *big.Int) (postgres.Withdrawal, bool, error) {
+	if value.Cmp(f.item.ReservedFeeWei) <= 0 {
+		return f.item, false, nil
+	}
+	diff := new(big.Int).Sub(value, f.item.ReservedFeeWei)
+	available := big.NewInt(1_000_000_000)
+	if f.availableWei != nil {
+		available = f.availableWei
+	}
+	if available.Cmp(diff) < 0 {
+		return postgres.Withdrawal{}, false, postgres.ErrInsufficientBalance
+	}
+	f.availableWei = new(big.Int).Sub(available, diff)
+	f.item.ReservedFeeWei = new(big.Int).Set(value)
+	return f.item, true, nil
+}
+
+// AllocateWithdrawalNonce 保存测试 Nonce 与 Gas 参数并进入签名中状态。
+func (f *fakeStore) AllocateWithdrawalNonce(_ context.Context, _ int64, nonce uint64, gas postgres.PreparedGasParams) (postgres.Withdrawal, bool, error) {
 	if f.item.Nonce != nil {
 		return f.item, false, nil
 	}
 	f.item.Nonce = new(big.Int).SetUint64(nonce)
+	f.item.GasLimit = int64Pointer(int64(gas.GasLimit))
+	f.item.MaxFeePerGasWei = new(big.Int).Set(gas.MaxFeePerGasWei)
+	f.item.MaxPriorityFeePerGasWei = new(big.Int).Set(gas.MaxPriorityFeePerGasWei)
 	f.item.Status = postgres.WithdrawalSigning
 	return f.item, true, nil
 }
 
 // SaveSignedWithdrawal 保存测试签名交易并进入已签名状态。
 func (f *fakeStore) SaveSignedWithdrawal(_ context.Context, signed postgres.SignedWithdrawal) (postgres.Withdrawal, bool, error) {
+	requiredFee := new(big.Int).Mul(new(big.Int).SetUint64(signed.GasLimit), signed.MaxFeePerGasWei)
+	if f.item.ReservedFeeWei != nil && requiredFee.Cmp(f.item.ReservedFeeWei) > 0 {
+		return postgres.Withdrawal{}, false, postgres.ErrActualFeeExceedsHold
+	}
 	f.item.GasLimit = int64Pointer(int64(signed.GasLimit))
 	f.item.MaxFeePerGasWei = new(big.Int).Set(signed.MaxFeePerGasWei)
 	f.item.MaxPriorityFeePerGasWei = new(big.Int).Set(signed.MaxPriorityFeePerGasWei)
 	f.item.RawTx = append([]byte(nil), signed.RawTx...)
 	f.item.TxHash = signed.TxHash
+	f.item.SigningRetryCount = 0
 	f.item.Status = postgres.WithdrawalSigned
 	f.attempts = append([]postgres.EVMTxAttempt{{
 		BusinessType:            postgres.EVMBusinessWithdrawal,
@@ -173,6 +216,8 @@ func (f *fakeStore) ReplaceWithdrawalTx(_ context.Context, replacement postgres.
 	f.item.RawTx = append([]byte(nil), replacement.RawTx...)
 	f.item.TxHash = replacement.TxHash
 	f.item.BumpCount++
+	f.item.BumpBlockedAt = nil
+	f.item.BumpBlockedReason = ""
 	now := time.Now()
 	f.item.LastBroadcastAt = &now
 	f.attempts = append([]postgres.EVMTxAttempt{{
@@ -246,6 +291,45 @@ func (f *fakeStore) FinalizeWithdrawal(_ context.Context, settlement postgres.Wi
 		f.item.TxHash = settlement.TxHash
 	}
 	return f.item, true, nil
+}
+
+// RecordEVMSigningFailure 记录签名失败次数并在达到上限时转入人工核查且仅告警一次。
+func (f *fakeStore) RecordEVMSigningFailure(_ context.Context, _ string, _ int64, maxRetries int, worker, refType string, refID int64, errorCode, errorMessage string) (bool, error) {
+	f.item.SigningRetryCount++
+	if int(f.item.SigningRetryCount) >= maxRetries && f.item.Status == postgres.WithdrawalSigning {
+		f.item.Status = postgres.WithdrawalManualReview
+		f.item.ErrorCode = errorCode
+		f.item.ErrorMessage = errorMessage
+		f.errors = append(f.errors, postgres.WorkerError{
+			Worker:        worker,
+			Stage:         "sign",
+			ReferenceType: refType,
+			ReferenceID:   &refID,
+			ErrorCode:     errorCode,
+			ErrorMessage:  errorMessage,
+		})
+		return true, nil
+	}
+	return false, nil
+}
+
+// RecordEVMBumpBlocked 持久化首次加价阻塞原因并去重写入告警。
+func (f *fakeStore) RecordEVMBumpBlocked(_ context.Context, _ string, _ int64, worker, refType string, refID int64, reasonCode, reasonMessage string) (time.Time, bool, error) {
+	if f.item.BumpBlockedAt == nil {
+		now := time.Now()
+		f.item.BumpBlockedAt = &now
+		f.item.BumpBlockedReason = reasonMessage
+		f.errors = append(f.errors, postgres.WorkerError{
+			Worker:        worker,
+			Stage:         "bump",
+			ReferenceType: refType,
+			ReferenceID:   &refID,
+			ErrorCode:     reasonCode,
+			ErrorMessage:  reasonMessage,
+		})
+		return now, true, nil
+	}
+	return *f.item.BumpBlockedAt, false, nil
 }
 
 // RecordWorkerError 保存测试 Worker 错误。
@@ -456,22 +540,23 @@ func TestWorkerReleasesBeforeAllocatingNonceWhenChainBalanceInsufficient(t *test
 	}
 }
 
-// TestWorkerStopsRepeatedErrorWritesAfterSigningFailureThreshold 验证分配 Nonce 后连续签名失败达到阈值后停止无限刷错。
+// TestWorkerStopsRepeatedErrorWritesAfterSigningFailureThreshold 验证分配 Nonce 后连续签名失败达到阈值后转入人工核查且保留 Nonce 停止刷错。
 func TestWorkerStopsRepeatedErrorWritesAfterSigningFailureThreshold(t *testing.T) {
 	chain := defaultFakeChain()
-	chain.header = nil
 	store := defaultFakeStore(t, postgres.WithdrawalSigning)
 	store.item.Nonce = big.NewInt(7)
+	// 故意不设置持久化 Gas 参数以稳定触发签名阶段失败（不依赖额外费率 RPC）。
 	worker := newTestWorker(t, chain, store)
 
 	for i := 0; i < 8; i++ {
 		_ = worker.RunOnce(context.Background())
 	}
-	if store.item.Status != postgres.WithdrawalSigning {
-		t.Fatalf("status=%s, must never release signed/signing nonce", store.item.Status)
+	if store.item.Status != postgres.WithdrawalManualReview || store.item.Nonce == nil {
+		t.Fatalf("status=%s nonce=%v, want MANUAL_REVIEW with retained nonce", store.item.Status, store.item.Nonce)
 	}
-	if len(store.errors) != 5 {
-		t.Fatalf("error records=%d, want 5 (4 process + 1 manual intervention)", len(store.errors))
+	// 5 次签名失败触发 5 次 process 错误 + 1 次 SIGNING_MANUAL_INTERVENTION，之后进入 MANUAL_REVIEW 不再触发刷错。
+	if len(store.errors) != evm.DefaultMaxSigningRetryCount+1 {
+		t.Fatalf("error records=%d, want %d", len(store.errors), evm.DefaultMaxSigningRetryCount+1)
 	}
 }
 
@@ -657,6 +742,174 @@ func TestWorkerSkipsBumpWhenFeeCapExceededAndMovesNonceGapToManualReview(t *test
 		t.Fatalf("manual review Process() error = %v", err)
 	}
 	if store.item.Status != postgres.WithdrawalManualReview || store.errors[len(store.errors)-1].ErrorCode != "EVM_TX_MANUAL_REVIEW" {
+		t.Fatalf("status = %s, errors = %+v", store.item.Status, store.errors)
+	}
+}
+
+// failingSignKeys 在测试签名阶段返回可控错误。
+type failingSignKeys struct {
+	err error
+}
+
+// Address 返回空测试地址。
+func (f failingSignKeys) Address(context.Context, string) (common.Address, error) {
+	return common.Address{}, nil
+}
+
+// SignTx 固定返回预设的测试签名失败错误。
+func (f failingSignKeys) SignTx(context.Context, string, *types.Transaction, *big.Int) (*types.Transaction, error) {
+	return nil, f.err
+}
+
+// TestWorkerSignsPersistedGasWithoutFeeRPC 验证 SIGNING 阶段只使用持久化 Gas 参数而不额外请求费率 RPC。
+func TestWorkerSignsPersistedGasWithoutFeeRPC(t *testing.T) {
+	chain := defaultFakeChain()
+	store := defaultFakeStore(t, postgres.WithdrawalSigning)
+	nonce := new(big.Int).SetUint64(7)
+	store.item.Nonce = nonce
+	store.item.ReservedFeeWei = big.NewInt(4_242_000)
+	store.item.GasLimit = int64Pointer(21_000)
+	store.item.MaxFeePerGasWei = big.NewInt(202)
+	store.item.MaxPriorityFeePerGasWei = big.NewInt(2)
+	chain.header = nil
+	worker := newTestWorker(t, chain, store)
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if chain.headerCalls != 0 || chain.tipCalls != 0 || chain.estimateCalls != 0 {
+		t.Fatalf("unexpected fee RPC calls during sign: header=%d tip=%d estimate=%d", chain.headerCalls, chain.tipCalls, chain.estimateCalls)
+	}
+	if store.item.Status != postgres.WithdrawalBroadcasted || len(chain.sentRaw) != 1 {
+		t.Fatalf("status = %s, sends = %d", store.item.Status, len(chain.sentRaw))
+	}
+}
+
+// TestWorkerClampsSignedWithdrawalFeeToReservedHold 验证重签时若持久化费率超冻结预留费且可用余额不足，则将费率钳制在预留额度内。
+func TestWorkerClampsSignedWithdrawalFeeToReservedHold(t *testing.T) {
+	chain := defaultFakeChain()
+	store := defaultFakeStore(t, postgres.WithdrawalSigning)
+	store.availableWei = big.NewInt(0)
+	store.item.Nonce = new(big.Int).SetUint64(7)
+	store.item.ReservedFeeWei = big.NewInt(2_100_000)
+	store.item.GasLimit = int64Pointer(21_000)
+	store.item.MaxFeePerGasWei = big.NewInt(200)
+	store.item.MaxPriorityFeePerGasWei = big.NewInt(150)
+	worker := newTestWorker(t, chain, store)
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if store.item.MaxFeePerGasWei.Cmp(big.NewInt(100)) != 0 || store.item.MaxPriorityFeePerGasWei.Cmp(big.NewInt(100)) != 0 {
+		t.Fatalf("clamped fees = (%s, %s), want (100, 100)", store.item.MaxFeePerGasWei, store.item.MaxPriorityFeePerGasWei)
+	}
+}
+
+// TestWorkerRecoversBroadcastNonceTooLowViaCandidateReceipt 验证广播收到 nonce too low 时复核候选 Receipt 结算，若确认 Nonce 已推进且无 Receipt 则转人工核查。
+func TestWorkerRecoversBroadcastNonceTooLowViaCandidateReceipt(t *testing.T) {
+	chain := defaultFakeChain()
+	chain.confirmedNonce = 8
+	chain.sendErrors = []error{errors.New("模拟链节点错误: nonce too low")}
+	store := defaultFakeStore(t, postgres.WithdrawalCreated)
+	worker := newTestWorker(t, chain, store)
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("first Process() should escalate safely when confirmedNonce advanced, got error = %v", err)
+	}
+	if store.item.Status != postgres.WithdrawalManualReview {
+		t.Fatalf("status = %s, want MANUAL_REVIEW", store.item.Status)
+	}
+	// 当候选交易已有足够确认 Receipt 时应直接结算完成。
+	chain2 := defaultFakeChain()
+	store2 := defaultFakeStore(t, postgres.WithdrawalCreated)
+	worker2 := newTestWorker(t, chain2, store2)
+	if err := worker2.Process(context.Background(), store2.item.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	firstHash := common.HexToHash(store2.item.TxHash)
+	store2.item.Status = postgres.WithdrawalSigned
+	chain2.sendErrors = []error{errors.New("模拟链节点错误: nonce too low")}
+	chain2.latest = 12
+	chain2.receiptsByHash = map[common.Hash]*types.Receipt{
+		firstHash: {Status: types.ReceiptStatusSuccessful, BlockNumber: big.NewInt(10), GasUsed: 21_000, EffectiveGasPrice: big.NewInt(100)},
+	}
+	if err := worker2.Process(context.Background(), store2.item.ID); err != nil {
+		t.Fatalf("recovery Process() error = %v", err)
+	}
+	if store2.item.Status != postgres.WithdrawalCompleted {
+		t.Fatalf("status = %s, want COMPLETED", store2.item.Status)
+	}
+}
+
+// TestWorkerHandlesBumpBlockedOnceRebroadcastsAndEscalatesToManualReview 验证加价受阻时仅首次告警、期间继续重播且超时转人工核查。
+func TestWorkerHandlesBumpBlockedOnceRebroadcastsAndEscalatesToManualReview(t *testing.T) {
+	chain := defaultFakeChain()
+	store := defaultFakeStore(t, postgres.WithdrawalCreated)
+	worker := newTestWorker(t, chain, store)
+	worker.config.RebroadcastAfter = 10 * time.Second
+	worker.config.BumpAfter = 30 * time.Second
+	worker.config.BumpPercent = 15
+	worker.config.MaxBumps = 3
+	worker.config.BumpBlockedManualReviewAfter = 30 * time.Minute
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	store.availableWei = big.NewInt(0)
+	stale := time.Now().Add(-time.Minute)
+	store.item.BroadcastedAt = &stale
+	store.item.LastBroadcastAt = &stale
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("first blocked bump Process() error = %v", err)
+	}
+	if store.item.BumpCount != 0 || len(store.errors) != 1 || store.errors[0].ErrorCode != "FEE_RESERVE_INSUFFICIENT" {
+		t.Fatalf("bump_count = %d, errors = %+v", store.item.BumpCount, store.errors)
+	}
+	if len(chain.sentRaw) != 2 {
+		t.Fatalf("expected rebroadcast on blocked bump, sends = %d", len(chain.sentRaw))
+	}
+
+	store.item.LastBroadcastAt = &stale
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("second blocked bump Process() error = %v", err)
+	}
+	if len(store.errors) != 1 || len(chain.sentRaw) != 3 {
+		t.Fatalf("errors should stay deduplicated (%d) and rebroadcast once more (%d)", len(store.errors), len(chain.sentRaw))
+	}
+
+	expired := time.Now().Add(-31 * time.Minute)
+	store.item.BumpBlockedAt = &expired
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("expired blocked bump Process() error = %v", err)
+	}
+	if store.item.Status != postgres.WithdrawalManualReview || store.item.ErrorCode != "EVM_BUMP_BLOCKED_MANUAL_REVIEW" {
+		t.Fatalf("status = %s, errorCode = %s", store.item.Status, store.item.ErrorCode)
+	}
+}
+
+// TestWorkerEscalatesSigningFailuresToManualReview 验证连续签名失败达到上限后转入人工核查且停止重试。
+func TestWorkerEscalatesSigningFailuresToManualReview(t *testing.T) {
+	chain := defaultFakeChain()
+	store := defaultFakeStore(t, postgres.WithdrawalSigning)
+	store.item.Nonce = new(big.Int).SetUint64(7)
+	store.item.ReservedFeeWei = big.NewInt(4_242_000)
+	store.item.GasLimit = int64Pointer(21_000)
+	store.item.MaxFeePerGasWei = big.NewInt(202)
+	store.item.MaxPriorityFeePerGasWei = big.NewInt(2)
+	worker, err := NewWorker(chain, store, failingSignKeys{err: errors.New("硬件签名器异常")}, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+		Interval: time.Second, Confirmations: 3, ChainID: big.NewInt(evm.SepoliaChainID),
+	})
+	if err != nil {
+		t.Fatalf("NewWorker() error = %v", err)
+	}
+
+	for i := 0; i < evm.DefaultMaxSigningRetryCount; i++ {
+		if err := worker.Process(context.Background(), store.item.ID); err == nil {
+			t.Fatalf("attempt %d unexpectedly succeeded", i+1)
+		}
+	}
+	if store.item.Status != postgres.WithdrawalManualReview || len(store.errors) != 1 || store.errors[0].ErrorCode != "SIGNING_MANUAL_INTERVENTION" {
 		t.Fatalf("status = %s, errors = %+v", store.item.Status, store.errors)
 	}
 }

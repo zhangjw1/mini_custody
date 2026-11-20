@@ -208,9 +208,9 @@ func TestClientFilterLogsRetriesRateLimit(t *testing.T) {
 // TestClientFilterLogsRetriesTimeout 验证日志查询超时会按策略重试且保留失败语义。
 func TestClientFilterLogsRetriesTimeout(t *testing.T) {
 	mock := newMockRPC(t)
-	mock.delay("eth_getLogs", 100*time.Millisecond)
+	mock.delay("eth_getLogs", 180*time.Millisecond)
 	client, err := New(context.Background(), Config{
-		PrimaryURL: mock.URL(), Timeout: 20 * time.Millisecond, Retry: RetryPolicy{MaxAttempts: 2},
+		PrimaryURL: mock.URL(), Timeout: 60 * time.Millisecond, Retry: RetryPolicy{MaxAttempts: 2},
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -612,5 +612,68 @@ func TestClientBatchBlocksAndHeaders(t *testing.T) {
 	}
 	if batchPosts != 2 {
 		t.Fatalf("batchPosts = %d, want 2 (1 for blocks + 1 for headers)", batchPosts)
+	}
+}
+
+// TestClientDoesNotSwitchEndpointOnInsufficientFundsOrNonceTooLow 验证节点返回 insufficient funds 和 nonce too low（含非标准 HTTP 错误包装）时不切换端点也不标记 DEGRADED。
+func TestClientDoesNotSwitchEndpointOnInsufficientFundsOrNonceTooLow(t *testing.T) {
+	primary := newMockRPC(t)
+	fallback := newMockRPC(t)
+	client := newTestClientWithPolicy(t, primary.URL(), fallback.URL(), RetryPolicy{MaxAttempts: 2})
+	defer client.Close()
+
+	sampleTx := types.NewTx(&types.DynamicFeeTx{
+		ChainID:   big.NewInt(SepoliaChainID),
+		Nonce:     1,
+		GasTipCap: big.NewInt(1_000_000_000),
+		GasFeeCap: big.NewInt(2_000_000_000),
+		Gas:       21_000,
+		To:        &common.Address{},
+		Value:     big.NewInt(100),
+	})
+
+	primary.failRPC("eth_sendRawTransaction", -32000, "insufficient funds for gas * price + value", 1)
+	if err := client.SendTransaction(context.Background(), sampleTx); err == nil {
+		t.Fatal("expected insufficient funds error")
+	}
+	if fallback.calls("eth_sendRawTransaction") != 0 || client.Snapshot().Status != "HEALTHY" {
+		t.Fatalf("insufficient funds triggered fallback=%d snap=%+v", fallback.calls("eth_sendRawTransaction"), client.Snapshot())
+	}
+
+	primary.failRPC("eth_sendRawTransaction", -32000, "nonce too low", 1)
+	if err := client.SendTransaction(context.Background(), sampleTx); err == nil {
+		t.Fatal("expected nonce too low error")
+	}
+	if fallback.calls("eth_sendRawTransaction") != 0 || client.Snapshot().Status != "HEALTHY" {
+		t.Fatalf("nonce too low triggered fallback=%d snap=%+v", fallback.calls("eth_sendRawTransaction"), client.Snapshot())
+	}
+
+	// 非 200 HTTP 响应但错误消息明确为业务错误（insufficient funds / nonce too low）时同样不得切换端点。
+	var primaryHTTPNon200Calls int
+	httpErrPrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		if req.Method == "eth_chainId" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": mockChainID})
+			return
+		}
+		primaryHTTPNon200Calls++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"insufficient funds for intrinsic transaction cost"}`))
+	}))
+	defer httpErrPrimary.Close()
+	client2 := newTestClientWithPolicy(t, httpErrPrimary.URL, fallback.URL(), RetryPolicy{MaxAttempts: 2})
+	defer client2.Close()
+
+	if err := client2.SendTransaction(context.Background(), sampleTx); err == nil {
+		t.Fatal("expected HTTP 400 insufficient funds error")
+	}
+	if primaryHTTPNon200Calls != 1 || fallback.calls("eth_sendRawTransaction") != 0 || client2.Snapshot().Status != "HEALTHY" {
+		t.Fatalf("HTTP 400 insufficient funds switched/retried unexpectedly: primaryCalls=%d fallback=%d snap=%+v",
+			primaryHTTPNon200Calls, fallback.calls("eth_sendRawTransaction"), client2.Snapshot())
 	}
 }

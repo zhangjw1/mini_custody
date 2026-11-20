@@ -237,6 +237,9 @@ type Withdrawal struct {
 	BroadcastedAt           *time.Time
 	LastBroadcastAt         *time.Time
 	BumpCount               int32
+	SigningRetryCount       int32
+	BumpBlockedAt           *time.Time
+	BumpBlockedReason       string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -316,6 +319,9 @@ type TokenSweep struct {
 	BroadcastedAt           *time.Time
 	LastBroadcastAt         *time.Time
 	BumpCount               int32
+	SigningRetryCount       int32
+	BumpBlockedAt           *time.Time
+	BumpBlockedReason       string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -372,6 +378,9 @@ type InternalTransfer struct {
 	BroadcastedAt           *time.Time
 	LastBroadcastAt         *time.Time
 	BumpCount               int32
+	SigningRetryCount       int32
+	BumpBlockedAt           *time.Time
+	BumpBlockedReason       string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -399,6 +408,9 @@ type TokenWithdrawal struct {
 	BroadcastedAt           *time.Time
 	LastBroadcastAt         *time.Time
 	BumpCount               int32
+	SigningRetryCount       int32
+	BumpBlockedAt           *time.Time
+	BumpBlockedReason       string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -432,4 +444,11 @@ type EVMTxAttempt struct {
 	MaxPriorityFeePerGasWei *big.Int
 	GasLimit                int64
 	CreatedAt               time.Time
+}
+
+// PreparedGasParams 描述分配 Nonce 阶段同步落库的交易 Gas 预算参数。
+type PreparedGasParams struct {
+	GasLimit                uint64
+	MaxFeePerGasWei         *big.Int
+	MaxPriorityFeePerGasWei *big.Int
 }

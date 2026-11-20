@@ -239,14 +239,15 @@ func (a *App) wireEVM(ctx context.Context, cfg config.Config, chainClient *evm.C
 		return fmt.Errorf("创建 Sepolia 提币服务失败：%w", err)
 	}
 	withdrawalWorker, err := withdrawal.NewWorker(chainClient, store, provider, logger, withdrawal.WorkerConfig{
-		Interval:         cfg.SepoliaScanInterval,
-		Confirmations:    cfg.SepoliaConfirmations,
-		ChainID:          big.NewInt(evm.SepoliaChainID),
-		RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter,
-		BumpAfter:        cfg.EVMReplacement.BumpAfter,
-		BumpPercent:      cfg.EVMReplacement.BumpPercent,
-		MaxBumps:         cfg.EVMReplacement.MaxBumps,
-		MaxFeeCapWei:     cfg.EVMReplacement.MaxFeeCapWei,
+		Interval:                     cfg.SepoliaScanInterval,
+		Confirmations:                cfg.SepoliaConfirmations,
+		ChainID:                      big.NewInt(evm.SepoliaChainID),
+		RebroadcastAfter:             cfg.EVMReplacement.RebroadcastAfter,
+		BumpAfter:                    cfg.EVMReplacement.BumpAfter,
+		BumpBlockedManualReviewAfter: cfg.EVMReplacement.BumpBlockedManualReviewAfter,
+		BumpPercent:                  cfg.EVMReplacement.BumpPercent,
+		MaxBumps:                     cfg.EVMReplacement.MaxBumps,
+		MaxFeeCapWei:                 cfg.EVMReplacement.MaxFeeCapWei,
 	})
 	if err != nil {
 		return fmt.Errorf("创建 Sepolia 提币 Worker 失败：%w", err)
@@ -290,11 +291,15 @@ func (a *App) wireERC20(ctx context.Context, cfg config.Config, chainClient *evm
 			return fmt.Errorf("创建 Token 提币服务失败：%w", err)
 		}
 		tokenWithdrawalWorker, err := tokenwithdrawal.NewWorker(chainClient, tokenContract, store, provider, logger, tokenwithdrawal.WorkerConfig{
-			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
-			ChainID:          big.NewInt(evm.SepoliaChainID),
-			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
-			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
-			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
+			Interval:                     cfg.ERC20.SweepInterval,
+			Confirmations:                cfg.ERC20.Confirmations,
+			ChainID:                      big.NewInt(evm.SepoliaChainID),
+			RebroadcastAfter:             cfg.EVMReplacement.RebroadcastAfter,
+			BumpAfter:                    cfg.EVMReplacement.BumpAfter,
+			BumpBlockedManualReviewAfter: cfg.EVMReplacement.BumpBlockedManualReviewAfter,
+			BumpPercent:                  cfg.EVMReplacement.BumpPercent,
+			MaxBumps:                     cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei:                 cfg.EVMReplacement.MaxFeeCapWei,
 		})
 		if err != nil {
 			return fmt.Errorf("创建 Token 提币 Worker 失败：%w", err)
@@ -306,22 +311,34 @@ func (a *App) wireERC20(ctx context.Context, cfg config.Config, chainClient *evm
 	}
 	if cfg.ERC20.SweepEnabled {
 		gasStationWorker, err := gasstation.NewWorker(chainClient, tokenContract, store, provider, logger, gasstation.Config{
-			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
-			ChainID: big.NewInt(evm.SepoliaChainID), GasSafetyBPS: cfg.ERC20.GasSafetyBPS,
-			GasTopupMaxWei: cfg.ERC20.GasTopupMaxWei, PlatformMinBalanceWei: cfg.PlatformWallet.MinETHBalanceWei,
-			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
-			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
-			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
+			Interval:                     cfg.ERC20.SweepInterval,
+			Confirmations:                cfg.ERC20.Confirmations,
+			ChainID:                      big.NewInt(evm.SepoliaChainID),
+			GasSafetyBPS:                 cfg.ERC20.GasSafetyBPS,
+			GasTopupMaxWei:               cfg.ERC20.GasTopupMaxWei,
+			PlatformMinBalanceWei:        cfg.PlatformWallet.MinETHBalanceWei,
+			RebroadcastAfter:             cfg.EVMReplacement.RebroadcastAfter,
+			BumpAfter:                    cfg.EVMReplacement.BumpAfter,
+			BumpBlockedManualReviewAfter: cfg.EVMReplacement.BumpBlockedManualReviewAfter,
+			BumpPercent:                  cfg.EVMReplacement.BumpPercent,
+			MaxBumps:                     cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei:                 cfg.EVMReplacement.MaxFeeCapWei,
 		})
 		if err != nil {
 			return fmt.Errorf("创建 Gas Station Worker 失败：%w", err)
 		}
 		tokenSweepWorker, err := tokensweep.NewWorker(chainClient, tokenContract, store, provider, logger, tokensweep.Config{
-			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
-			ChainID: big.NewInt(evm.SepoliaChainID), Symbol: cfg.ERC20.Symbol,
-			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
-			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
-			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
+			Interval:                     cfg.ERC20.SweepInterval,
+			Confirmations:                cfg.ERC20.Confirmations,
+			ChainID:                      big.NewInt(evm.SepoliaChainID),
+			Symbol:                       cfg.ERC20.Symbol,
+			GasSafetyBPS:                 cfg.ERC20.GasSafetyBPS,
+			RebroadcastAfter:             cfg.EVMReplacement.RebroadcastAfter,
+			BumpAfter:                    cfg.EVMReplacement.BumpAfter,
+			BumpBlockedManualReviewAfter: cfg.EVMReplacement.BumpBlockedManualReviewAfter,
+			BumpPercent:                  cfg.EVMReplacement.BumpPercent,
+			MaxBumps:                     cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei:                 cfg.EVMReplacement.MaxFeeCapWei,
 		})
 		if err != nil {
 			return fmt.Errorf("创建 Token Sweep Worker 失败：%w", err)

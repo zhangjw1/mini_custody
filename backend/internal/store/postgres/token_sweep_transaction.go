@@ -35,9 +35,12 @@ type TokenSweepSettlement struct {
 	TxHash        string
 }
 
-// AllocateTokenSweepNonce 在用户地址行锁下固定归集金额、分配 Nonce 并进入签名状态。
-func (s *Store) AllocateTokenSweepNonce(ctx context.Context, sweepID int64, sweepAmountUnits *big.Int, chainPendingNonce uint64) (TokenSweep, bool, error) {
+// AllocateTokenSweepNonce 在用户地址行锁下固定归集金额、分配 Nonce，并同事务落库准备阶段估算的 Gas 参数。
+func (s *Store) AllocateTokenSweepNonce(ctx context.Context, sweepID int64, sweepAmountUnits *big.Int, chainPendingNonce uint64, gas PreparedGasParams) (TokenSweep, bool, error) {
 	if err := amount.RequirePositive(sweepAmountUnits); err != nil {
+		return TokenSweep{}, false, err
+	}
+	if err := validatePreparedGas(gas); err != nil {
 		return TokenSweep{}, false, err
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -102,9 +105,11 @@ func (s *Store) AllocateTokenSweepNonce(ctx context.Context, sweepID int64, swee
 	}
 	item, err = s.scanTokenSweep(tx.QueryRow(ctx, `
 		UPDATE token_sweeps SET sweep_amount_units = $2::numeric, nonce = $3::numeric,
-			status = $4, error_code = NULL, error_message = NULL, updated_at = CURRENT_TIMESTAMP
+			gas_limit = $4, max_fee_per_gas_wei = $5::numeric, max_priority_fee_per_gas_wei = $6::numeric,
+			status = $7, error_code = NULL, error_message = NULL, updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+tokenSweepColumns,
-		item.ID, sweepAmountUnits.String(), nonce.String(), TokenSweepSigning,
+		item.ID, sweepAmountUnits.String(), nonce.String(), int64(gas.GasLimit),
+		gas.MaxFeePerGasWei.String(), gas.MaxPriorityFeePerGasWei.String(), TokenSweepSigning,
 	))
 	if err != nil {
 		return TokenSweep{}, false, fmt.Errorf("保存 Token 归集金额和 Nonce 失败：%w", err)
@@ -163,7 +168,7 @@ func (s *Store) SaveSignedTokenSweep(ctx context.Context, signed SignedTokenSwee
 	item, err = s.scanTokenSweep(tx.QueryRow(ctx, `
 		UPDATE token_sweeps SET gas_limit = $2, max_fee_per_gas_wei = $3::numeric,
 			max_priority_fee_per_gas_wei = $4::numeric, raw_tx = $5, tx_hash = $6,
-			status = $7, updated_at = CURRENT_TIMESTAMP
+			status = $7, signing_retry_count = 0, updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+tokenSweepColumns,
 		item.ID, int64(signed.GasLimit), signed.MaxFeePerGasWei.String(),
 		signed.MaxPriorityFeePerGasWei.String(), signed.RawTx, signed.TxHash, TokenSweepSigned,

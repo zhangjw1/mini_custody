@@ -49,7 +49,7 @@ type Store interface {
 	ListEVMTxAttempts(ctx context.Context, businessType string, businessID int64) ([]postgres.EVMTxAttempt, error)
 	WalletAddressByUser(ctx context.Context, userID int64) (postgres.WalletAddress, error)
 	PlatformWalletByRole(ctx context.Context, network, role string) (postgres.PlatformWallet, error)
-	AllocateTokenSweepNonce(ctx context.Context, sweepID int64, sweepAmountUnits *big.Int, chainPendingNonce uint64) (postgres.TokenSweep, bool, error)
+	AllocateTokenSweepNonce(ctx context.Context, sweepID int64, sweepAmountUnits *big.Int, chainPendingNonce uint64, gas postgres.PreparedGasParams) (postgres.TokenSweep, bool, error)
 	SaveSignedTokenSweep(ctx context.Context, signed postgres.SignedTokenSweep) (postgres.TokenSweep, bool, error)
 	ReplaceTokenSweepTx(ctx context.Context, replacement postgres.SignedTokenSweep) (postgres.TokenSweep, bool, error)
 	TouchTokenSweepBroadcast(ctx context.Context, sweepID int64) (postgres.TokenSweep, error)
@@ -58,20 +58,24 @@ type Store interface {
 	UpdateTokenSweepConfirmations(ctx context.Context, sweepID, confirmations int64) (postgres.TokenSweep, error)
 	FinalizeTokenSweep(ctx context.Context, settlement postgres.TokenSweepSettlement) (postgres.TokenSweep, bool, error)
 	FailWaitingTokenSweep(ctx context.Context, sweepID int64, errorCode, errorMessage string) (postgres.TokenSweep, bool, error)
+	RecordEVMSigningFailure(ctx context.Context, businessType string, businessID int64, maxRetries int, worker, refType string, refID int64, errorCode, errorMessage string) (bool, error)
+	RecordEVMBumpBlocked(ctx context.Context, businessType string, businessID int64, worker, refType string, refID int64, reasonCode, reasonMessage string) (time.Time, bool, error)
 	RecordWorkerError(ctx context.Context, item postgres.WorkerError) (int64, error)
 }
 
 // Config 定义 Token 归集轮询、确认数、卡单重播加价策略、Chain ID 和展示资产信息。
 type Config struct {
-	Interval         time.Duration
-	Confirmations    uint64
-	ChainID          *big.Int
-	Symbol           string
-	RebroadcastAfter time.Duration
-	BumpAfter        time.Duration
-	BumpPercent      uint64
-	MaxBumps         int
-	MaxFeeCapWei     *big.Int
+	Interval                     time.Duration
+	Confirmations                uint64
+	ChainID                      *big.Int
+	Symbol                       string
+	GasSafetyBPS                 uint64
+	RebroadcastAfter             time.Duration
+	BumpAfter                    time.Duration
+	BumpBlockedManualReviewAfter time.Duration
+	BumpPercent                  uint64
+	MaxBumps                     int
+	MaxFeeCapWei                 *big.Int
 }
 
 // HealthSnapshot 描述热钱包 Token 链上库存的最近快照。
@@ -97,7 +101,6 @@ type Worker struct {
 	fees        evm.FeeEstimator
 	broadcaster evm.Broadcaster
 	confirmer   evm.Confirmer
-	signing     *evm.SigningFailureTracker
 }
 
 // NewWorker 创建并校验 Token Sweep Worker。
@@ -120,7 +123,6 @@ func NewWorker(chain Chain, contract TokenContract, store Store, keys wallet.Key
 		fees:        evm.NewFeeEstimator(chain),
 		broadcaster: evm.NewBroadcaster(chain),
 		confirmer:   evm.NewConfirmer(chain),
-		signing:     evm.NewSigningFailureTracker(evm.DefaultMaxSigningRetryCount),
 	}, nil
 }
 
@@ -143,13 +145,8 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("查询待处理 Token 归集失败：%w", err)
 	}
 	for _, item := range items {
-		if w.signing.IsPaused(item.ID) {
-			continue
-		}
 		if err := w.Process(ctx, item.ID); err != nil {
-			if !w.signing.IsPaused(item.ID) {
-				w.recordError(ctx, item.ID, "process", "TOKEN_SWEEP_PROCESS_FAILED", err)
-			}
+			w.recordError(ctx, item.ID, "process", "TOKEN_SWEEP_PROCESS_FAILED", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -223,17 +220,25 @@ func (w *Worker) prepare(ctx context.Context, item postgres.TokenSweep) error {
 	if err != nil {
 		return fmt.Errorf("查询归集来源地址 Pending Nonce 失败：%w", err)
 	}
-	item, _, err = w.store.AllocateTokenSweepNonce(ctx, item.ID, sweepAmount, chainNonce)
+	item, _, err = w.store.AllocateTokenSweepNonce(ctx, item.ID, sweepAmount, chainNonce, postgres.PreparedGasParams{
+		GasLimit:                quote.GasLimit,
+		MaxFeePerGasWei:         quote.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: quote.MaxPriorityFeePerGasWei,
+	})
 	if err != nil {
 		return fmt.Errorf("分配 Token 归集 Nonce 失败：%w", err)
 	}
 	return w.sign(ctx, item)
 }
 
-// sign 在已分配用户地址 Nonce 后直接估算费用、签名并持久化，不再因余额波动无限阻断。
+// sign 在已分配用户地址 Nonce 后直接读取已落库 Gas 参数、签名并持久化，不再调用会失败的链上 RPC。
 func (w *Worker) sign(ctx context.Context, item postgres.TokenSweep) error {
 	if item.Nonce == nil || !item.Nonce.IsUint64() || item.SweepAmountUnits == nil || item.SweepAmountUnits.Sign() <= 0 {
 		return w.handleSigningFailure(ctx, item.ID, errors.New("Token 归集 Nonce 或金额无效"))
+	}
+	if item.GasLimit == nil || *item.GasLimit <= 0 || item.MaxFeePerGasWei == nil ||
+		item.MaxFeePerGasWei.Sign() <= 0 || item.MaxPriorityFeePerGasWei == nil || item.MaxPriorityFeePerGasWei.Sign() < 0 {
+		return w.handleSigningFailure(ctx, item.ID, errors.New("已分配 Nonce 的 Token 归集缺少有效 Gas 参数"))
 	}
 	address, platform, err := w.walletsFor(ctx, item)
 	if err != nil {
@@ -241,14 +246,9 @@ func (w *Worker) sign(ctx context.Context, item postgres.TokenSweep) error {
 	}
 	from := common.HexToAddress(address.Address)
 	to := common.HexToAddress(platform.Address)
-	gasLimit, err := w.contract.EstimateTransferGas(ctx, from, to, item.SweepAmountUnits)
-	if err != nil {
-		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("签名前估算 Token 归集 Gas 失败：%w", err))
-	}
-	quote, err := w.quoteWithGasLimit(ctx, gasLimit)
-	if err != nil {
-		return w.handleSigningFailure(ctx, item.ID, err)
-	}
+	gasLimit := uint64(*item.GasLimit)
+	maxFee := new(big.Int).Set(item.MaxFeePerGasWei)
+	maxTip := new(big.Int).Set(item.MaxPriorityFeePerGasWei)
 	calldata, err := w.contract.EncodeTransfer(to, item.SweepAmountUnits)
 	if err != nil {
 		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("编码 Token 归集 calldata 失败：%w", err))
@@ -256,8 +256,8 @@ func (w *Worker) sign(ctx context.Context, item postgres.TokenSweep) error {
 	contractAddress := w.contract.Address()
 	transaction := types.NewTx(&types.DynamicFeeTx{
 		ChainID: new(big.Int).Set(w.config.ChainID), Nonce: item.Nonce.Uint64(),
-		GasTipCap: quote.MaxPriorityFeePerGasWei, GasFeeCap: quote.MaxFeePerGasWei,
-		Gas: quote.GasLimit, To: &contractAddress, Value: new(big.Int), Data: calldata,
+		GasTipCap: maxTip, GasFeeCap: maxFee,
+		Gas: gasLimit, To: &contractAddress, Value: new(big.Int), Data: calldata,
 	})
 	if err := w.validateTransaction(transaction, to, item.SweepAmountUnits); err != nil {
 		return w.handleSigningFailure(ctx, item.ID, err)
@@ -275,22 +275,28 @@ func (w *Worker) sign(ctx context.Context, item postgres.TokenSweep) error {
 		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("编码已签名 Token 归集交易失败：%w", err))
 	}
 	item, _, err = w.store.SaveSignedTokenSweep(ctx, postgres.SignedTokenSweep{
-		SweepID: item.ID, GasLimit: quote.GasLimit, MaxFeePerGasWei: quote.MaxFeePerGasWei,
-		MaxPriorityFeePerGasWei: quote.MaxPriorityFeePerGasWei, RawTx: raw,
+		SweepID: item.ID, GasLimit: gasLimit, MaxFeePerGasWei: maxFee,
+		MaxPriorityFeePerGasWei: maxTip, RawTx: raw,
 		TxHash: strings.ToLower(signed.Hash().Hex()),
 	})
 	if err != nil {
 		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("持久化已签名 Token 归集失败：%w", err))
 	}
-	w.signing.Clear(item.ID)
 	return w.broadcast(ctx, item)
 }
 
-// handleSigningFailure 统计分配 Nonce 后的连续签名失败次数，超限后记入人工介入错误并暂停自动重复写入。
+// handleSigningFailure 持久化累计分配 Nonce 后的连续签名失败次数，超限后转入 MANUAL_REVIEW 并写一次告警。
 func (w *Worker) handleSigningFailure(ctx context.Context, id int64, err error) error {
-	w.signing.RecordFailure(id, func() {
-		w.recordError(ctx, id, "signing", "TOKEN_SWEEP_SIGNING_MANUAL_INTERVENTION", err)
-	})
+	escalated, recErr := w.store.RecordEVMSigningFailure(
+		ctx, postgres.EVMBusinessTokenSweep, id, evm.DefaultMaxSigningRetryCount,
+		"token-sweep-worker", "TOKEN_SWEEP", id,
+		"TOKEN_SWEEP_SIGNING_MANUAL_INTERVENTION", err.Error(),
+	)
+	if recErr != nil {
+		w.logger.Error("记录 Token 归集签名失败计数异常", "sweep_id", id, "error", recErr)
+	} else if escalated {
+		w.logger.Warn("Token 归集连续签名失败超限，已转入人工核查状态", "sweep_id", id)
+	}
 	return err
 }
 
@@ -374,7 +380,7 @@ func (w *Worker) confirm(ctx context.Context, item postgres.TokenSweep) error {
 		return nil
 	}
 	tierStart := replacementTierStart(item.BumpCount, item.BroadcastedAt, item.LastBroadcastAt, attempts)
-	if tierStart != nil && time.Since(*tierStart) >= w.config.BumpAfter && int(item.BumpCount) < w.config.MaxBumps {
+	if tierStart != nil && time.Since(*tierStart) >= w.config.BumpAfter && int(item.BumpCount) < w.effectiveMaxBumps() {
 		return w.bumpAndBroadcast(ctx, item, attempts)
 	}
 	if item.LastBroadcastAt != nil && time.Since(*item.LastBroadcastAt) >= w.config.RebroadcastAfter {
@@ -552,21 +558,35 @@ func valueOrZero(value *big.Int) *big.Int {
 // normalizeReplacementConfig 校验并填充 Token 归集重播与 Gas 加价配置默认值。
 func normalizeReplacementConfig(cfg *Config) error {
 	settings := evm.ReplacementSettings{
-		RebroadcastAfter: cfg.RebroadcastAfter,
-		BumpAfter:        cfg.BumpAfter,
-		BumpPercent:      cfg.BumpPercent,
-		MaxBumps:         cfg.MaxBumps,
-		MaxFeeCapWei:     cfg.MaxFeeCapWei,
+		RebroadcastAfter:             cfg.RebroadcastAfter,
+		BumpAfter:                    cfg.BumpAfter,
+		BumpBlockedManualReviewAfter: cfg.BumpBlockedManualReviewAfter,
+		BumpPercent:                  cfg.BumpPercent,
+		MaxBumps:                     cfg.MaxBumps,
+		MaxFeeCapWei:                 cfg.MaxFeeCapWei,
 	}
 	if err := evm.NormalizeReplacementSettings(&settings); err != nil {
 		return err
 	}
 	cfg.RebroadcastAfter = settings.RebroadcastAfter
 	cfg.BumpAfter = settings.BumpAfter
+	cfg.BumpBlockedManualReviewAfter = settings.BumpBlockedManualReviewAfter
 	cfg.BumpPercent = settings.BumpPercent
 	cfg.MaxBumps = settings.MaxBumps
 	cfg.MaxFeeCapWei = settings.MaxFeeCapWei
 	return nil
+}
+
+// effectiveMaxBumps 根据补气安全余量覆盖能力限制归集允许的最大加价次数（H2）。
+func (w *Worker) effectiveMaxBumps() int {
+	if w.config.GasSafetyBPS == 0 {
+		return w.config.MaxBumps
+	}
+	covered := evm.MaxCoveredSweepBumps(w.config.GasSafetyBPS, w.config.BumpPercent)
+	if covered < w.config.MaxBumps {
+		return covered
+	}
+	return w.config.MaxBumps
 }
 
 // candidateHashes 查询同一笔 Token 归集按尝试序号倒序排列的所有候选交易哈希。
@@ -670,11 +690,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.TokenSweep,
 	}
 	bumpedFeeCap, bumpedTip, ok := evm.ComputeBumpedFees(prevFeeCap, prevTip, baseFee, quote.MaxPriorityFeePerGasWei, w.config.BumpPercent, w.config.MaxFeeCapWei)
 	if !ok {
-		w.recordError(ctx, item.ID, "bump", "EVM_BUMP_FEE_CAP_EXCEEDED", errors.New("Token 归集加价后手续费上限超过配置最大值，停止继续加价"))
-		if item.LastBroadcastAt != nil && time.Since(*item.LastBroadcastAt) >= w.config.RebroadcastAfter {
-			return w.rebroadcast(ctx, item)
-		}
-		return nil
+		return w.handleBumpBlocked(ctx, item, "EVM_BUMP_FEE_CAP_EXCEEDED", "Token 归集加价后手续费上限超过配置最大值，停止继续加价")
 	}
 	requiredFee := new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), bumpedFeeCap)
 	ethBalance, err := w.chain.BalanceAt(ctx, from, nil)
@@ -682,8 +698,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.TokenSweep,
 		return fmt.Errorf("Token 归集加价查询来源 ETH 余额失败：%w", err)
 	}
 	if ethBalance == nil || ethBalance.Cmp(requiredFee) < 0 {
-		w.recordError(ctx, item.ID, "bump", "CHAIN_BALANCE_INSUFFICIENT", errors.New("归集来源地址 ETH 余额不足以支持归集加价替换"))
-		return nil
+		return w.handleBumpBlocked(ctx, item, "CHAIN_BALANCE_INSUFFICIENT", "归集来源地址 ETH 余额不足以支持归集加价替换")
 	}
 	calldata, err := w.contract.EncodeTransfer(to, item.SweepAmountUnits)
 	if err != nil {
@@ -779,4 +794,31 @@ func replacementTierStart(bumpCount int32, broadcastedAt, lastBroadcastAt *time.
 		latestAttemptAt = &attempts[0].CreatedAt
 	}
 	return evm.ReplacementTierStart(bumpCount, broadcastedAt, lastBroadcastAt, latestAttemptAt)
+}
+
+// handleBumpBlocked 统一持久化 Token 归集加价阻塞原因、按间隔重播原交易并在超时后转人工核查。
+func (w *Worker) handleBumpBlocked(ctx context.Context, item postgres.TokenSweep, code, message string) error {
+	return evm.HandleBumpBlocked(ctx, evm.BumpBlockedAction{
+		RecordBlocked: func(c context.Context, cCode, cMsg string) (time.Time, error) {
+			at, _, err := w.store.RecordEVMBumpBlocked(c, postgres.EVMBusinessTokenSweep, item.ID, "token-sweep-worker", "TOKEN_SWEEP", item.ID, cCode, cMsg)
+			return at, err
+		},
+		MarkManualReview: func(c context.Context, cCode, cMsg string) error {
+			_, changed, err := w.store.MarkTokenSweepManualReview(c, item.ID, cCode, cMsg)
+			if err != nil {
+				return err
+			}
+			if changed {
+				w.recordError(c, item.ID, "bump", cCode, errors.New(cMsg))
+				w.logger.Warn("Token 归集加价长期受阻，已转入人工核查", "sweep_id", item.ID, "reason", code)
+			}
+			return nil
+		},
+		Rebroadcast:       func(c context.Context) error { return w.rebroadcast(c, item) },
+		LastBroadcastAt:   item.LastBroadcastAt,
+		RebroadcastAfter:  w.config.RebroadcastAfter,
+		ManualReviewAfter: w.config.BumpBlockedManualReviewAfter,
+		ReasonCode:        code,
+		ReasonMessage:     message,
+	})
 }

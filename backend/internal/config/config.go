@@ -88,11 +88,12 @@ type HTTPConfig struct {
 
 // EVMReplacementConfig 描述 EVM 卡单重播与 Gas 加价替换策略参数。
 type EVMReplacementConfig struct {
-	RebroadcastAfter time.Duration
-	BumpAfter        time.Duration
-	BumpPercent      uint64
-	MaxBumps         int
-	MaxFeeCapWei     *big.Int
+	RebroadcastAfter             time.Duration
+	BumpAfter                    time.Duration
+	BumpBlockedManualReviewAfter time.Duration
+	BumpPercent                  uint64
+	MaxBumps                     int
+	MaxFeeCapWei                 *big.Int
 }
 
 // DBConfig 描述 PostgreSQL 连接池容量和生命周期配置。
@@ -289,11 +290,12 @@ func load(requireCustody bool) (Config, error) {
 		SepoliaScanBatchSize:      uint64OrDefault("SEPOLIA_SCAN_BATCH_SIZE", 20),
 		SepoliaExplorerBaseURL:    strings.TrimRight(envOrDefault("SEPOLIA_EXPLORER_BASE_URL", "https://sepolia.etherscan.io"), "/"),
 		EVMReplacement: EVMReplacementConfig{
-			RebroadcastAfter: durationOrDefault("EVM_REBROADCAST_AFTER", 60*time.Second),
-			BumpAfter:        durationOrDefault("EVM_BUMP_AFTER", 180*time.Second),
-			BumpPercent:      uint64OrDefault("EVM_BUMP_PERCENT", 15),
-			MaxBumps:         evmMaxBumps,
-			MaxFeeCapWei:     evmMaxFeeCapWei,
+			RebroadcastAfter:             durationOrDefault("EVM_REBROADCAST_AFTER", 60*time.Second),
+			BumpAfter:                    durationOrDefault("EVM_BUMP_AFTER", 180*time.Second),
+			BumpBlockedManualReviewAfter: durationOrDefault("EVM_BUMP_BLOCKED_MANUAL_REVIEW_AFTER", 30*time.Minute),
+			BumpPercent:                  uint64OrDefault("EVM_BUMP_PERCENT", 15),
+			MaxBumps:                     evmMaxBumps,
+			MaxFeeCapWei:                 evmMaxFeeCapWei,
 		},
 		ERC20: ERC20Config{
 			Enabled:           erc20Enabled,
@@ -390,6 +392,7 @@ func (c Config) validate(requireCustody bool) error {
 		return errors.New("Sepolia 充值扫描配置无效")
 	}
 	if c.EVMReplacement.RebroadcastAfter <= 0 || c.EVMReplacement.BumpAfter <= 0 ||
+		c.EVMReplacement.BumpBlockedManualReviewAfter < 0 ||
 		c.EVMReplacement.BumpPercent < 10 || c.EVMReplacement.MaxBumps < 0 ||
 		c.EVMReplacement.MaxFeeCapWei == nil || c.EVMReplacement.MaxFeeCapWei.Sign() <= 0 {
 		return errors.New("EVM 卡单重播与 Gas 加价配置无效")

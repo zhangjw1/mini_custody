@@ -14,14 +14,17 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/amount"
 )
 
-// GasTopupRequest 描述创建 Gas 补充内部转账所需的确定性参数。
+// GasTopupRequest 描述创建 Gas 补充内部转账及同步落库准备阶段 Gas 参数所需的确定性参数。
 type GasTopupRequest struct {
-	SweepID           int64
-	PlatformWalletID  int64
-	FromAddress       string
-	ToAddress         string
-	AmountWei         *big.Int
-	ChainPendingNonce uint64
+	SweepID                 int64
+	PlatformWalletID        int64
+	FromAddress             string
+	ToAddress               string
+	AmountWei               *big.Int
+	ChainPendingNonce       uint64
+	GasLimit                uint64
+	MaxFeePerGasWei         *big.Int
+	MaxPriorityFeePerGasWei *big.Int
 }
 
 // SignedInternalTransfer 描述广播前必须持久化的内部转账签名结果。
@@ -130,6 +133,13 @@ func (s *Store) CreateOrGetGasTopup(ctx context.Context, request GasTopupRequest
 	if err := amount.RequirePositive(request.AmountWei); err != nil {
 		return InternalTransfer{}, false, err
 	}
+	if err := validatePreparedGas(PreparedGasParams{
+		GasLimit:                request.GasLimit,
+		MaxFeePerGasWei:         request.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: request.MaxPriorityFeePerGasWei,
+	}); err != nil {
+		return InternalTransfer{}, false, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return InternalTransfer{}, false, fmt.Errorf("开启 Gas 补充创建事务失败：%w", err)
@@ -184,11 +194,12 @@ func (s *Store) CreateOrGetGasTopup(ctx context.Context, request GasTopupRequest
 	item, err := s.scanInternalTransfer(tx.QueryRow(ctx, `
 		INSERT INTO internal_transfers (
 			platform_wallet_id, sweep_id, transfer_type, from_address, to_address,
-			amount_wei, nonce, status
-		) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8)
+			amount_wei, nonce, gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei, status
+		) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9::numeric, $10::numeric, $11)
 		RETURNING `+internalTransferColumns,
 		platform.ID, sweep.ID, InternalTransferGasTopup, request.FromAddress, request.ToAddress,
-		request.AmountWei.String(), nonce.String(), InternalTransferSigning,
+		request.AmountWei.String(), nonce.String(), int64(request.GasLimit),
+		request.MaxFeePerGasWei.String(), request.MaxPriorityFeePerGasWei.String(), InternalTransferSigning,
 	))
 	if err != nil {
 		return InternalTransfer{}, false, fmt.Errorf("创建 Gas 补充内部转账失败：%w", err)
@@ -248,7 +259,7 @@ func (s *Store) SaveSignedInternalTransfer(ctx context.Context, signed SignedInt
 	item, err = s.scanInternalTransfer(tx.QueryRow(ctx, `
 		UPDATE internal_transfers SET gas_limit = $2, max_fee_per_gas_wei = $3::numeric,
 			max_priority_fee_per_gas_wei = $4::numeric, raw_tx = $5, tx_hash = $6,
-			status = $7, updated_at = CURRENT_TIMESTAMP
+			status = $7, signing_retry_count = 0, updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+internalTransferColumns,
 		item.ID, int64(signed.GasLimit), signed.MaxFeePerGasWei.String(),
 		signed.MaxPriorityFeePerGasWei.String(), signed.RawTx, signed.TxHash, InternalTransferSigned,

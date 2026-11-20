@@ -208,8 +208,22 @@ func (s *Store) IncreaseWithdrawalFee(ctx context.Context, withdrawalID int64, n
 	return item, true, nil
 }
 
-// AllocateWithdrawalNonce 在地址行锁下选择链上与数据库中的较大 Nonce 并推进提币状态。
-func (s *Store) AllocateWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64) (Withdrawal, bool, error) {
+// validatePreparedGas 校验分配 Nonce 阶段同步落库的 EIP-1559 费用参数合法性。
+func validatePreparedGas(gas PreparedGasParams) error {
+	if gas.GasLimit == 0 || gas.GasLimit > uint64(math.MaxInt64) {
+		return errors.New("准备阶段 Gas Limit 无效")
+	}
+	if err := amount.RequirePositive(gas.MaxFeePerGasWei); err != nil {
+		return err
+	}
+	return amount.RequireNonNegative(gas.MaxPriorityFeePerGasWei)
+}
+
+// AllocateWithdrawalNonce 在地址行锁下选择链上与数据库中的较大 Nonce，并同事务落库已预留的 Gas 参数。
+func (s *Store) AllocateWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64, gas PreparedGasParams) (Withdrawal, bool, error) {
+	if err := validatePreparedGas(gas); err != nil {
+		return Withdrawal{}, false, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Withdrawal{}, false, fmt.Errorf("开启提币 Nonce 分配事务失败：%w", err)
@@ -251,9 +265,13 @@ func (s *Store) AllocateWithdrawalNonce(ctx context.Context, withdrawalID int64,
 		return Withdrawal{}, false, fmt.Errorf("推进钱包地址 Nonce 失败：%w", err)
 	}
 	item, err = s.scanWithdrawal(tx.QueryRow(ctx, `
-		UPDATE withdrawals SET nonce = $2::numeric, status = $3, updated_at = CURRENT_TIMESTAMP
+		UPDATE withdrawals SET
+			nonce = $2::numeric, gas_limit = $3,
+			max_fee_per_gas_wei = $4::numeric, max_priority_fee_per_gas_wei = $5::numeric,
+			status = $6, updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+withdrawalColumns,
-		item.ID, nonce.String(), WithdrawalSigning,
+		item.ID, nonce.String(), int64(gas.GasLimit),
+		gas.MaxFeePerGasWei.String(), gas.MaxPriorityFeePerGasWei.String(), WithdrawalSigning,
 	))
 	if err != nil {
 		return Withdrawal{}, false, fmt.Errorf("保存提币 Nonce 失败：%w", err)
@@ -300,6 +318,10 @@ func (s *Store) SaveSignedWithdrawal(ctx context.Context, signed SignedWithdrawa
 	if item.Status != WithdrawalSigning || item.Nonce == nil {
 		return Withdrawal{}, false, ErrInvalidState
 	}
+	requiredHold := new(big.Int).Mul(new(big.Int).SetUint64(signed.GasLimit), signed.MaxFeePerGasWei)
+	if requiredHold.Cmp(item.ReservedFeeWei) > 0 {
+		return Withdrawal{}, false, ErrActualFeeExceedsHold
+	}
 	var fromAddress string
 	if err := tx.QueryRow(ctx, `SELECT address FROM wallet_addresses WHERE id = $1`, item.AddressID).Scan(&fromAddress); err != nil {
 		return Withdrawal{}, false, fmt.Errorf("查询提币发送地址失败：%w", mapNotFound(err))
@@ -308,7 +330,7 @@ func (s *Store) SaveSignedWithdrawal(ctx context.Context, signed SignedWithdrawa
 		UPDATE withdrawals SET
 			gas_limit = $2, max_fee_per_gas_wei = $3::numeric,
 			max_priority_fee_per_gas_wei = $4::numeric, raw_tx = $5,
-			tx_hash = $6, status = $7, updated_at = CURRENT_TIMESTAMP
+			tx_hash = $6, status = $7, signing_retry_count = 0, updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+withdrawalColumns,
 		item.ID, int64(signed.GasLimit), signed.MaxFeePerGasWei.String(),
 		signed.MaxPriorityFeePerGasWei.String(), signed.RawTx, signed.TxHash, WithdrawalSigned,

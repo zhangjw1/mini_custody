@@ -148,8 +148,11 @@ func (s *Store) ReserveTokenWithdrawal(ctx context.Context, request TokenWithdra
 	return item, true, nil
 }
 
-// AllocateTokenWithdrawalNonce 在平台钱包行锁下分配共享 Nonce 并推进到签名状态。
-func (s *Store) AllocateTokenWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64) (TokenWithdrawal, bool, error) {
+// AllocateTokenWithdrawalNonce 在平台钱包行锁下分配共享 Nonce，并同事务落库准备阶段估算的 Gas 参数。
+func (s *Store) AllocateTokenWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64, gas PreparedGasParams) (TokenWithdrawal, bool, error) {
+	if err := validatePreparedGas(gas); err != nil {
+		return TokenWithdrawal{}, false, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return TokenWithdrawal{}, false, fmt.Errorf("开启 Token 提币 Nonce 事务失败：%w", err)
@@ -190,8 +193,12 @@ func (s *Store) AllocateTokenWithdrawalNonce(ctx context.Context, withdrawalID i
 		return TokenWithdrawal{}, false, fmt.Errorf("推进 Token 提币平台钱包 Nonce 失败：%w", err)
 	}
 	item, err = s.scanTokenWithdrawal(tx.QueryRow(ctx, `
-		UPDATE token_withdrawals SET nonce = $2::numeric, status = $3, updated_at = CURRENT_TIMESTAMP
-		WHERE id = $1 RETURNING `+tokenWithdrawalColumns, item.ID, nonce.String(), WithdrawalSigning,
+		UPDATE token_withdrawals SET nonce = $2::numeric, gas_limit = $3,
+			max_fee_per_gas_wei = $4::numeric, max_priority_fee_per_gas_wei = $5::numeric,
+			status = $6, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 RETURNING `+tokenWithdrawalColumns,
+		item.ID, nonce.String(), int64(gas.GasLimit),
+		gas.MaxFeePerGasWei.String(), gas.MaxPriorityFeePerGasWei.String(), WithdrawalSigning,
 	))
 	if err != nil {
 		return TokenWithdrawal{}, false, fmt.Errorf("保存 Token 提币 Nonce 失败：%w", err)
@@ -248,7 +255,7 @@ func (s *Store) SaveSignedTokenWithdrawal(ctx context.Context, signed SignedToke
 	item, err = s.scanTokenWithdrawal(tx.QueryRow(ctx, `
 		UPDATE token_withdrawals SET gas_limit = $2, max_fee_per_gas_wei = $3::numeric,
 			max_priority_fee_per_gas_wei = $4::numeric, raw_tx = $5, tx_hash = $6,
-			status = $7, updated_at = CURRENT_TIMESTAMP
+			status = $7, signing_retry_count = 0, updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1 RETURNING `+tokenWithdrawalColumns, item.ID, int64(signed.GasLimit),
 		signed.MaxFeePerGasWei.String(), signed.MaxPriorityFeePerGasWei.String(), signed.RawTx,
 		signed.TxHash, WithdrawalSigned,

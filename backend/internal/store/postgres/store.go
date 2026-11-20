@@ -195,13 +195,14 @@ func (s *Store) scanWithdrawal(row rowScanner) (Withdrawal, error) {
 	var amountValue, reservedFeeValue string
 	var actualFee, nonce, maxFee, maxPriorityFee pgtype.Text
 	var gasLimit, blockNumber pgtype.Int8
-	var txHash, errorCode, errorMessage pgtype.Text
+	var txHash, errorCode, errorMessage, bumpBlockedReason pgtype.Text
 	if err := row.Scan(
 		&item.ID, &item.IdempotencyKey, &item.UserID, &item.AddressID, &item.ToAddress,
 		&amountValue, &reservedFeeValue, &actualFee, &nonce, &gasLimit, &maxFee,
 		&maxPriorityFee, &item.RawTx, &txHash, &blockNumber, &item.Confirmations,
 		&item.Status, &errorCode, &errorMessage, &item.BroadcastedAt, &item.LastBroadcastAt,
-		&item.BumpCount, &item.CreatedAt, &item.UpdatedAt,
+		&item.BumpCount, &item.SigningRetryCount, &item.BumpBlockedAt, &bumpBlockedReason,
+		&item.CreatedAt, &item.UpdatedAt,
 	); err != nil {
 		return Withdrawal{}, err
 	}
@@ -231,6 +232,8 @@ func (s *Store) scanWithdrawal(row rowScanner) (Withdrawal, error) {
 	item.ErrorMessage = optionalString(errorMessage)
 	item.BroadcastedAt = s.localTimePtr(item.BroadcastedAt)
 	item.LastBroadcastAt = s.localTimePtr(item.LastBroadcastAt)
+	item.BumpBlockedAt = s.localTimePtr(item.BumpBlockedAt)
+	item.BumpBlockedReason = optionalString(bumpBlockedReason)
 	item.CreatedAt = s.localTime(item.CreatedAt)
 	item.UpdatedAt = s.localTime(item.UpdatedAt)
 	return item, nil

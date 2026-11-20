@@ -22,10 +22,11 @@ const workerBatchSize = evm.DefaultWorkerBatchSize
 type WorkerStore interface {
 	WithdrawalByID(ctx context.Context, id int64) (postgres.Withdrawal, error)
 	WalletAddressByUser(ctx context.Context, userID int64) (postgres.WalletAddress, error)
+	BalanceByUser(ctx context.Context, userID int64) (postgres.AssetBalance, error)
 	ListProcessableWithdrawals(ctx context.Context, limit int) ([]postgres.Withdrawal, error)
 	ListEVMTxAttempts(ctx context.Context, businessType string, businessID int64) ([]postgres.EVMTxAttempt, error)
 	IncreaseWithdrawalFee(ctx context.Context, withdrawalID int64, newReservedFeeWei *big.Int) (postgres.Withdrawal, bool, error)
-	AllocateWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64) (postgres.Withdrawal, bool, error)
+	AllocateWithdrawalNonce(ctx context.Context, withdrawalID int64, chainPendingNonce uint64, gas postgres.PreparedGasParams) (postgres.Withdrawal, bool, error)
 	SaveSignedWithdrawal(ctx context.Context, signed postgres.SignedWithdrawal) (postgres.Withdrawal, bool, error)
 	ReplaceWithdrawalTx(ctx context.Context, replacement postgres.SignedWithdrawal, newReservedFeeWei *big.Int) (postgres.Withdrawal, bool, error)
 	TouchWithdrawalBroadcast(ctx context.Context, withdrawalID int64) (postgres.Withdrawal, error)
@@ -34,19 +35,22 @@ type WorkerStore interface {
 	ReleaseWithdrawal(ctx context.Context, withdrawalID int64, errorCode, errorMessage string) (postgres.Withdrawal, bool, error)
 	UpdateWithdrawalConfirmations(ctx context.Context, withdrawalID, confirmations int64) (postgres.Withdrawal, error)
 	FinalizeWithdrawal(ctx context.Context, settlement postgres.WithdrawalSettlement) (postgres.Withdrawal, bool, error)
+	RecordEVMSigningFailure(ctx context.Context, businessType string, businessID int64, maxRetries int, worker, refType string, refID int64, errorCode, errorMessage string) (bool, error)
+	RecordEVMBumpBlocked(ctx context.Context, businessType string, businessID int64, worker, refType string, refID int64, reasonCode, reasonMessage string) (time.Time, bool, error)
 	RecordWorkerError(ctx context.Context, item postgres.WorkerError) (int64, error)
 }
 
 // WorkerConfig 定义提币轮询间隔、确认数、卡单重播加价策略和 Sepolia Chain ID。
 type WorkerConfig struct {
-	Interval         time.Duration
-	Confirmations    uint64
-	ChainID          *big.Int
-	RebroadcastAfter time.Duration
-	BumpAfter        time.Duration
-	BumpPercent      uint64
-	MaxBumps         int
-	MaxFeeCapWei     *big.Int
+	Interval                     time.Duration
+	Confirmations                uint64
+	ChainID                      *big.Int
+	RebroadcastAfter             time.Duration
+	BumpAfter                    time.Duration
+	BumpBlockedManualReviewAfter time.Duration
+	BumpPercent                  uint64
+	MaxBumps                     int
+	MaxFeeCapWei                 *big.Int
 }
 
 // Worker 负责提币签名、幂等广播、崩溃恢复和费用结算。
@@ -59,7 +63,6 @@ type Worker struct {
 	fees        evm.FeeEstimator
 	broadcaster evm.Broadcaster
 	confirmer   evm.Confirmer
-	signing     *evm.SigningFailureTracker
 }
 
 // NewWorker 创建并校验提币 Worker。
@@ -83,7 +86,6 @@ func NewWorker(chain Chain, store WorkerStore, keys wallet.KeyProvider, logger *
 		fees:        evm.NewFeeEstimator(chain),
 		broadcaster: evm.NewBroadcaster(chain),
 		confirmer:   evm.NewConfirmer(chain),
-		signing:     evm.NewSigningFailureTracker(evm.DefaultMaxSigningRetryCount),
 	}, nil
 }
 
@@ -103,13 +105,8 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, item := range items {
-		if w.signing.IsPaused(item.ID) {
-			continue
-		}
 		if err := w.Process(ctx, item.ID); err != nil {
-			if !w.signing.IsPaused(item.ID) {
-				w.recordError(ctx, item.ID, "process", "WITHDRAWAL_PROCESS_FAILED", err)
-			}
+			w.recordError(ctx, item.ID, "process", "WITHDRAWAL_PROCESS_FAILED", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -165,29 +162,60 @@ func (w *Worker) prepare(ctx context.Context, item postgres.Withdrawal) error {
 	if err != nil {
 		return fmt.Errorf("查询提币地址 Pending Nonce 失败：%w", err)
 	}
-	item, _, err = w.store.AllocateWithdrawalNonce(ctx, item.ID, chainNonce)
+	item, _, err = w.store.AllocateWithdrawalNonce(ctx, item.ID, chainNonce, postgres.PreparedGasParams{
+		GasLimit:                quote.GasLimit,
+		MaxFeePerGasWei:         quote.MaxFeePerGasWei,
+		MaxPriorityFeePerGasWei: quote.MaxPriorityFeePerGasWei,
+	})
 	if err != nil {
 		return fmt.Errorf("分配提币 %d Nonce 失败：%w", item.ID, err)
 	}
 	return w.sign(ctx, item)
 }
 
-// sign 在已分配 Nonce 后仅负责构建和持久化 EIP-1559 原始交易，绝不释放已占 Nonce。
+// sign 在已分配 Nonce 后仅读取数据库已落库的 Gas 参数构建、签名并持久化交易，不再调用会失败的链上 RPC。
 func (w *Worker) sign(ctx context.Context, item postgres.Withdrawal) error {
 	if item.Nonce == nil || !item.Nonce.IsUint64() {
 		return w.handleSigningFailure(ctx, item.ID, errors.New("提币 Nonce 无效"))
 	}
-	walletAddress, quote, err := w.quoteFor(ctx, item)
-	if err != nil {
-		return w.handleSigningFailure(ctx, item.ID, err)
+	if item.GasLimit == nil || *item.GasLimit <= 0 || item.MaxFeePerGasWei == nil ||
+		item.MaxFeePerGasWei.Sign() <= 0 || item.MaxPriorityFeePerGasWei == nil || item.MaxPriorityFeePerGasWei.Sign() < 0 {
+		return w.handleSigningFailure(ctx, item.ID, errors.New("已分配 Nonce 的提币缺少有效 Gas 参数"))
 	}
+	walletAddress, err := w.store.WalletAddressByUser(ctx, item.UserID)
+	if err != nil {
+		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("查询提币地址失败：%w", err))
+	}
+	gasLimit := uint64(*item.GasLimit)
+	feeCap := new(big.Int).Set(item.MaxFeePerGasWei)
+	tip := new(big.Int).Set(item.MaxPriorityFeePerGasWei)
+
+	// H4：重签阶段保证 gasLimit*feeCap 不超过冻结预留费；若超出则先尝试增额，余额不足则钳制在冻结额度内。
+	requiredFee := new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), feeCap)
+	if requiredFee.Cmp(item.ReservedFeeWei) > 0 {
+		updated, _, feeErr := w.store.IncreaseWithdrawalFee(ctx, item.ID, requiredFee)
+		if feeErr == nil {
+			item = updated
+		} else if errors.Is(feeErr, postgres.ErrInsufficientBalance) {
+			feeCap = new(big.Int).Div(item.ReservedFeeWei, new(big.Int).SetUint64(gasLimit))
+			if feeCap.Sign() <= 0 {
+				return w.handleSigningFailure(ctx, item.ID, errors.New("冻结预留费不足以覆盖任何有效 Gas 费率"))
+			}
+			if tip.Cmp(feeCap) > 0 {
+				tip = new(big.Int).Set(feeCap)
+			}
+		} else {
+			return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("重签阶段校验提币预留费用失败：%w", feeErr))
+		}
+	}
+
 	to := common.HexToAddress(item.ToAddress)
 	transaction := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   new(big.Int).Set(w.config.ChainID),
 		Nonce:     item.Nonce.Uint64(),
-		GasTipCap: quote.MaxPriorityFeePerGasWei,
-		GasFeeCap: quote.MaxFeePerGasWei,
-		Gas:       quote.GasLimit,
+		GasTipCap: tip,
+		GasFeeCap: feeCap,
+		Gas:       gasLimit,
 		To:        &to,
 		Value:     new(big.Int).Set(item.AmountWei),
 	})
@@ -201,24 +229,30 @@ func (w *Worker) sign(ctx context.Context, item postgres.Withdrawal) error {
 	}
 	item, _, err = w.store.SaveSignedWithdrawal(ctx, postgres.SignedWithdrawal{
 		WithdrawalID:            item.ID,
-		GasLimit:                quote.GasLimit,
-		MaxFeePerGasWei:         quote.MaxFeePerGasWei,
-		MaxPriorityFeePerGasWei: quote.MaxPriorityFeePerGasWei,
+		GasLimit:                gasLimit,
+		MaxFeePerGasWei:         feeCap,
+		MaxPriorityFeePerGasWei: tip,
 		RawTx:                   raw,
 		TxHash:                  signed.Hash().Hex(),
 	})
 	if err != nil {
 		return w.handleSigningFailure(ctx, item.ID, fmt.Errorf("持久化已签名提币失败：%w", err))
 	}
-	w.signing.Clear(item.ID)
 	return w.broadcast(ctx, item)
 }
 
-// handleSigningFailure 统计分配 Nonce 后的连续签名失败次数，超限后记入一次人工介入错误并暂停重复写入。
+// handleSigningFailure 持久化累计分配 Nonce 后的连续签名失败次数，超限后转入 MANUAL_REVIEW 并写一次告警。
 func (w *Worker) handleSigningFailure(ctx context.Context, id int64, err error) error {
-	w.signing.RecordFailure(id, func() {
-		w.recordError(ctx, id, "signing", "SIGNING_MANUAL_INTERVENTION", err)
-	})
+	escalated, recErr := w.store.RecordEVMSigningFailure(
+		ctx, postgres.EVMBusinessWithdrawal, id, evm.DefaultMaxSigningRetryCount,
+		"withdrawal-worker", postgres.EVMBusinessWithdrawal, id,
+		"SIGNING_MANUAL_INTERVENTION", err.Error(),
+	)
+	if recErr != nil {
+		w.logger.Error("记录提币签名失败计数异常", "withdrawal_id", id, "error", recErr)
+	} else if escalated {
+		w.logger.Warn("提币连续签名失败超限，已转入人工核查状态", "withdrawal_id", id)
+	}
 	return err
 }
 
@@ -373,17 +407,19 @@ func (w *Worker) recordError(ctx context.Context, withdrawalID int64, stage, cod
 // normalizeReplacementConfig 校验并填充提币重播与 Gas 加价配置默认值。
 func normalizeReplacementConfig(cfg *WorkerConfig) error {
 	settings := evm.ReplacementSettings{
-		RebroadcastAfter: cfg.RebroadcastAfter,
-		BumpAfter:        cfg.BumpAfter,
-		BumpPercent:      cfg.BumpPercent,
-		MaxBumps:         cfg.MaxBumps,
-		MaxFeeCapWei:     cfg.MaxFeeCapWei,
+		RebroadcastAfter:             cfg.RebroadcastAfter,
+		BumpAfter:                    cfg.BumpAfter,
+		BumpBlockedManualReviewAfter: cfg.BumpBlockedManualReviewAfter,
+		BumpPercent:                  cfg.BumpPercent,
+		MaxBumps:                     cfg.MaxBumps,
+		MaxFeeCapWei:                 cfg.MaxFeeCapWei,
 	}
 	if err := evm.NormalizeReplacementSettings(&settings); err != nil {
 		return err
 	}
 	cfg.RebroadcastAfter = settings.RebroadcastAfter
 	cfg.BumpAfter = settings.BumpAfter
+	cfg.BumpBlockedManualReviewAfter = settings.BumpBlockedManualReviewAfter
 	cfg.BumpPercent = settings.BumpPercent
 	cfg.MaxBumps = settings.MaxBumps
 	cfg.MaxFeeCapWei = settings.MaxFeeCapWei
@@ -482,15 +518,21 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.Withdrawal,
 	}
 	bumpedFeeCap, bumpedTip, ok := evm.ComputeBumpedFees(prevFeeCap, prevTip, baseFee, quote.MaxPriorityFeePerGasWei, w.config.BumpPercent, w.config.MaxFeeCapWei)
 	if !ok {
-		w.recordError(ctx, item.ID, "bump", "EVM_BUMP_FEE_CAP_EXCEEDED", errors.New("提币加价后手续费上限超过配置最大值，停止继续加价"))
-		if item.LastBroadcastAt != nil && time.Since(*item.LastBroadcastAt) >= w.config.RebroadcastAfter {
-			return w.rebroadcast(ctx, item)
-		}
-		return nil
+		return w.handleBumpBlocked(ctx, item, "EVM_BUMP_FEE_CAP_EXCEEDED", "提币加价后手续费上限超过配置最大值，停止继续加价")
 	}
 	newReservedFee := new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), bumpedFeeCap)
 	if newReservedFee.Cmp(item.ReservedFeeWei) < 0 {
 		newReservedFee = new(big.Int).Set(item.ReservedFeeWei)
+	}
+	if newReservedFee.Cmp(item.ReservedFeeWei) > 0 {
+		balance, balErr := w.store.BalanceByUser(ctx, item.UserID)
+		if balErr != nil {
+			return fmt.Errorf("提币加价预检用户可用余额失败：%w", balErr)
+		}
+		diff := new(big.Int).Sub(newReservedFee, item.ReservedFeeWei)
+		if balance.AvailableWei == nil || balance.AvailableWei.Cmp(diff) < 0 {
+			return w.handleBumpBlocked(ctx, item, "FEE_RESERVE_INSUFFICIENT", "用户可用余额不足以支付提币加价替换费用")
+		}
 	}
 	chainBalance, err := w.chain.BalanceAt(ctx, common.HexToAddress(walletAddress.Address), nil)
 	if err != nil {
@@ -498,8 +540,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.Withdrawal,
 	}
 	required := new(big.Int).Add(item.AmountWei, newReservedFee)
 	if chainBalance == nil || chainBalance.Cmp(required) < 0 {
-		w.recordError(ctx, item.ID, "bump", "CHAIN_BALANCE_INSUFFICIENT", errors.New("托管地址链上余额不足以支持提币加价替换"))
-		return nil
+		return w.handleBumpBlocked(ctx, item, "CHAIN_BALANCE_INSUFFICIENT", "托管地址链上余额不足以支持提币加价替换")
 	}
 	to := common.HexToAddress(item.ToAddress)
 	transaction := types.NewTx(&types.DynamicFeeTx{
@@ -528,8 +569,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.Withdrawal,
 		TxHash:                  strings.ToLower(signed.Hash().Hex()),
 	}, newReservedFee)
 	if errors.Is(err, postgres.ErrInsufficientBalance) {
-		w.recordError(ctx, item.ID, "bump", "FEE_RESERVE_INSUFFICIENT", errors.New("用户可用余额不足以支付提币加价替换费用"))
-		return nil
+		return w.handleBumpBlocked(ctx, item, "FEE_RESERVE_INSUFFICIENT", "用户可用余额不足以支付提币加价替换费用")
 	}
 	if err != nil {
 		return fmt.Errorf("保存提币加价替换交易失败：%w", err)
@@ -578,4 +618,31 @@ func replacementTierStart(bumpCount int32, broadcastedAt, lastBroadcastAt *time.
 		latestAttemptAt = &attempts[0].CreatedAt
 	}
 	return evm.ReplacementTierStart(bumpCount, broadcastedAt, lastBroadcastAt, latestAttemptAt)
+}
+
+// handleBumpBlocked 统一持久化提币加价阻塞原因、按间隔重播原交易并在超时后转入人工核查。
+func (w *Worker) handleBumpBlocked(ctx context.Context, item postgres.Withdrawal, code, message string) error {
+	return evm.HandleBumpBlocked(ctx, evm.BumpBlockedAction{
+		RecordBlocked: func(c context.Context, cCode, cMsg string) (time.Time, error) {
+			at, _, err := w.store.RecordEVMBumpBlocked(c, postgres.EVMBusinessWithdrawal, item.ID, "withdrawal-worker", postgres.EVMBusinessWithdrawal, item.ID, cCode, cMsg)
+			return at, err
+		},
+		MarkManualReview: func(c context.Context, cCode, cMsg string) error {
+			_, changed, err := w.store.MarkWithdrawalManualReview(c, item.ID, cCode, cMsg)
+			if err != nil {
+				return err
+			}
+			if changed {
+				w.recordError(c, item.ID, "bump", cCode, errors.New(cMsg))
+				w.logger.Warn("Sepolia 提币加价长期受阻，已转入人工核查", "withdrawal_id", item.ID, "reason", code)
+			}
+			return nil
+		},
+		Rebroadcast:       func(c context.Context) error { return w.rebroadcast(c, item) },
+		LastBroadcastAt:   item.LastBroadcastAt,
+		RebroadcastAfter:  w.config.RebroadcastAfter,
+		ManualReviewAfter: w.config.BumpBlockedManualReviewAfter,
+		ReasonCode:        code,
+		ReasonMessage:     message,
+	})
 }

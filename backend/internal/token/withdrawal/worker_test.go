@@ -35,15 +35,19 @@ type fakeChain struct {
 	receiptErr     error
 	sendErrors     []error
 	sentRaw        [][]byte
+	headerCalls    int
+	tipCalls       int
 }
 
-// HeaderByNumber 返回固定 EIP-1559 区块头。
+// HeaderByNumber 返回固定 EIP-1559 区块头并累计调用次数。
 func (f *fakeChain) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
+	f.headerCalls++
 	return f.header, nil
 }
 
-// SuggestGasTipCap 返回固定优先费。
+// SuggestGasTipCap 返回固定优先费并累计调用次数。
 func (f *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	f.tipCalls++
 	return new(big.Int).Set(f.tip), nil
 }
 
@@ -167,12 +171,16 @@ func (f *fakeStore) PlatformWalletByRole(context.Context, string, string) (postg
 	return f.platform, nil
 }
 
-// AllocateTokenWithdrawalNonce 保存测试 Nonce 并进入签名状态。
-func (f *fakeStore) AllocateTokenWithdrawalNonce(_ context.Context, _ int64, nonce uint64) (postgres.TokenWithdrawal, bool, error) {
+// AllocateTokenWithdrawalNonce 保存测试 Nonce 与 Gas 参数并进入签名状态。
+func (f *fakeStore) AllocateTokenWithdrawalNonce(_ context.Context, _ int64, nonce uint64, gas postgres.PreparedGasParams) (postgres.TokenWithdrawal, bool, error) {
 	if f.item.Nonce != nil {
 		return f.item, false, nil
 	}
+	gasLimit := int64(gas.GasLimit)
 	f.item.Nonce = new(big.Int).SetUint64(nonce)
+	f.item.GasLimit = &gasLimit
+	f.item.MaxFeePerGasWei = new(big.Int).Set(gas.MaxFeePerGasWei)
+	f.item.MaxPriorityFeePerGasWei = new(big.Int).Set(gas.MaxPriorityFeePerGasWei)
 	f.item.Status = postgres.WithdrawalSigning
 	return f.item, true, nil
 }
@@ -185,6 +193,7 @@ func (f *fakeStore) SaveSignedTokenWithdrawal(_ context.Context, signed postgres
 	f.item.MaxPriorityFeePerGasWei = new(big.Int).Set(signed.MaxPriorityFeePerGasWei)
 	f.item.RawTx = append([]byte(nil), signed.RawTx...)
 	f.item.TxHash = signed.TxHash
+	f.item.SigningRetryCount = 0
 	f.item.Status = postgres.WithdrawalSigned
 	f.attempts = append([]postgres.EVMTxAttempt{{
 		BusinessType:            postgres.EVMBusinessTokenWithdrawal,
@@ -215,6 +224,8 @@ func (f *fakeStore) ReplaceTokenWithdrawalTx(_ context.Context, replacement post
 	f.item.RawTx = append([]byte(nil), replacement.RawTx...)
 	f.item.TxHash = replacement.TxHash
 	f.item.BumpCount++
+	f.item.BumpBlockedAt = nil
+	f.item.BumpBlockedReason = ""
 	now := time.Now()
 	f.item.LastBroadcastAt = &now
 	f.attempts = append([]postgres.EVMTxAttempt{{
@@ -282,6 +293,37 @@ func (f *fakeStore) FinalizeTokenWithdrawal(_ context.Context, settlement postgr
 		f.item.TxHash = settlement.TxHash
 	}
 	return f.item, true, nil
+}
+
+// RecordEVMSigningFailure 记录 Token 提币签名失败并在达到上限后转入人工核查且仅告警一次。
+func (f *fakeStore) RecordEVMSigningFailure(_ context.Context, _ string, _ int64, maxRetries int, worker, refType string, refID int64, errorCode, errorMessage string) (bool, error) {
+	f.item.SigningRetryCount++
+	if int(f.item.SigningRetryCount) >= maxRetries && f.item.Status == postgres.WithdrawalSigning {
+		f.item.Status = postgres.WithdrawalManualReview
+		f.item.ErrorCode = errorCode
+		f.item.ErrorMessage = errorMessage
+		f.errors = append(f.errors, postgres.WorkerError{
+			Worker: worker, Stage: "sign", ReferenceType: refType, ReferenceID: &refID,
+			ErrorCode: errorCode, ErrorMessage: errorMessage,
+		})
+		return true, nil
+	}
+	return false, nil
+}
+
+// RecordEVMBumpBlocked 持久化首次加价阻塞原因并去重写入告警。
+func (f *fakeStore) RecordEVMBumpBlocked(_ context.Context, _ string, _ int64, worker, refType string, refID int64, reasonCode, reasonMessage string) (time.Time, bool, error) {
+	if f.item.BumpBlockedAt == nil {
+		now := time.Now()
+		f.item.BumpBlockedAt = &now
+		f.item.BumpBlockedReason = reasonMessage
+		f.errors = append(f.errors, postgres.WorkerError{
+			Worker: worker, Stage: "bump", ReferenceType: refType, ReferenceID: &refID,
+			ErrorCode: reasonCode, ErrorMessage: reasonMessage,
+		})
+		return now, true, nil
+	}
+	return *f.item.BumpBlockedAt, false, nil
 }
 
 // RecordWorkerError 保存测试 Worker 错误。
@@ -466,5 +508,59 @@ func TestWorkerMovesNonceGapTokenWithdrawalToManualReview(t *testing.T) {
 	}
 	if store.item.Status != postgres.WithdrawalManualReview || len(store.errors) == 0 || store.errors[0].ErrorCode != "EVM_TX_MANUAL_REVIEW" {
 		t.Fatalf("status = %s, errors = %+v", store.item.Status, store.errors)
+	}
+}
+
+// TestWorkerSignsTokenWithdrawalWithoutExtraFeeRPC 验证 SIGNING 阶段只读取持久化 Gas 参数而不调用费率 RPC。
+func TestWorkerSignsTokenWithdrawalWithoutExtraFeeRPC(t *testing.T) {
+	chain, _, store, worker := newTestWorker(t)
+	gasLimit := int64(50_000)
+	store.item.Status = postgres.WithdrawalSigning
+	store.item.Nonce = new(big.Int).SetUint64(9)
+	store.item.GasLimit = &gasLimit
+	store.item.MaxFeePerGasWei = big.NewInt(202)
+	store.item.MaxPriorityFeePerGasWei = big.NewInt(2)
+	chain.header = nil
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if chain.headerCalls != 0 || chain.tipCalls != 0 {
+		t.Fatalf("unexpected fee RPC calls during sign: header=%d tip=%d", chain.headerCalls, chain.tipCalls)
+	}
+	if store.item.Status != postgres.WithdrawalBroadcasted || len(chain.sentRaw) != 1 {
+		t.Fatalf("status = %s, sends = %d", store.item.Status, len(chain.sentRaw))
+	}
+}
+
+// TestWorkerHandlesTokenWithdrawalBumpBlockedOnceAndRebroadcasts 验证热钱包 Gas 不足阻塞加价时仅告警一次并按重播间隔继续重播。
+func TestWorkerHandlesTokenWithdrawalBumpBlockedAndRebroadcasts(t *testing.T) {
+	chain, _, store, worker := newTestWorker(t)
+	worker.config.RebroadcastAfter = 10 * time.Second
+	worker.config.BumpAfter = 30 * time.Second
+	worker.config.BumpPercent = 15
+	worker.config.MaxBumps = 3
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("initial Process() error = %v", err)
+	}
+	chain.ethBalance = big.NewInt(1)
+	stale := time.Now().Add(-time.Minute)
+	store.item.BroadcastedAt = &stale
+	store.item.LastBroadcastAt = &stale
+
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("first blocked bump Process() error = %v", err)
+	}
+	if store.item.BumpCount != 0 || len(store.errors) != 1 || store.errors[0].ErrorCode != "HOT_WALLET_GAS_INSUFFICIENT" || len(chain.sentRaw) != 2 {
+		t.Fatalf("bump_count = %d, errors = %+v, sends = %d", store.item.BumpCount, store.errors, len(chain.sentRaw))
+	}
+
+	store.item.LastBroadcastAt = &stale
+	if err := worker.Process(context.Background(), store.item.ID); err != nil {
+		t.Fatalf("second blocked bump Process() error = %v", err)
+	}
+	if len(store.errors) != 1 || len(chain.sentRaw) != 3 {
+		t.Fatalf("errors should stay 1 (%d) and sends should advance to 3 (%d)", len(store.errors), len(chain.sentRaw))
 	}
 }
