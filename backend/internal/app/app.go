@@ -190,10 +190,12 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		}
 	}
 	depositScanner, err := deposit.NewScanner(chainClient, store, logger, deposit.Config{
-		StartBlock:    cfg.SepoliaScanStartBlock,
-		Confirmations: cfg.SepoliaConfirmations,
-		BatchSize:     cfg.SepoliaScanBatchSize,
-		Interval:      cfg.SepoliaScanInterval,
+		StartBlock:        cfg.SepoliaScanStartBlock,
+		Confirmations:     cfg.SepoliaConfirmations,
+		SafeDepth:         cfg.SepoliaSafeDepth,
+		ReorgRewindBlocks: cfg.SepoliaReorgRewindBlocks,
+		BatchSize:         cfg.SepoliaScanBatchSize,
+		Interval:          cfg.SepoliaScanInterval,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("创建 Sepolia 充值扫描器失败：%w", err)
@@ -206,6 +208,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		tokenScanner, err = tokendeposit.NewScanner(chainClient, tokenContract, store, logger, tokendeposit.Config{
 			AssetID: tokenAsset.ID, StartBlock: cfg.ERC20.ScanStartBlock,
 			BatchSize: cfg.ERC20.ScanBatchSize, Confirmations: cfg.ERC20.Confirmations,
+			SafeDepth: cfg.ERC20.SafeDepth, ReorgRewindBlocks: cfg.ERC20.ReorgRewindBlocks,
 			Interval: cfg.SepoliaScanInterval,
 		})
 		if err != nil {

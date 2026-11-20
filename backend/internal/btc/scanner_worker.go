@@ -3,6 +3,7 @@ package btc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -22,6 +23,8 @@ type ScannerStore interface {
 	UpdateBTCDepositConfirmations(context.Context, int64, int64) error
 	CreditBTCDeposit(context.Context, int64, int64) error
 	RewindBTCCheckpoint(context.Context, int64, string) error
+	OrphanBTCDeposit(context.Context, int64) error
+	RecordBTCWorkerError(ctx context.Context, stage, referenceType string, referenceID *int64, errorCode, errorMessage string) error
 }
 type Checkpoint struct {
 	Network, Scanner, LastScannedHash string
@@ -126,7 +129,7 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 	return s.confirm(ctx, tip)
 }
 
-// confirm 更新确认数并在复核原区块哈希后完成入账。
+// confirm 更新确认数并在复核原区块哈希后完成入账，单条异常隔离跳过而不阻塞后续入账。
 func (s *Scanner) confirm(ctx context.Context, tip int64) error {
 	items, err := s.store.ListConfirmingBTCDeposits(ctx, 200)
 	if err != nil {
@@ -136,22 +139,55 @@ func (s *Scanner) confirm(ctx context.Context, tip int64) error {
 		confirmations := Confirmations(tip, item.BlockHeight)
 		if confirmations < s.confirmations {
 			if err = s.store.UpdateBTCDepositConfirmations(ctx, item.ID, confirmations); err != nil {
-				return err
+				s.recordDepositError(ctx, "update_confirmations", item.ID, "BTC_DEPOSIT_CONFIRMATION_UPDATE_FAILED", err.Error())
+				continue
 			}
 			continue
 		}
 		hash, hashErr := s.chain.BlockHash(ctx, item.BlockHeight)
 		if hashErr != nil {
-			return hashErr
+			s.logger.Warn("复核 BTC 充值区块哈希失败，跳过本条继续后续处理", "deposit_id", item.ID, "block_height", item.BlockHeight, "error", hashErr)
+			s.recordDepositError(ctx, "block_hash_check", item.ID, "BTC_BLOCK_HASH_QUERY_FAILED", hashErr.Error())
+			continue
 		}
 		if hash != item.BlockHash {
-			return errors.New("BTC 充值原区块哈希发生变化")
+			msg := fmt.Sprintf("BTC 充值 %d 所在区块 %d 哈希从 %s 变更为 %s，触发孤块冲正", item.ID, item.BlockHeight, item.BlockHash, hash)
+			s.logger.Warn("检测到 BTC 孤块充值", "deposit_id", item.ID, "block_height", item.BlockHeight)
+			s.recordDepositError(ctx, "block_hash_check", item.ID, "BLOCK_HASH_MISMATCH", msg)
+			rewind := item.BlockHeight - s.confirmations
+			if rewind < 0 {
+				rewind = 0
+			}
+			if last, _, cpErr := s.store.BTCCheckpoint(ctx); cpErr == nil && last >= item.BlockHeight {
+				if rewindHash, rHashErr := s.chain.BlockHash(ctx, rewind); rHashErr == nil {
+					if rErr := s.store.RewindBTCCheckpoint(ctx, rewind, rewindHash); rErr != nil {
+						s.recordDepositError(ctx, "rewind_checkpoint", item.ID, "BTC_REORG_REWIND_FAILED", rErr.Error())
+					}
+				}
+			}
+			if orphanErr := s.store.OrphanBTCDeposit(ctx, item.ID); orphanErr != nil {
+				s.recordDepositError(ctx, "orphan_deposit", item.ID, "BTC_ORPHAN_FAILED", orphanErr.Error())
+			}
+			continue
 		}
 		if err = s.store.CreditBTCDeposit(ctx, item.ID, confirmations); err != nil {
-			return err
+			s.logger.Warn("BTC 充值入账失败，记录错误并继续后续充值", "deposit_id", item.ID, "error", err)
+			s.recordDepositError(ctx, "credit_deposit", item.ID, "BTC_CREDIT_FAILED", err.Error())
+			continue
 		}
 	}
 	return nil
+}
+
+// recordDepositError 写入 BTC 单条充值异常告警，避免单笔问题阻塞整批确认。
+func (s *Scanner) recordDepositError(ctx context.Context, stage string, depositID int64, code, message string) {
+	if ctx.Err() != nil {
+		return
+	}
+	refID := depositID
+	if err := s.store.RecordBTCWorkerError(ctx, stage, "BTC_DEPOSIT", &refID, code, message); err != nil {
+		s.logger.Warn("写入 BTC 后台任务错误失败", "deposit_id", depositID, "error", err)
+	}
 }
 
 // Confirmations 返回区块在当前 tip 下的确认数。

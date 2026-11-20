@@ -31,6 +31,13 @@ const (
 	DepositConfirming = "CONFIRMING"
 	DepositConfirmed  = "CONFIRMED"
 	DepositCredited   = "CREDITED"
+	DepositOrphaned   = "ORPHANED"
+)
+
+const (
+	EntryDepositPending  = "DEPOSIT_PENDING"
+	EntryDepositCredit   = "DEPOSIT_CREDIT"
+	EntryDepositReversal = "DEPOSIT_REVERSAL"
 )
 
 const (

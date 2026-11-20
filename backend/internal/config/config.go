@@ -36,17 +36,19 @@ const (
 
 // ERC20Config 描述单个 Sepolia ERC-20 资产及其扫描、归集和 Gas 补充参数。
 type ERC20Config struct {
-	Enabled         bool
-	ContractAddress string
-	Symbol          string
-	Decimals        uint8
-	ScanStartBlock  *uint64
-	ScanBatchSize   uint64
-	Confirmations   uint64
-	SweepEnabled    bool
-	SweepInterval   time.Duration
-	GasSafetyBPS    uint64
-	GasTopupMaxWei  *big.Int
+	Enabled           bool
+	ContractAddress   string
+	Symbol            string
+	Decimals          uint8
+	ScanStartBlock    *uint64
+	ScanBatchSize     uint64
+	Confirmations     uint64
+	SafeDepth         uint64
+	ReorgRewindBlocks uint64
+	SweepEnabled      bool
+	SweepInterval     time.Duration
+	GasSafetyBPS      uint64
+	GasTopupMaxWei    *big.Int
 }
 
 // PlatformWalletConfig 描述平台热钱包派生路径和 ETH 余额告警阈值。
@@ -108,11 +110,13 @@ type Config struct {
 	SepoliaRPCMaxAttempts  int
 	SepoliaRPCBaseDelay    time.Duration
 	SepoliaRPCMaxDelay     time.Duration
-	SepoliaScanStartBlock  *uint64
-	SepoliaConfirmations   uint64
-	SepoliaScanInterval    time.Duration
-	SepoliaScanBatchSize   uint64
-	SepoliaExplorerBaseURL string
+	SepoliaScanStartBlock     *uint64
+	SepoliaConfirmations      uint64
+	SepoliaSafeDepth          uint64
+	SepoliaReorgRewindBlocks uint64
+	SepoliaScanInterval       time.Duration
+	SepoliaScanBatchSize      uint64
+	SepoliaExplorerBaseURL    string
 	EVMReplacement         EVMReplacementConfig
 	ERC20                  ERC20Config
 	PlatformWallet         PlatformWalletConfig
@@ -194,6 +198,38 @@ func load(requireCustody bool) (Config, error) {
 	if evmMaxFeeCapGwei != nil && evmMaxFeeCapGwei.Sign() > 0 {
 		evmMaxFeeCapWei = new(big.Int).Mul(evmMaxFeeCapGwei, big.NewInt(1_000_000_000))
 	}
+	sepoliaConfirmations := uint64OrDefault("SEPOLIA_CONFIRMATIONS", 3)
+	sepoliaSafeDepth, err := nonNegativeUint64OrDefault("SEPOLIA_SAFE_DEPTH", 2)
+	if err != nil {
+		return Config{}, err
+	}
+	sepoliaRewindPtr, err := optionalUint64("SEPOLIA_REORG_REWIND_BLOCKS")
+	if err != nil {
+		return Config{}, err
+	}
+	sepoliaRewindBlocks := sepoliaConfirmations
+	if sepoliaRewindPtr != nil {
+		if *sepoliaRewindPtr == 0 {
+			return Config{}, errors.New("SEPOLIA_REORG_REWIND_BLOCKS 必须大于零")
+		}
+		sepoliaRewindBlocks = *sepoliaRewindPtr
+	}
+	erc20Confirmations := uint64OrDefault("ERC20_CONFIRMATIONS", 3)
+	erc20SafeDepth, err := nonNegativeUint64OrDefault("ERC20_SAFE_DEPTH", 2)
+	if err != nil {
+		return Config{}, err
+	}
+	erc20RewindPtr, err := optionalUint64("ERC20_REORG_REWIND_BLOCKS")
+	if err != nil {
+		return Config{}, err
+	}
+	erc20RewindBlocks := erc20Confirmations
+	if erc20RewindPtr != nil {
+		if *erc20RewindPtr == 0 {
+			return Config{}, errors.New("ERC20_REORG_REWIND_BLOCKS 必须大于零")
+		}
+		erc20RewindBlocks = *erc20RewindPtr
+	}
 
 	cfg := Config{
 		AppEnv:   envOrDefault("APP_ENV", "development"),
@@ -221,11 +257,13 @@ func load(requireCustody bool) (Config, error) {
 		SepoliaRPCMaxAttempts:  intOrDefault("SEPOLIA_RPC_MAX_ATTEMPTS", 3),
 		SepoliaRPCBaseDelay:    durationOrDefault("SEPOLIA_RPC_BASE_DELAY", 250*time.Millisecond),
 		SepoliaRPCMaxDelay:     durationOrDefault("SEPOLIA_RPC_MAX_DELAY", 3*time.Second),
-		SepoliaScanStartBlock:  scanStartBlock,
-		SepoliaConfirmations:   uint64OrDefault("SEPOLIA_CONFIRMATIONS", 3),
-		SepoliaScanInterval:    durationOrDefault("SEPOLIA_SCAN_INTERVAL", 12*time.Second),
-		SepoliaScanBatchSize:   uint64OrDefault("SEPOLIA_SCAN_BATCH_SIZE", 20),
-		SepoliaExplorerBaseURL: strings.TrimRight(envOrDefault("SEPOLIA_EXPLORER_BASE_URL", "https://sepolia.etherscan.io"), "/"),
+		SepoliaScanStartBlock:     scanStartBlock,
+		SepoliaConfirmations:      sepoliaConfirmations,
+		SepoliaSafeDepth:          sepoliaSafeDepth,
+		SepoliaReorgRewindBlocks: sepoliaRewindBlocks,
+		SepoliaScanInterval:       durationOrDefault("SEPOLIA_SCAN_INTERVAL", 12*time.Second),
+		SepoliaScanBatchSize:      uint64OrDefault("SEPOLIA_SCAN_BATCH_SIZE", 20),
+		SepoliaExplorerBaseURL:    strings.TrimRight(envOrDefault("SEPOLIA_EXPLORER_BASE_URL", "https://sepolia.etherscan.io"), "/"),
 		EVMReplacement: EVMReplacementConfig{
 			RebroadcastAfter: durationOrDefault("EVM_REBROADCAST_AFTER", 60*time.Second),
 			BumpAfter:        durationOrDefault("EVM_BUMP_AFTER", 180*time.Second),
@@ -234,17 +272,19 @@ func load(requireCustody bool) (Config, error) {
 			MaxFeeCapWei:     evmMaxFeeCapWei,
 		},
 		ERC20: ERC20Config{
-			Enabled:         erc20Enabled,
-			ContractAddress: strings.TrimSpace(envOrDefault("ERC20_CONTRACT_ADDRESS", defaultERC20Contract)),
-			Symbol:          strings.TrimSpace(envOrDefault("ERC20_SYMBOL", "USDC")),
-			Decimals:        uint8OrDefault("ERC20_DECIMALS", 6),
-			ScanStartBlock:  erc20ScanStartBlock,
-			ScanBatchSize:   uint64OrDefault("ERC20_SCAN_BATCH_SIZE", 100),
-			Confirmations:   uint64OrDefault("ERC20_CONFIRMATIONS", 3),
-			SweepEnabled:    erc20SweepEnabled,
-			SweepInterval:   durationOrDefault("ERC20_SWEEP_INTERVAL", 15*time.Second),
-			GasSafetyBPS:    uint64OrDefault("ERC20_GAS_SAFETY_BPS", 2000),
-			GasTopupMaxWei:  bigIntOrDefault("ERC20_GAS_TOPUP_MAX_WEI", defaultGasTopupMaxWei),
+			Enabled:           erc20Enabled,
+			ContractAddress:   strings.TrimSpace(envOrDefault("ERC20_CONTRACT_ADDRESS", defaultERC20Contract)),
+			Symbol:            strings.TrimSpace(envOrDefault("ERC20_SYMBOL", "USDC")),
+			Decimals:          uint8OrDefault("ERC20_DECIMALS", 6),
+			ScanStartBlock:    erc20ScanStartBlock,
+			ScanBatchSize:     uint64OrDefault("ERC20_SCAN_BATCH_SIZE", 100),
+			Confirmations:     erc20Confirmations,
+			SafeDepth:         erc20SafeDepth,
+			ReorgRewindBlocks: erc20RewindBlocks,
+			SweepEnabled:      erc20SweepEnabled,
+			SweepInterval:     durationOrDefault("ERC20_SWEEP_INTERVAL", 15*time.Second),
+			GasSafetyBPS:      uint64OrDefault("ERC20_GAS_SAFETY_BPS", 2000),
+			GasTopupMaxWei:    bigIntOrDefault("ERC20_GAS_TOPUP_MAX_WEI", defaultGasTopupMaxWei),
 		},
 		PlatformWallet: PlatformWalletConfig{
 			HotWalletPath:    envOrDefault("PLATFORM_HOT_WALLET_PATH", defaultPlatformWalletPath),
@@ -533,6 +573,19 @@ func nonNegativeIntOrDefault(key string, fallback int) (int, error) {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s 配置必须是非负整数", key)
+	}
+	return parsed, nil
+}
+
+// nonNegativeUint64OrDefault 读取非负无符号整数配置，格式错误时返回中文错误。
+func nonNegativeUint64OrDefault(key string, fallback uint64) (uint64, error) {
+	value := strings.TrimSpace(settings.GetString(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
 		return 0, fmt.Errorf("%s 配置必须是非负整数", key)
 	}
 	return parsed, nil

@@ -135,7 +135,7 @@ func (s *Store) recordDepositInTx(ctx context.Context, tx pgx.Tx, observation De
 			user_id, address_id, network, asset, tx_hash, tx_index,
 			block_number, block_hash, amount_wei, status
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::numeric, $10)
-		ON CONFLICT (network, tx_hash, address_id) DO NOTHING
+		ON CONFLICT (network, tx_hash, address_id) WHERE status <> 'ORPHANED' DO NOTHING
 		RETURNING id`,
 		observation.UserID, observation.AddressID, NetworkSepolia, AssetETH,
 		observation.TxHash, observation.TxIndex, observation.BlockNumber,
@@ -163,8 +163,8 @@ func (s *Store) recordDepositInTx(ctx context.Context, tx pgx.Tx, observation De
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO balance_entries (
 				user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
-			) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, 'DEPOSIT_PENDING', $3::numeric, 'DEPOSIT', $4)`,
-			observation.UserID, AssetETH, observation.AmountWei.String(), depositID,
+			) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, $3, $4::numeric, 'DEPOSIT', $5)`,
+			observation.UserID, AssetETH, EntryDepositPending, observation.AmountWei.String(), depositID,
 		); err != nil {
 			return Deposit{}, false, fmt.Errorf("写入待确认充值流水失败：%w", err)
 		}
@@ -178,16 +178,36 @@ func (s *Store) recordDepositInTx(ctx context.Context, tx pgx.Tx, observation De
 		existing, err := s.scanDeposit(tx.QueryRow(ctx, `
 			SELECT `+depositColumns+`
 			FROM deposits
-			WHERE network = $1 AND tx_hash = $2 AND address_id = $3`,
+			WHERE network = $1 AND tx_hash = $2 AND address_id = $3 AND status <> 'ORPHANED'`,
 			NetworkSepolia, observation.TxHash, observation.AddressID,
 		))
 		if err != nil {
 			return Deposit{}, false, fmt.Errorf("读取重复充值记录失败：%w", err)
 		}
-		if existing.UserID != observation.UserID || existing.TxIndex != observation.TxIndex ||
-			existing.BlockNumber != observation.BlockNumber || existing.BlockHash != observation.BlockHash ||
-			existing.AmountWei.Cmp(observation.AmountWei) != 0 {
+		if existing.UserID != observation.UserID || existing.AmountWei.Cmp(observation.AmountWei) != 0 {
 			return Deposit{}, false, ErrIdempotencyConflict
+		}
+		if existing.TxIndex != observation.TxIndex || existing.BlockNumber != observation.BlockNumber || existing.BlockHash != observation.BlockHash {
+			if existing.Status == DepositCredited {
+				refID := existing.ID
+				if _, err := recordWorkerErrorWith(ctx, tx, WorkerError{
+					Worker:        "deposit-scanner",
+					Stage:         "reorg_check",
+					ReferenceType: "DEPOSIT",
+					ReferenceID:   &refID,
+					ErrorCode:     "CREDITED_DEPOSIT_REORG",
+					ErrorMessage:  fmt.Sprintf("已入账充值 %d 在重组后位置变更为区块 %d (%s)，系统保持余额不变请人工核查", existing.ID, observation.BlockNumber, observation.BlockHash),
+				}); err != nil {
+					return Deposit{}, false, err
+				}
+			} else if _, err := tx.Exec(ctx, `
+				UPDATE deposits SET
+					tx_index = $2, block_number = $3, block_hash = $4, confirmations = 0, updated_at = CURRENT_TIMESTAMP
+				WHERE id = $1`,
+				existing.ID, observation.TxIndex, observation.BlockNumber, observation.BlockHash,
+			); err != nil {
+				return Deposit{}, false, fmt.Errorf("更新重组后充值区块信息失败：%w", err)
+			}
 		}
 		depositID = existing.ID
 	}
@@ -197,6 +217,95 @@ func (s *Store) recordDepositInTx(ctx context.Context, tx pgx.Tx, observation De
 		return Deposit{}, false, fmt.Errorf("读取已记录充值失败：%w", err)
 	}
 	return item, created, nil
+}
+
+// OrphanDeposit 在链重组确认交易不再属于主链时将未入账充值置为 ORPHANED 并写入冲正流水。
+func (s *Store) OrphanDeposit(ctx context.Context, depositID int64) (Deposit, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Deposit{}, false, fmt.Errorf("开启孤块充值冲正事务失败：%w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	item, err := s.scanDeposit(tx.QueryRow(ctx,
+		`SELECT `+depositColumns+` FROM deposits WHERE id = $1 FOR UPDATE`, depositID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Deposit{}, false, ErrNotFound
+	}
+	if err != nil {
+		return Deposit{}, false, fmt.Errorf("锁定待冲正充值失败：%w", err)
+	}
+	if item.Status == DepositOrphaned {
+		if err := tx.Commit(ctx); err != nil {
+			return Deposit{}, false, fmt.Errorf("提交已孤立充值查询失败：%w", err)
+		}
+		return item, false, nil
+	}
+	if item.Status == DepositCredited {
+		return Deposit{}, false, ErrInvalidState
+	}
+	balance, err := balanceForUpdate(ctx, s, tx, item.UserID)
+	if err != nil {
+		return Deposit{}, false, err
+	}
+	if balance.PendingDepositWei.Cmp(item.AmountWei) < 0 {
+		return Deposit{}, false, ErrPendingBalance
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE asset_balances SET
+			pending_deposit_wei = pending_deposit_wei - $2::numeric,
+			version = version + 1,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE user_id = $1 AND asset = $3`,
+		item.UserID, item.AmountWei.String(), AssetETH,
+	); err != nil {
+		return Deposit{}, false, fmt.Errorf("扣减孤块充值待确认余额失败：%w", err)
+	}
+	reversal := new(big.Int).Neg(item.AmountWei).String()
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO balance_entries (
+			user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
+		) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, $3, $4::numeric, 'DEPOSIT', $5)
+		ON CONFLICT (entry_type, reference_type, reference_id) DO NOTHING`,
+		item.UserID, AssetETH, EntryDepositReversal, reversal, item.ID,
+	); err != nil {
+		return Deposit{}, false, fmt.Errorf("写入孤块充值冲正流水失败：%w", err)
+	}
+	item, err = s.scanDeposit(tx.QueryRow(ctx, `
+		UPDATE deposits SET status = $2, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 RETURNING `+depositColumns, item.ID, DepositOrphaned,
+	))
+	if err != nil {
+		return Deposit{}, false, fmt.Errorf("更新充值为孤块状态失败：%w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deposit{}, false, fmt.Errorf("提交孤块充值冲正事务失败：%w", err)
+	}
+	return item, true, nil
+}
+
+// ListDepositsAfterBlock 查询指定区块高度之后需要复核主链一致性的非孤块充值记录。
+func (s *Store) ListDepositsAfterBlock(ctx context.Context, afterBlock int64, limit int) ([]Deposit, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+depositColumns+` FROM deposits
+		WHERE block_number > $1 AND status <> $2
+		ORDER BY block_number, id LIMIT $3`,
+		afterBlock, DepositOrphaned, normalizedLimit(limit),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询重组区间充值记录失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]Deposit, 0)
+	for rows.Next() {
+		item, err := s.scanDeposit(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取重组区间充值记录失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 // UpdateDepositConfirmations 单调更新充值确认数和确认中状态。

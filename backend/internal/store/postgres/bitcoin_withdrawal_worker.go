@@ -387,7 +387,7 @@ func (s *Store) CompleteBTCWithdrawal(ctx context.Context, id, confirmations, he
 		if _, err = tx.Exec(ctx, `
 			INSERT INTO btc_utxos (deposit_id, address_id, network, txid, vout, value_sats, script_pub_key, block_height, status)
 			VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, 'UNSPENT')
-			ON CONFLICT (network, txid, vout) DO NOTHING`,
+			ON CONFLICT (network, txid, vout) WHERE status <> 'UNKNOWN' DO NOTHING`,
 			changeAddrID, NetworkBitcoinSignet, strings.ToLower(txid), btc.ChangeOutputVout, changeSats, changeScript, height,
 		); err != nil {
 			return err

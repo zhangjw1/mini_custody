@@ -57,6 +57,24 @@ func TestIntegrationBTCReorgReversesPendingDeposit(t *testing.T) {
 	if len(items) != 0 {
 		t.Fatalf("confirming deposits = %d, want 0", len(items))
 	}
+	var depositStatus, utxoStatus string
+	var entryCount int
+	var pendingBalance string
+	if err = store.pool.QueryRow(context.Background(), `SELECT status FROM btc_deposits WHERE txid=$1`, observation.TxID).Scan(&depositStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.pool.QueryRow(context.Background(), `SELECT status FROM btc_utxos WHERE txid=$1`, observation.TxID).Scan(&utxoStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM balance_entries WHERE reference_type='BTC_DEPOSIT' AND entry_type IN ('DEPOSIT_PENDING','DEPOSIT_REVERSAL')`).Scan(&entryCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.pool.QueryRow(context.Background(), `SELECT pending_deposit_wei::text FROM asset_balances WHERE user_id=$1 AND asset='BTC'`, address.UserID).Scan(&pendingBalance); err != nil {
+		t.Fatal(err)
+	}
+	if depositStatus != DepositOrphaned || utxoStatus != btc.UTXOStatusUnknown || entryCount != 2 || pendingBalance != "0" {
+		t.Fatalf("after rewind: depositStatus=%s utxoStatus=%s entryCount=%d pending=%s", depositStatus, utxoStatus, entryCount, pendingBalance)
+	}
 }
 
 // TestIntegrationBTCLockUTXOsConcurrent 验证并发提币选币只允许一个事务锁定同一组平台 UTXO。
@@ -1896,5 +1914,129 @@ func TestIntegrationInternalTransferReplacementMatchesAttemptHashes(t *testing.T
 	attempts, err := store.ListEVMTxAttempts(ctx, EVMBusinessInternalTransfer, transfer.ID)
 	if err != nil || len(attempts) != 2 || attempts[0].TxHash != hash2 || attempts[1].TxHash != hash1 {
 		t.Fatalf("internal transfer attempts = %+v, error = %v", attempts, err)
+	}
+}
+
+// TestIntegrationEVMDepositReorgRewindUpdateOrphanAndCreditedAlert 验证真实数据库中 EVM/Token 充值重组回退、跨块更新、孤块冲正流水和已入账告警。
+func TestIntegrationEVMDepositReorgRewindUpdateOrphanAndCreditedAlert(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	user, address := firstDemoWallet(t, store)
+
+	// 1. 写入两笔待确认 ETH 充值和一笔已入账 ETH 充值。
+	relocatedObs := depositObservation(user.ID, address.ID, 21, 100)
+	orphanedObs := depositObservation(user.ID, address.ID, 22, 200)
+	creditedObs := depositObservation(user.ID, address.ID, 20, 300)
+	if _, _, err := store.RecordDepositAndCheckpoint(ctx, creditedObs); err != nil {
+		t.Fatalf("RecordDepositAndCheckpoint(credited) error = %v", err)
+	}
+	creditedItem, _, err := store.RecordDepositAndCheckpoint(ctx, creditedObs)
+	if err != nil {
+		t.Fatalf("reload credited error = %v", err)
+	}
+	if _, _, err := store.CreditDeposit(ctx, creditedItem.ID, 3); err != nil {
+		t.Fatalf("CreditDeposit() error = %v", err)
+	}
+	if _, _, err := store.RecordDepositAndCheckpoint(ctx, relocatedObs); err != nil {
+		t.Fatalf("RecordDepositAndCheckpoint(relocated) error = %v", err)
+	}
+	orphanedItem, _, err := store.RecordDepositAndCheckpoint(ctx, orphanedObs)
+	if err != nil {
+		t.Fatalf("RecordDepositAndCheckpoint(orphaned) error = %v", err)
+	}
+
+	// 2. 模拟检查点回退到 19 并重新扫到重定位后的交易。
+	rewindHash := fmt.Sprintf("0x%064x", 10_019)
+	if err := store.RewindCheckpoint(ctx, NetworkSepolia, "deposit-scanner", 19, rewindHash); err != nil {
+		t.Fatalf("RewindCheckpoint() error = %v", err)
+	}
+	cp, err := store.Checkpoint(ctx, NetworkSepolia, "deposit-scanner")
+	if err != nil || cp.LastScannedBlock != 19 || cp.LastScannedHash != rewindHash {
+		t.Fatalf("rewound checkpoint = %+v, err = %v", cp, err)
+	}
+
+	relocatedObs.BlockNumber = 23
+	relocatedObs.BlockHash = fmt.Sprintf("0x%064x", 20_023)
+	relocatedObs.TxIndex = 4
+	relocatedObs.Checkpoint.LastScannedBlock = 23
+	relocatedObs.Checkpoint.LastScannedHash = relocatedObs.BlockHash
+	updatedItem, created, err := store.RecordDepositAndCheckpoint(ctx, relocatedObs)
+	if err != nil || created || updatedItem.BlockNumber != 23 || updatedItem.BlockHash != relocatedObs.BlockHash || updatedItem.TxIndex != 4 {
+		t.Fatalf("relocated deposit = %+v, created = %v, err = %v", updatedItem, created, err)
+	}
+
+	// 3. 孤立消失的 pending 充值：校验 ORPHANED 状态、pending 余额减扣、负向冲正流水，以及同 tx_hash 重新入链不冲突。
+	orphanedAfter, changed, err := store.OrphanDeposit(ctx, orphanedItem.ID)
+	if err != nil || !changed || orphanedAfter.Status != DepositOrphaned {
+		t.Fatalf("OrphanDeposit() = %+v, changed = %v, err = %v", orphanedAfter, changed, err)
+	}
+	ethBalance, err := store.BalanceByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("BalanceByUser() error = %v", err)
+	}
+	assertBigInt(t, "available after orphan", ethBalance.AvailableWei, 300)
+	assertBigInt(t, "pending after orphan", ethBalance.PendingDepositWei, 100)
+
+	var reversalAmount string
+	if err := store.pool.QueryRow(ctx, `
+		SELECT amount_wei::text FROM balance_entries
+		WHERE entry_type = $1 AND reference_type = 'DEPOSIT' AND reference_id = $2`,
+		EntryDepositReversal, orphanedItem.ID,
+	).Scan(&reversalAmount); err != nil || reversalAmount != "-200" {
+		t.Fatalf("ETH reversal entry amount = %q, err = %v", reversalAmount, err)
+	}
+
+	// 同 tx_hash 在后续块重新上链应被允许且生成新记录。
+	reminedObs := orphanedObs
+	reminedObs.BlockNumber = 24
+	reminedObs.BlockHash = fmt.Sprintf("0x%064x", 20_024)
+	reminedObs.Checkpoint.LastScannedBlock = 24
+	reminedObs.Checkpoint.LastScannedHash = reminedObs.BlockHash
+	reminedItem, created, err := store.RecordDepositAndCheckpoint(ctx, reminedObs)
+	if err != nil || !created || reminedItem.ID == orphanedItem.ID {
+		t.Fatalf("remined deposit = %+v, created = %v, err = %v", reminedItem, created, err)
+	}
+
+	// 4. 已入账充值在重组后位置变化时不扣款，写 worker_errors 告警。
+	creditedObs.BlockNumber = 25
+	creditedObs.BlockHash = fmt.Sprintf("0x%064x", 20_025)
+	creditedObs.Checkpoint.LastScannedBlock = 25
+	creditedObs.Checkpoint.LastScannedHash = creditedObs.BlockHash
+	if _, _, err := store.RecordDepositAndCheckpoint(ctx, creditedObs); err != nil {
+		t.Fatalf("re-observed credited deposit error = %v", err)
+	}
+	if _, _, err := store.OrphanDeposit(ctx, creditedItem.ID); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("OrphanDeposit(credited) error = %v, want ErrInvalidState", err)
+	}
+	ethBalanceAfterCreditedReorg, err := store.BalanceByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("BalanceByUser() error = %v", err)
+	}
+	assertBigInt(t, "available remains untouched on credited reorg", ethBalanceAfterCreditedReorg.AvailableWei, 300)
+	var alertCount int
+	if err := store.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM worker_errors
+		WHERE error_code = 'CREDITED_DEPOSIT_REORG' AND reference_id = $1`, creditedItem.ID,
+	).Scan(&alertCount); err != nil || alertCount == 0 {
+		t.Fatalf("credited reorg alertCount = %d, err = %v", alertCount, err)
+	}
+
+	// 5. Token 孤块充值冲正测试。
+	tokenAsset := ensureTestUSDC(t, store)
+	tokenObs := tokenDepositObservation(user.ID, address, tokenAsset.ID, 30, 1, 777)
+	tokenItems, _, err := store.RecordTokenDepositsAndCheckpoint(ctx, []TokenDepositObservation{tokenObs}, ChainCheckpoint{
+		Network: NetworkSepolia, Scanner: "erc20:test", LastScannedBlock: 30, LastScannedHash: tokenObs.BlockHash,
+	})
+	if err != nil || len(tokenItems) != 1 {
+		t.Fatalf("RecordTokenDepositsAndCheckpoint() items = %+v, err = %v", tokenItems, err)
+	}
+	orphanedToken, changed, err := store.OrphanTokenDeposit(ctx, tokenItems[0].ID)
+	if err != nil || !changed || orphanedToken.Status != DepositOrphaned {
+		t.Fatalf("OrphanTokenDeposit() = %+v, changed = %v, err = %v", orphanedToken, changed, err)
+	}
+	var tokenPending string
+	if err := store.pool.QueryRow(ctx, `SELECT pending_deposit_wei::text FROM asset_balances WHERE user_id = $1 AND asset_id = $2`, user.ID, tokenAsset.ID).Scan(&tokenPending); err != nil || tokenPending != "0" {
+		t.Fatalf("token pending after orphan = %q, err = %v", tokenPending, err)
 	}
 }

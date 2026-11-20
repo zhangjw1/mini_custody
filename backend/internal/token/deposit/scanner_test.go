@@ -67,14 +67,17 @@ func (f *fakeContract) DecodeTransferLog(log types.Log) (erc20.TransferEvent, er
 }
 
 type fakeStore struct {
-	addresses    []postgres.WalletAddress
-	checkpoint   *postgres.ChainCheckpoint
-	recorded     []postgres.TokenDepositObservation
-	recordCalls  int
-	confirming   []postgres.TokenDeposit
-	updated      map[int64]int64
-	credited     map[int64]int
-	workerErrors []postgres.WorkerError
+	addresses     []postgres.WalletAddress
+	checkpoint    *postgres.ChainCheckpoint
+	rewinds       []postgres.ChainCheckpoint
+	recorded      []postgres.TokenDepositObservation
+	recordCalls   int
+	confirming    []postgres.TokenDeposit
+	updated       map[int64]int64
+	credited      map[int64]int
+	orphaned      map[int64]bool
+	workerErrors  []postgres.WorkerError
+	nextDepositID int64
 }
 
 // ListWalletAddresses 返回测试托管地址。
@@ -90,17 +93,68 @@ func (f *fakeStore) Checkpoint(context.Context, string, string) (postgres.ChainC
 	return *f.checkpoint, nil
 }
 
+// RewindCheckpoint 回退测试检查点。
+func (f *fakeStore) RewindCheckpoint(_ context.Context, network, scanner string, block int64, hash string) error {
+	cp := postgres.ChainCheckpoint{Network: network, Scanner: scanner, LastScannedBlock: block, LastScannedHash: hash}
+	f.checkpoint = &cp
+	f.rewinds = append(f.rewinds, cp)
+	return nil
+}
+
 // RecordTokenDepositsAndCheckpoint 记录扫描提交并推进内存检查点。
 func (f *fakeStore) RecordTokenDepositsAndCheckpoint(_ context.Context, observations []postgres.TokenDepositObservation, checkpoint postgres.ChainCheckpoint) ([]postgres.TokenDeposit, int, error) {
 	f.recordCalls++
 	f.recorded = append(f.recorded, observations...)
 	f.checkpoint = &checkpoint
-	return make([]postgres.TokenDeposit, len(observations)), len(observations), nil
+	items := make([]postgres.TokenDeposit, 0, len(observations))
+	for _, obs := range observations {
+		matched := false
+		for i := range f.confirming {
+			if f.confirming[i].AssetID == obs.AssetID && f.confirming[i].TxHash == obs.TxHash && f.confirming[i].LogIndex == obs.LogIndex && f.confirming[i].Status != postgres.DepositOrphaned {
+				if f.confirming[i].Status != postgres.DepositCredited {
+					f.confirming[i].BlockNumber = obs.BlockNumber
+					f.confirming[i].BlockHash = obs.BlockHash
+				}
+				items = append(items, f.confirming[i])
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		f.nextDepositID++
+		item := postgres.TokenDeposit{
+			ID: f.nextDepositID, UserID: obs.UserID, AddressID: obs.AddressID, AssetID: obs.AssetID,
+			TxHash: obs.TxHash, LogIndex: obs.LogIndex, BlockNumber: obs.BlockNumber, BlockHash: obs.BlockHash,
+			FromAddress: obs.FromAddress, ToAddress: obs.ToAddress, AmountUnits: obs.AmountUnits, Status: postgres.DepositConfirming,
+		}
+		f.confirming = append(f.confirming, item)
+		items = append(items, item)
+	}
+	return items, len(items), nil
 }
 
 // ListConfirmingTokenDeposits 返回测试待确认充值。
 func (f *fakeStore) ListConfirmingTokenDeposits(context.Context, int64, int) ([]postgres.TokenDeposit, error) {
-	return f.confirming, nil
+	result := make([]postgres.TokenDeposit, 0, len(f.confirming))
+	for _, item := range f.confirming {
+		if item.Status == postgres.DepositConfirming || item.Status == postgres.DepositConfirmed || item.Status == postgres.DepositDetected {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+
+// ListTokenDepositsAfterBlock 返回指定高度之后的非孤块测试 Token 充值记录。
+func (f *fakeStore) ListTokenDepositsAfterBlock(_ context.Context, assetID, afterBlock int64, _ int) ([]postgres.TokenDeposit, error) {
+	result := make([]postgres.TokenDeposit, 0)
+	for _, item := range f.confirming {
+		if item.AssetID == assetID && item.BlockNumber > afterBlock && item.Status != postgres.DepositOrphaned {
+			result = append(result, item)
+		}
+	}
+	return result, nil
 }
 
 // UpdateTokenDepositConfirmations 记录确认数更新。
@@ -112,7 +166,31 @@ func (f *fakeStore) UpdateTokenDepositConfirmations(_ context.Context, depositID
 // CreditTokenDeposit 记录 Token 入账调用。
 func (f *fakeStore) CreditTokenDeposit(_ context.Context, depositID, confirmations int64) (postgres.TokenDeposit, bool, error) {
 	f.credited[depositID]++
+	for i := range f.confirming {
+		if f.confirming[i].ID == depositID {
+			f.confirming[i].Status = postgres.DepositCredited
+			break
+		}
+	}
 	return postgres.TokenDeposit{ID: depositID, Confirmations: confirmations, Status: postgres.DepositCredited}, true, nil
+}
+
+// OrphanTokenDeposit 标记测试 Token 充值进入孤块状态。
+func (f *fakeStore) OrphanTokenDeposit(_ context.Context, depositID int64) (postgres.TokenDeposit, bool, error) {
+	if f.orphaned == nil {
+		f.orphaned = make(map[int64]bool)
+	}
+	for i := range f.confirming {
+		if f.confirming[i].ID == depositID {
+			if f.confirming[i].Status == postgres.DepositOrphaned {
+				return f.confirming[i], false, nil
+			}
+			f.confirming[i].Status = postgres.DepositOrphaned
+			f.orphaned[depositID] = true
+			return f.confirming[i], true, nil
+		}
+	}
+	return postgres.TokenDeposit{}, false, postgres.ErrNotFound
 }
 
 // RecordWorkerError 保存测试后台错误。
@@ -181,15 +259,17 @@ func TestScannerRPCFailureDoesNotAdvanceCheckpoint(t *testing.T) {
 	}
 }
 
-// TestScannerConfirmsOnlyAfterHashVerification 验证达到确认数并复核区块哈希后才执行入账。
+// TestScannerConfirmsOnlyAfterHashVerification 验证达到确认数并复核区块哈希后入账，孤块被冲正且不阻塞后续合法充值。
 func TestScannerConfirmsOnlyAfterHashVerification(t *testing.T) {
 	monitored := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	headers := headersForRange(10, 12)
 	chain := &fakeChain{latest: 12, headers: headers}
 	contract := &fakeContract{address: common.HexToAddress("0x1c7d4b196cb0c7b01d743fbc6116a902379c7238"), events: make(map[uint]erc20.TransferEvent)}
 	store := newFakeStore(monitored)
-	store.checkpoint = &postgres.ChainCheckpoint{Network: postgres.NetworkSepolia, Scanner: "erc20:test", LastScannedBlock: 12, LastScannedHash: headers[12].Hash().Hex()}
-	store.confirming = []postgres.TokenDeposit{{ID: 7, AssetID: 1, BlockNumber: 10, BlockHash: headers[10].Hash().Hex(), Status: postgres.DepositConfirming}}
+	store.checkpoint = &postgres.ChainCheckpoint{Network: postgres.NetworkSepolia, Scanner: "erc20:test", LastScannedBlock: 12, LastScannedHash: stringsLower(headers[12].Hash().Hex())}
+	store.confirming = []postgres.TokenDeposit{
+		{ID: 7, AssetID: 1, BlockNumber: 10, BlockHash: stringsLower(headers[10].Hash().Hex()), Status: postgres.DepositConfirming},
+	}
 	scanner := newTestScanner(t, chain, contract, store, nil)
 	if err := scanner.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
@@ -197,12 +277,59 @@ func TestScannerConfirmsOnlyAfterHashVerification(t *testing.T) {
 	if store.credited[7] != 1 {
 		t.Fatalf("credit calls = %d, want 1", store.credited[7])
 	}
-	store.confirming[0].BlockHash = common.HexToHash("0x9999").Hex()
-	if err := scanner.RunOnce(context.Background()); !errors.Is(err, ErrBlockHashMismatch) {
-		t.Fatalf("RunOnce() error = %v, want hash mismatch", err)
+	store.confirming = []postgres.TokenDeposit{
+		{ID: 8, AssetID: 1, BlockNumber: 10, BlockHash: common.HexToHash("0x9999").Hex(), Status: postgres.DepositConfirming},
+		{ID: 9, AssetID: 1, BlockNumber: 10, BlockHash: stringsLower(headers[10].Hash().Hex()), Status: postgres.DepositConfirming},
 	}
-	if len(store.workerErrors) != 1 {
-		t.Fatalf("worker errors = %d, want 1", len(store.workerErrors))
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v, want isolated handling without error", err)
+	}
+	if len(store.workerErrors) != 1 || !store.orphaned[8] {
+		t.Fatalf("worker errors = %d, orphaned = %v", len(store.workerErrors), store.orphaned)
+	}
+	if store.credited[9] != 1 {
+		t.Fatalf("valid token deposit #9 credit calls = %d, want 1", store.credited[9])
+	}
+}
+
+// TestScannerSafeDepthAndReorgRewind 验证 Token 扫描安全深度上限与重组回退重扫。
+func TestScannerSafeDepthAndReorgRewind(t *testing.T) {
+	monitored := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	headers := headersForRange(7, 14)
+	contract := &fakeContract{
+		address: common.HexToAddress("0x1c7d4b196cb0c7b01d743fbc6116a902379c7238"),
+		events:  make(map[uint]erc20.TransferEvent),
+	}
+	chain := &fakeChain{latest: 14, headers: headers}
+	store := newFakeStore(monitored)
+	store.checkpoint = &postgres.ChainCheckpoint{
+		Network: postgres.NetworkSepolia, Scanner: "erc20:test",
+		LastScannedBlock: 10, LastScannedHash: common.HexToHash("0xdead10").Hex(),
+	}
+	store.confirming = []postgres.TokenDeposit{
+		{ID: 11, AssetID: 1, BlockNumber: 9, BlockHash: common.HexToHash("0xdead09").Hex(), Status: postgres.DepositConfirming},
+		{ID: 12, AssetID: 1, BlockNumber: 8, BlockHash: common.HexToHash("0xdead08").Hex(), Status: postgres.DepositCredited},
+	}
+	scanner, err := NewScanner(chain, contract, store, slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
+		AssetID: 1, BatchSize: 20, Confirmations: 3, SafeDepth: 2, ReorgRewindBlocks: 3, Interval: time.Second, ScannerName: "erc20:test",
+	})
+	if err != nil {
+		t.Fatalf("NewScanner() error = %v", err)
+	}
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if len(store.rewinds) != 1 || store.rewinds[0].LastScannedBlock != 7 {
+		t.Fatalf("rewinds = %+v, want block 7", store.rewinds)
+	}
+	if store.checkpoint.LastScannedBlock != 12 {
+		t.Fatalf("checkpoint = %d, want 12 (latest 14 - safeDepth 2)", store.checkpoint.LastScannedBlock)
+	}
+	if !store.orphaned[11] || store.orphaned[12] {
+		t.Fatalf("orphaned = %v, want deposit 11 orphaned and credited deposit 12 intact", store.orphaned)
+	}
+	if len(store.workerErrors) < 2 {
+		t.Fatalf("expected worker error alerts, got %+v", store.workerErrors)
 	}
 }
 
@@ -226,11 +353,19 @@ func newTestScanner(t *testing.T, chain *fakeChain, contract *fakeContract, stor
 	return scanner
 }
 
-// headersForRange 构造连续高度的确定性区块头。
+// headersForRange 构造连续高度与链式父哈希的确定性区块头。
 func headersForRange(from, to uint64) map[uint64]*types.Header {
 	result := make(map[uint64]*types.Header)
 	for height := from; height <= to; height++ {
-		result[height] = &types.Header{Number: new(big.Int).SetUint64(height), Extra: []byte(fmt.Sprintf("block-%d", height))}
+		var parentHash common.Hash
+		if prev, ok := result[height-1]; ok {
+			parentHash = prev.Hash()
+		}
+		result[height] = &types.Header{
+			Number:     new(big.Int).SetUint64(height),
+			ParentHash: parentHash,
+			Extra:      []byte(fmt.Sprintf("block-%d", height)),
+		}
 	}
 	return result
 }

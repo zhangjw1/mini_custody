@@ -157,7 +157,7 @@ func (s *Store) CompleteBTCSweep(ctx context.Context, id, confirmations, blockHe
 	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='SPENT', spend_txid=(SELECT txid FROM btc_sweeps WHERE id=$1), locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND status='LOCKED'`, id, utxoID); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO btc_utxos(deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) SELECT NULL,s.to_address_id,$2,s.txid,0,s.output_value_sats,a.script_pub_key,$3,'UNSPENT' FROM btc_sweeps s JOIN btc_addresses a ON a.id=s.to_address_id WHERE s.id=$1 ON CONFLICT(network,txid,vout) DO NOTHING`, id, NetworkBitcoinSignet, blockHeight); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO btc_utxos(deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) SELECT NULL,s.to_address_id,$2,s.txid,0,s.output_value_sats,a.script_pub_key,$3,'UNSPENT' FROM btc_sweeps s JOIN btc_addresses a ON a.id=s.to_address_id WHERE s.id=$1 ON CONFLICT(network,txid,vout) WHERE status <> 'UNKNOWN' DO NOTHING`, id, NetworkBitcoinSignet, blockHeight); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -202,7 +202,7 @@ func (s *Store) BTCCheckpoint(ctx context.Context) (int64, string, error) {
 	return item.LastScannedBlock, item.LastScannedHash, nil
 }
 
-// RewindBTCCheckpoint 在检测到区块重组时回退检查点并标记受影响充值。
+// RewindBTCCheckpoint 在检测到区块重组时回退检查点，将未入账孤块充值置为 ORPHANED 并追加冲正流水。
 func (s *Store) RewindBTCCheckpoint(ctx context.Context, height int64, hash string) error {
 	if height < 0 || len(hash) != 64 {
 		return errors.New("BTC 回退高度无效")
@@ -212,37 +212,144 @@ func (s *Store) RewindBTCCheckpoint(ctx context.Context, height int64, hash stri
 		return err
 	}
 	defer tx.Rollback(context.Background())
-	var credited int64
-	if err = tx.QueryRow(ctx, `SELECT COUNT(*) FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status='CREDITED'`, NetworkBitcoinSignet, height).Scan(&credited); err != nil {
+
+	// 已入账充值发生重组时绝不自动扣款，写入 worker_errors 供人工核查。
+	creditedRows, err := tx.Query(ctx, `SELECT id, block_height, block_hash FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status=$3`, NetworkBitcoinSignet, height, DepositCredited)
+	if err != nil {
 		return err
 	}
-	if credited > 0 {
-		return errors.New("Bitcoin 重组影响已入账充值，已停止自动回退")
+	var creditedAlerts []struct {
+		id     int64
+		height int64
+		hash   string
 	}
+	for creditedRows.Next() {
+		var row struct {
+			id     int64
+			height int64
+			hash   string
+		}
+		if scanErr := creditedRows.Scan(&row.id, &row.height, &row.hash); scanErr != nil {
+			creditedRows.Close()
+			return scanErr
+		}
+		creditedAlerts = append(creditedAlerts, row)
+	}
+	if err = creditedRows.Err(); err != nil {
+		creditedRows.Close()
+		return err
+	}
+	creditedRows.Close()
+	for _, alert := range creditedAlerts {
+		refID := alert.id
+		if _, err = recordWorkerErrorWith(ctx, tx, WorkerError{
+			Worker:        "btc-deposit-scanner",
+			Stage:         "reorg_check",
+			ReferenceType: "BTC_DEPOSIT",
+			ReferenceID:   &refID,
+			ErrorCode:     "CREDITED_DEPOSIT_REORG",
+			ErrorMessage:  fmt.Sprintf("已入账 BTC 充值 %d (区块 %d / %s) 受重组影响，保持可用余额不变请人工核查", alert.id, alert.height, alert.hash),
+		}); err != nil {
+			return err
+		}
+	}
+
 	var affectedUsers int64
-	if err = tx.QueryRow(ctx, `SELECT COUNT(DISTINCT user_id) FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status<>'CREDITED'`, NetworkBitcoinSignet, height).Scan(&affectedUsers); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT COUNT(DISTINCT user_id) FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status NOT IN ($3,$4)`, NetworkBitcoinSignet, height, DepositCredited, DepositOrphaned).Scan(&affectedUsers); err != nil {
 		return err
 	}
-	command, updateErr := tx.Exec(ctx, `WITH affected AS (SELECT user_id,SUM(amount_sats)::numeric AS amount FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status<>'CREDITED' GROUP BY user_id) UPDATE asset_balances b SET pending_deposit_wei=b.pending_deposit_wei-affected.amount,version=b.version+1,updated_at=CURRENT_TIMESTAMP FROM affected WHERE b.user_id=affected.user_id AND b.asset='BTC' AND b.pending_deposit_wei>=affected.amount`, NetworkBitcoinSignet, height)
-	if updateErr != nil {
-		return updateErr
-	}
-	if command.RowsAffected() != affectedUsers {
-		return ErrPendingBalance
-	}
-	if _, err = tx.Exec(ctx, `DELETE FROM balance_entries WHERE reference_type='BTC_DEPOSIT' AND entry_type='DEPOSIT_PENDING' AND reference_id IN (SELECT id FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status<>'CREDITED')`, NetworkBitcoinSignet, height); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, `DELETE FROM btc_utxos WHERE deposit_id IN (SELECT id FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status<>'CREDITED')`, NetworkBitcoinSignet, height); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, `DELETE FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status<>'CREDITED'`, NetworkBitcoinSignet, height); err != nil {
-		return err
+	if affectedUsers > 0 {
+		assetID, assetErr := s.btcAssetID(ctx, tx)
+		if assetErr != nil {
+			return assetErr
+		}
+		command, updateErr := tx.Exec(ctx, `WITH affected AS (SELECT user_id,SUM(amount_sats)::numeric AS amount FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status NOT IN ($3,$4) GROUP BY user_id) UPDATE asset_balances b SET pending_deposit_wei=b.pending_deposit_wei-affected.amount,version=b.version+1,updated_at=CURRENT_TIMESTAMP FROM affected WHERE b.user_id=affected.user_id AND b.asset_id=$5 AND b.pending_deposit_wei>=affected.amount`, NetworkBitcoinSignet, height, DepositCredited, DepositOrphaned, assetID)
+		if updateErr != nil {
+			return updateErr
+		}
+		if command.RowsAffected() != affectedUsers {
+			return ErrPendingBalance
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO balance_entries (user_id,asset_id,asset,entry_type,amount_wei,reference_type,reference_id) SELECT d.user_id,$5,'BTC',$6,-d.amount_sats,'BTC_DEPOSIT',d.id FROM btc_deposits d WHERE d.network=$1 AND d.block_height>$2 AND d.status NOT IN ($3,$4) ON CONFLICT (entry_type,reference_type,reference_id) DO NOTHING`, NetworkBitcoinSignet, height, DepositCredited, DepositOrphaned, assetID, EntryDepositReversal); err != nil {
+			return fmt.Errorf("写入 BTC 孤块冲正流水失败：%w", err)
+		}
+		if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status=$5,updated_at=CURRENT_TIMESTAMP WHERE deposit_id IN (SELECT id FROM btc_deposits WHERE network=$1 AND block_height>$2 AND status NOT IN ($3,$4))`, NetworkBitcoinSignet, height, DepositCredited, DepositOrphaned, btc.UTXOStatusUnknown); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `UPDATE btc_deposits SET status=$5,updated_at=CURRENT_TIMESTAMP WHERE network=$1 AND block_height>$2 AND status NOT IN ($3,$4)`, NetworkBitcoinSignet, height, DepositCredited, DepositOrphaned, DepositOrphaned); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.Exec(ctx, `UPDATE chain_checkpoints SET last_scanned_block=$2,last_scanned_hash=$3,updated_at=CURRENT_TIMESTAMP WHERE network=$1 AND scanner='btc-deposit'`, NetworkBitcoinSignet, height, strings.ToLower(hash)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// OrphanBTCDeposit 将区块哈希不再匹配主链的单笔 BTC 充值置为 ORPHANED 并追加冲正流水。
+func (s *Store) OrphanBTCDeposit(ctx context.Context, depositID int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+
+	var userID, amountSats, blockHeight int64
+	var status, blockHash string
+	if err = tx.QueryRow(ctx, `SELECT user_id,amount_sats,block_height,block_hash,status FROM btc_deposits WHERE id=$1 FOR UPDATE`, depositID).Scan(&userID, &amountSats, &blockHeight, &blockHash, &status); err != nil {
+		return mapNotFound(err)
+	}
+	if status == DepositOrphaned {
+		return tx.Commit(ctx)
+	}
+	if status == DepositCredited {
+		refID := depositID
+		if _, err = recordWorkerErrorWith(ctx, tx, WorkerError{
+			Worker:        "btc-deposit-scanner",
+			Stage:         "reorg_check",
+			ReferenceType: "BTC_DEPOSIT",
+			ReferenceID:   &refID,
+			ErrorCode:     "CREDITED_DEPOSIT_REORG",
+			ErrorMessage:  fmt.Sprintf("已入账 BTC 充值 %d (区块 %d / %s) 哈希不一致，保持可用余额不变请人工核查", depositID, blockHeight, blockHash),
+		}); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	assetID, err := s.btcAssetID(ctx, tx)
+	if err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `UPDATE asset_balances SET pending_deposit_wei=pending_deposit_wei-$3,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE user_id=$1 AND asset_id=$2 AND pending_deposit_wei>=$3`, userID, assetID, amountSats)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrPendingBalance
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO balance_entries (user_id,asset_id,asset,entry_type,amount_wei,reference_type,reference_id) VALUES ($1,$2,'BTC',$3,-$4,'BTC_DEPOSIT',$5) ON CONFLICT (entry_type,reference_type,reference_id) DO NOTHING`, userID, assetID, EntryDepositReversal, amountSats, depositID); err != nil {
+		return fmt.Errorf("写入 BTC 孤块冲正流水失败：%w", err)
+	}
+	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status=$2,updated_at=CURRENT_TIMESTAMP WHERE deposit_id=$1`, depositID, btc.UTXOStatusUnknown); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE btc_deposits SET status=$2,updated_at=CURRENT_TIMESTAMP WHERE id=$1`, depositID, DepositOrphaned); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// RecordBTCWorkerError 记录 BTC 扫描器处理单条充值异常时的后台错误告警。
+func (s *Store) RecordBTCWorkerError(ctx context.Context, stage, referenceType string, referenceID *int64, errorCode, errorMessage string) error {
+	_, err := s.RecordWorkerError(ctx, WorkerError{
+		Worker:        "btc-deposit-scanner",
+		Stage:         stage,
+		ReferenceType: referenceType,
+		ReferenceID:   referenceID,
+		ErrorCode:     errorCode,
+		ErrorMessage:  errorMessage,
+	})
+	return err
 }
 
 // ListBTCAddresses 查询启用的用户 BTC 充值地址。
@@ -434,14 +541,14 @@ func (s *Store) RecordBTCDepositsAndCheckpoint(ctx context.Context, observations
 			return 0, errors.New("BTC 充值观察值无效")
 		}
 		var id int64
-		err := tx.QueryRow(ctx, `INSERT INTO btc_deposits (user_id,address_id,network,txid,vout,block_hash,block_height,amount_sats,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (network,txid,vout,address_id) DO NOTHING RETURNING id`, item.UserID, item.AddressID, NetworkBitcoinSignet, strings.ToLower(item.TxID), item.Vout, strings.ToLower(item.BlockHash), item.BlockHeight, item.AmountSats, DepositConfirming).Scan(&id)
+		err := tx.QueryRow(ctx, `INSERT INTO btc_deposits (user_id,address_id,network,txid,vout,block_hash,block_height,amount_sats,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (network,txid,vout,address_id) WHERE status <> 'ORPHANED' DO NOTHING RETURNING id`, item.UserID, item.AddressID, NetworkBitcoinSignet, strings.ToLower(item.TxID), item.Vout, strings.ToLower(item.BlockHash), item.BlockHeight, item.AmountSats, DepositConfirming).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return 0, fmt.Errorf("写入 BTC 充值失败：%w", err)
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO btc_utxos (deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'UNCONFIRMED') ON CONFLICT DO NOTHING`, id, item.AddressID, NetworkBitcoinSignet, strings.ToLower(item.TxID), item.Vout, item.AmountSats, fmt.Sprintf("%x", item.ScriptPubKey), item.BlockHeight); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO btc_utxos (deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'UNCONFIRMED') ON CONFLICT (network,txid,vout) WHERE status <> 'UNKNOWN' DO NOTHING`, id, item.AddressID, NetworkBitcoinSignet, strings.ToLower(item.TxID), item.Vout, item.AmountSats, fmt.Sprintf("%x", item.ScriptPubKey), item.BlockHeight); err != nil {
 			return 0, fmt.Errorf("写入 BTC UTXO 失败：%w", err)
 		}
 		assetID, assetErr := s.btcAssetID(ctx, tx)

@@ -185,6 +185,10 @@ B1 必须覆盖 ETH 提币、Token 提币、Token 归集、Gas Station 四条链
   - BTC 孤块充值走已有的 `RewindBTCCheckpoint` 逻辑，并改为写冲正流水，而不是 DELETE 流水。
 - **验收**：一条异常充值不会影响同一批次中其他充值入账。
 
+### 批次 C 状态与流水约定（迁移 `000007_reorg_orphaned`）
+- 新增充值状态：`ORPHANED`，同时扩展 `deposits.status`、`token_deposits.status`、`btc_deposits.status` 约束；将上述三张表的幂等唯一约束替换为 `WHERE status <> 'ORPHANED'` 部分唯一索引（以及 `btc_utxos` 的 `WHERE status <> 'UNKNOWN'`），保证孤块冲正保留不可变记录且同一交易随后重新上链仍可入账。
+- 新增余额流水类型：`DEPOSIT_REVERSAL`（只追加负向冲正流水，禁止 `DELETE FROM balance_entries`）。
+
 ### 批次 C 提示词
 
 ```text

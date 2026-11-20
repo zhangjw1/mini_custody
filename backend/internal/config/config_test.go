@@ -136,6 +136,7 @@ func TestConfigLoadsSepoliaScannerSettings(t *testing.T) {
 	t.Setenv("SEPOLIA_RPC_URL", "https://primary.example")
 	t.Setenv("SEPOLIA_SCAN_START_BLOCK", "123")
 	t.Setenv("SEPOLIA_CONFIRMATIONS", "5")
+	t.Setenv("SEPOLIA_SAFE_DEPTH", "2")
 	t.Setenv("SEPOLIA_SCAN_INTERVAL", "4s")
 	t.Setenv("SEPOLIA_SCAN_BATCH_SIZE", "25")
 
@@ -144,8 +145,19 @@ func TestConfigLoadsSepoliaScannerSettings(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if cfg.SepoliaScanStartBlock == nil || *cfg.SepoliaScanStartBlock != 123 || cfg.SepoliaConfirmations != 5 ||
+		cfg.SepoliaSafeDepth != 2 || cfg.SepoliaReorgRewindBlocks != 5 ||
 		cfg.SepoliaScanInterval != 4*time.Second || cfg.SepoliaScanBatchSize != 25 {
 		t.Fatalf("scanner config = %+v", cfg)
+	}
+
+	t.Setenv("SEPOLIA_REORG_REWIND_BLOCKS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want error for SEPOLIA_REORG_REWIND_BLOCKS=0")
+	}
+	t.Setenv("SEPOLIA_REORG_REWIND_BLOCKS", "8")
+	cfg, err = Load()
+	if err != nil || cfg.SepoliaReorgRewindBlocks != 8 {
+		t.Fatalf("explicit rewind = %d, err = %v", cfg.SepoliaReorgRewindBlocks, err)
 	}
 }
 
@@ -187,6 +199,8 @@ func TestConfigLoadsERC20Settings(t *testing.T) {
 	t.Setenv("ERC20_SCAN_START_BLOCK", "789")
 	t.Setenv("ERC20_SCAN_BATCH_SIZE", "250")
 	t.Setenv("ERC20_CONFIRMATIONS", "5")
+	t.Setenv("ERC20_SAFE_DEPTH", "2")
+	t.Setenv("ERC20_REORG_REWIND_BLOCKS", "7")
 	t.Setenv("ERC20_SWEEP_ENABLED", "true")
 	t.Setenv("ERC20_SWEEP_INTERVAL", "30s")
 	t.Setenv("ERC20_GAS_SAFETY_BPS", "1500")
@@ -202,7 +216,7 @@ func TestConfigLoadsERC20Settings(t *testing.T) {
 		t.Fatalf("ERC20 config = %+v", cfg.ERC20)
 	}
 	if cfg.ERC20.ScanStartBlock == nil || *cfg.ERC20.ScanStartBlock != 789 || cfg.ERC20.ScanBatchSize != 250 ||
-		cfg.ERC20.Confirmations != 5 || cfg.ERC20.SweepInterval != 30*time.Second {
+		cfg.ERC20.Confirmations != 5 || cfg.ERC20.SafeDepth != 2 || cfg.ERC20.ReorgRewindBlocks != 7 || cfg.ERC20.SweepInterval != 30*time.Second {
 		t.Fatalf("ERC20 scanner config = %+v", cfg.ERC20)
 	}
 	if cfg.ERC20.GasTopupMaxWei.String() != "4000000000000000" || cfg.PlatformWallet.MinETHBalanceWei.String() != "9000000000000000" {

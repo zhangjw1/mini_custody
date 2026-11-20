@@ -581,6 +581,29 @@ func (s *Store) AdvanceCheckpoint(ctx context.Context, checkpoint ChainCheckpoin
 	return nil
 }
 
+// RewindCheckpoint 在检测到链重组时将指定网络和扫描器的检查点回退到目标区块高度与哈希。
+func (s *Store) RewindCheckpoint(ctx context.Context, network, scanner string, block int64, hash string) error {
+	network = strings.TrimSpace(network)
+	scanner = strings.TrimSpace(scanner)
+	hash = strings.ToLower(strings.TrimSpace(hash))
+	if network == "" || scanner == "" || block < 0 || !transactionHashPattern.MatchString(hash) {
+		return errors.New("回退扫描检查点参数无效")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE chain_checkpoints
+		SET last_scanned_block = $3, last_scanned_hash = $4, updated_at = CURRENT_TIMESTAMP
+		WHERE network = $1 AND scanner = $2`,
+		network, scanner, block, hash,
+	)
+	if err != nil {
+		return fmt.Errorf("回退扫描检查点失败：%w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // advanceCheckpoint 在现有事务内写入或推进扫描检查点。
 func advanceCheckpoint(ctx context.Context, tx pgx.Tx, checkpoint ChainCheckpoint) error {
 	checkpoint.Network = strings.TrimSpace(checkpoint.Network)
@@ -612,6 +635,13 @@ func advanceCheckpoint(ctx context.Context, tx pgx.Tx, checkpoint ChainCheckpoin
 
 // RecordWorkerError 合并或写入经过清洗的后台任务错误信息，避免同错误每轮重复堆积。
 func (s *Store) RecordWorkerError(ctx context.Context, item WorkerError) (int64, error) {
+	return recordWorkerErrorWith(ctx, s.pool, item)
+}
+
+// recordWorkerErrorWith 使用指定查询执行器合并或写入经过清洗的后台任务错误记录。
+func recordWorkerErrorWith(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, item WorkerError) (int64, error) {
 	worker := strings.TrimSpace(item.Worker)
 	stage := strings.TrimSpace(item.Stage)
 	refType := strings.TrimSpace(item.ReferenceType)
@@ -619,7 +649,7 @@ func (s *Store) RecordWorkerError(ctx context.Context, item WorkerError) (int64,
 	errMsg := strings.TrimSpace(item.ErrorMessage)
 
 	var id int64
-	updateErr := s.pool.QueryRow(ctx, `
+	updateErr := db.QueryRow(ctx, `
 		UPDATE worker_errors
 		SET error_message = $5,
 		    retry_count = retry_count + 1,
@@ -643,7 +673,7 @@ func (s *Store) RecordWorkerError(ctx context.Context, item WorkerError) (int64,
 		return 0, fmt.Errorf("更新后台任务错误失败：%w", updateErr)
 	}
 
-	err := s.pool.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		INSERT INTO worker_errors (
 			worker, stage, reference_type, reference_id, error_code, error_message, retry_count
 		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7)

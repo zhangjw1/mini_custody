@@ -182,3 +182,28 @@ func TestEVMReplacementMigrationDocumentsEveryColumn(t *testing.T) {
 		}
 	}
 }
+
+// TestReorgOrphanedMigrationContainsConstraintsAndComments 验证 000007 迁移补全 ORPHANED 状态、部分唯一索引与 DEPOSIT_REVERSAL 约束。
+func TestReorgOrphanedMigrationContainsConstraintsAndComments(t *testing.T) {
+	sqlBytes, err := migrationFiles.ReadFile("000007_reorg_orphaned.up.sql")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	sql := string(sqlBytes)
+	for _, fragment := range []string{
+		"'ORPHANED'",
+		"'DEPOSIT_REVERSAL'",
+		"deposits_active_network_tx_hash_address_idx",
+		"token_deposits_active_asset_tx_log_idx",
+		"btc_deposits_active_network_txid_vout_addr_idx",
+		"btc_utxos_active_network_txid_vout_idx",
+		"COMMENT ON COLUMN deposits.status IS",
+		"COMMENT ON COLUMN token_deposits.status IS",
+		"COMMENT ON COLUMN btc_deposits.status IS",
+		"COMMENT ON COLUMN balance_entries.entry_type IS",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Errorf("reorg orphaned migration fragment %q is missing", fragment)
+		}
+	}
+}
