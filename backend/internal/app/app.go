@@ -127,73 +127,99 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	if err := ensureBootstrapAdmin(ctx, store, cfg, logger); err != nil {
 		return nil, err
 	}
-	var bitcoinClient *bitcoinchain.Client
-	var bitcoinScanner *btc.Scanner
-	var bitcoinSweeper *btc.SweepWorker
-	var bitcoinWithdrawals *btc.WithdrawalService
-	var bitcoinWithdrawalWorker *btc.WithdrawalWorker
-	if cfg.Bitcoin.Enabled {
-		profile, profileErr := bitcoinchain.ResolveNetwork(cfg.Bitcoin.Network)
-		if profileErr != nil {
-			return nil, profileErr
-		}
-		if err = postgres.ConfigureBitcoinNetwork(profile.DatabaseNetwork); err != nil {
-			return nil, err
-		}
-		if err = btc.ConfigureNetwork(profile.DatabaseNetwork); err != nil {
-			return nil, err
-		}
-		bitcoinClient, err = bitcoinchain.NewClient(cfg.Bitcoin.RPCURL, cfg.Bitcoin.RPCUser, cfg.Bitcoin.RPCPassword, cfg.Bitcoin.RPCTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("初始化 Bitcoin RPC 失败：%w", err)
-		}
-		if err = bitcoinClient.VerifyNetwork(ctx, profile.RPCChain); err != nil {
-			return nil, fmt.Errorf("校验 Bitcoin 网络失败：%w", err)
-		}
-		if err = store.EnsureBitcoinWallets(ctx, provider); err != nil {
-			return nil, fmt.Errorf("初始化 Bitcoin 钱包失败：%w", err)
-		}
-		addresses, loadErr := store.ListBTCAddresses(ctx)
-		if loadErr != nil {
-			return nil, fmt.Errorf("加载 Bitcoin 地址失败：%w", loadErr)
-		}
-		start := int64(0)
-		if cfg.Bitcoin.ScanStartBlock != nil {
-			start = int64(*cfg.Bitcoin.ScanStartBlock)
-		}
-		bitcoinScanner, err = btc.NewScanner(bitcoinClient, store, addresses, start, int64(cfg.Bitcoin.Confirmations), int64(cfg.Bitcoin.ScanBatchSize), cfg.Bitcoin.ScanInterval, logger)
-		if err != nil {
-			return nil, err
-		}
-		bitcoinSweeper, err = btc.NewSweepWorker(bitcoinClient, store, provider, cfg.Bitcoin.SweepInterval, cfg.Bitcoin.SweepFeeRateSatVB, int64(cfg.Bitcoin.Confirmations), logger)
-		if err != nil {
-			return nil, err
-		}
-		bitcoinWithdrawals, err = btc.NewWithdrawalService(store, cfg.Bitcoin.SweepFeeRateSatVB)
-		if err != nil {
-			return nil, err
-		}
-		bitcoinWithdrawalWorker, err = btc.NewWithdrawalWorker(bitcoinClient, store, provider, cfg.Bitcoin.SweepInterval, int64(cfg.Bitcoin.Confirmations), logger)
-		if err != nil {
-			return nil, err
-		}
+	application := &App{
+		config:        cfg,
+		logger:        logger,
+		pool:          pool,
+		store:         store,
+		apiStore:      store,
+		authStore:     store,
+		jwtSecret:     jwtSecret,
+		keys:          provider,
+		chain:         chainClient,
+		tokenContract: tokenContract,
 	}
-	var tokenAsset postgres.Asset
-	if cfg.ERC20.Enabled {
-		tokenAsset, err = store.EnsureERC20Asset(ctx, postgres.Asset{
-			Network:         postgres.NetworkSepolia,
-			Symbol:          cfg.ERC20.Symbol,
-			ContractAddress: cfg.ERC20.ContractAddress,
-			Decimals:        cfg.ERC20.Decimals,
-			Enabled:         true,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("初始化 ERC-20 资产失败：%w", err)
-		}
-		if _, err := store.EnsurePlatformHotWallet(ctx, provider, cfg.PlatformWallet.HotWalletPath); err != nil {
-			return nil, fmt.Errorf("初始化平台热钱包失败：%w", err)
-		}
+	if err := application.wireBTC(ctx, cfg, store, provider, logger); err != nil {
+		return nil, err
 	}
+	if err := application.wireEVM(ctx, cfg, chainClient, store, provider, logger); err != nil {
+		return nil, err
+	}
+	if err := application.wireERC20(ctx, cfg, chainClient, tokenContract, store, provider, logger); err != nil {
+		return nil, err
+	}
+	application.server = &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           application.requestContext(application.buildRouter()),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       cfg.HTTP.ReadTimeout,
+		WriteTimeout:      cfg.HTTP.WriteTimeout,
+		IdleTimeout:       cfg.HTTP.IdleTimeout,
+	}
+	failed = false
+	chainFailed = false
+	return application, nil
+}
+
+// wireBTC 根据配置装配 Bitcoin RPC 客户端、扫描器、归集和提币组件。
+func (a *App) wireBTC(ctx context.Context, cfg config.Config, store *postgres.Store, provider *wallet.MnemonicKeyProvider, logger *slog.Logger) error {
+	if !cfg.Bitcoin.Enabled {
+		return nil
+	}
+	profile, err := bitcoinchain.ResolveNetwork(cfg.Bitcoin.Network)
+	if err != nil {
+		return err
+	}
+	if err = postgres.ConfigureBitcoinNetwork(profile.DatabaseNetwork); err != nil {
+		return err
+	}
+	if err = btc.ConfigureNetwork(profile.DatabaseNetwork); err != nil {
+		return err
+	}
+	bitcoinClient, err := bitcoinchain.NewClient(cfg.Bitcoin.RPCURL, cfg.Bitcoin.RPCUser, cfg.Bitcoin.RPCPassword, cfg.Bitcoin.RPCTimeout)
+	if err != nil {
+		return fmt.Errorf("初始化 Bitcoin RPC 失败：%w", err)
+	}
+	if err = bitcoinClient.VerifyNetwork(ctx, profile.RPCChain); err != nil {
+		return fmt.Errorf("校验 Bitcoin 网络失败：%w", err)
+	}
+	if err = store.EnsureBitcoinWallets(ctx, provider); err != nil {
+		return fmt.Errorf("初始化 Bitcoin 钱包失败：%w", err)
+	}
+	addresses, err := store.ListBTCAddresses(ctx)
+	if err != nil {
+		return fmt.Errorf("加载 Bitcoin 地址失败：%w", err)
+	}
+	start := int64(0)
+	if cfg.Bitcoin.ScanStartBlock != nil {
+		start = int64(*cfg.Bitcoin.ScanStartBlock)
+	}
+	bitcoinScanner, err := btc.NewScanner(bitcoinClient, store, addresses, start, int64(cfg.Bitcoin.Confirmations), int64(cfg.Bitcoin.ScanBatchSize), cfg.Bitcoin.ScanInterval, logger)
+	if err != nil {
+		return err
+	}
+	bitcoinSweeper, err := btc.NewSweepWorker(bitcoinClient, store, provider, cfg.Bitcoin.SweepInterval, cfg.Bitcoin.SweepFeeRateSatVB, int64(cfg.Bitcoin.Confirmations), logger)
+	if err != nil {
+		return err
+	}
+	bitcoinWithdrawals, err := btc.NewWithdrawalService(store, cfg.Bitcoin.SweepFeeRateSatVB)
+	if err != nil {
+		return err
+	}
+	bitcoinWithdrawalWorker, err := btc.NewWithdrawalWorker(bitcoinClient, store, provider, cfg.Bitcoin.SweepInterval, int64(cfg.Bitcoin.Confirmations), logger)
+	if err != nil {
+		return err
+	}
+	a.bitcoinClient = bitcoinClient
+	a.bitcoinScanner = bitcoinScanner
+	a.bitcoinSweeper = bitcoinSweeper
+	a.bitcoinWithdrawals = bitcoinWithdrawals
+	a.bitcoinWithdrawalWorker = bitcoinWithdrawalWorker
+	return nil
+}
+
+// wireEVM 装配 Sepolia ETH 充值扫描器和提币服务及 Worker。
+func (a *App) wireEVM(ctx context.Context, cfg config.Config, chainClient *evm.Client, store *postgres.Store, provider *wallet.MnemonicKeyProvider, logger *slog.Logger) error {
 	depositScanner, err := deposit.NewScanner(chainClient, store, logger, deposit.Config{
 		StartBlock:        cfg.SepoliaScanStartBlock,
 		Confirmations:     cfg.SepoliaConfirmations,
@@ -203,72 +229,14 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		Interval:          cfg.SepoliaScanInterval,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("创建 Sepolia 充值扫描器失败：%w", err)
+		return fmt.Errorf("创建 Sepolia 充值扫描器失败：%w", err)
 	}
 	if err := depositScanner.Initialize(ctx); err != nil {
-		return nil, fmt.Errorf("初始化 Sepolia 充值扫描器失败：%w", err)
-	}
-	var tokenScanner *tokendeposit.Scanner
-	if cfg.ERC20.Enabled {
-		tokenScanner, err = tokendeposit.NewScanner(chainClient, tokenContract, store, logger, tokendeposit.Config{
-			AssetID: tokenAsset.ID, StartBlock: cfg.ERC20.ScanStartBlock,
-			BatchSize: cfg.ERC20.ScanBatchSize, Confirmations: cfg.ERC20.Confirmations,
-			SafeDepth: cfg.ERC20.SafeDepth, ReorgRewindBlocks: cfg.ERC20.ReorgRewindBlocks,
-			Interval: cfg.SepoliaScanInterval,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("创建 Token 充值扫描器失败：%w", err)
-		}
-		if err := tokenScanner.Initialize(ctx); err != nil {
-			return nil, fmt.Errorf("初始化 Token 充值扫描器失败：%w", err)
-		}
-	}
-	var gasStationWorker *gasstation.Worker
-	var tokenSweepWorker *tokensweep.Worker
-	var tokenWithdrawalService *tokenwithdrawal.Service
-	var tokenWithdrawalWorker *tokenwithdrawal.Worker
-	if cfg.ERC20.SweepEnabled {
-		gasStationWorker, err = gasstation.NewWorker(chainClient, tokenContract, store, provider, logger, gasstation.Config{
-			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
-			ChainID: big.NewInt(evm.SepoliaChainID), GasSafetyBPS: cfg.ERC20.GasSafetyBPS,
-			GasTopupMaxWei: cfg.ERC20.GasTopupMaxWei, PlatformMinBalanceWei: cfg.PlatformWallet.MinETHBalanceWei,
-			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
-			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
-			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("创建 Gas Station Worker 失败：%w", err)
-		}
-		tokenSweepWorker, err = tokensweep.NewWorker(chainClient, tokenContract, store, provider, logger, tokensweep.Config{
-			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
-			ChainID: big.NewInt(evm.SepoliaChainID), Symbol: cfg.ERC20.Symbol,
-			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
-			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
-			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("创建 Token Sweep Worker 失败：%w", err)
-		}
-	}
-	if cfg.ERC20.Enabled {
-		tokenWithdrawalService, err = tokenwithdrawal.NewService(chainClient, tokenContract, store, tokenAsset)
-		if err != nil {
-			return nil, fmt.Errorf("创建 Token 提币服务失败：%w", err)
-		}
-		tokenWithdrawalWorker, err = tokenwithdrawal.NewWorker(chainClient, tokenContract, store, provider, logger, tokenwithdrawal.WorkerConfig{
-			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
-			ChainID:          big.NewInt(evm.SepoliaChainID),
-			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
-			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
-			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("创建 Token 提币 Worker 失败：%w", err)
-		}
+		return fmt.Errorf("初始化 Sepolia 充值扫描器失败：%w", err)
 	}
 	withdrawalService, err := withdrawal.NewService(chainClient, store)
 	if err != nil {
-		return nil, fmt.Errorf("创建 Sepolia 提币服务失败：%w", err)
+		return fmt.Errorf("创建 Sepolia 提币服务失败：%w", err)
 	}
 	withdrawalWorker, err := withdrawal.NewWorker(chainClient, store, provider, logger, withdrawal.WorkerConfig{
 		Interval:         cfg.SepoliaScanInterval,
@@ -281,83 +249,131 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		MaxFeeCapWei:     cfg.EVMReplacement.MaxFeeCapWei,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("创建 Sepolia 提币 Worker 失败：%w", err)
+		return fmt.Errorf("创建 Sepolia 提币 Worker 失败：%w", err)
 	}
+	a.scanner = depositScanner
+	a.withdrawals = withdrawalService
+	a.withdrawalWorker = withdrawalWorker
+	return nil
+}
 
-	application := &App{
-		config:                cfg,
-		logger:                logger,
-		pool:                  pool,
-		store:                 store,
-		apiStore:              store,
-		authStore:             store,
-		jwtSecret:             jwtSecret,
-		keys:                  provider,
-		chain:                 chainClient,
-		tokenContract:         tokenContract,
-		tokenScanner:          tokenScanner,
-		gasStation:            gasStationWorker,
-		tokenSweeper:          tokenSweepWorker,
-		tokenAsset:            tokenAsset,
-		tokenWithdrawals:      tokenWithdrawalService,
-		tokenWithdrawalWorker: tokenWithdrawalWorker,
-		bitcoinClient:         bitcoinClient, bitcoinScanner: bitcoinScanner, bitcoinSweeper: bitcoinSweeper,
-		bitcoinWithdrawals:      bitcoinWithdrawals,
-		bitcoinWithdrawalWorker: bitcoinWithdrawalWorker,
-		scanner:                 depositScanner,
-		withdrawals:             withdrawalService,
-		withdrawalWorker:        withdrawalWorker,
+// wireERC20 根据配置装配 ERC-20 资产、平台热钱包及 Token 充值、归集、补气和提币组件。
+func (a *App) wireERC20(ctx context.Context, cfg config.Config, chainClient *evm.Client, tokenContract *erc20.Contract, store *postgres.Store, provider *wallet.MnemonicKeyProvider, logger *slog.Logger) error {
+	if cfg.ERC20.Enabled {
+		tokenAsset, err := store.EnsureERC20Asset(ctx, postgres.Asset{
+			Network:         postgres.NetworkSepolia,
+			Symbol:          cfg.ERC20.Symbol,
+			ContractAddress: cfg.ERC20.ContractAddress,
+			Decimals:        cfg.ERC20.Decimals,
+			Enabled:         true,
+		})
+		if err != nil {
+			return fmt.Errorf("初始化 ERC-20 资产失败：%w", err)
+		}
+		if _, err := store.EnsurePlatformHotWallet(ctx, provider, cfg.PlatformWallet.HotWalletPath); err != nil {
+			return fmt.Errorf("初始化平台热钱包失败：%w", err)
+		}
+		tokenScanner, err := tokendeposit.NewScanner(chainClient, tokenContract, store, logger, tokendeposit.Config{
+			AssetID: tokenAsset.ID, StartBlock: cfg.ERC20.ScanStartBlock,
+			BatchSize: cfg.ERC20.ScanBatchSize, Confirmations: cfg.ERC20.Confirmations,
+			SafeDepth: cfg.ERC20.SafeDepth, ReorgRewindBlocks: cfg.ERC20.ReorgRewindBlocks,
+			Interval: cfg.SepoliaScanInterval,
+		})
+		if err != nil {
+			return fmt.Errorf("创建 Token 充值扫描器失败：%w", err)
+		}
+		if err := tokenScanner.Initialize(ctx); err != nil {
+			return fmt.Errorf("初始化 Token 充值扫描器失败：%w", err)
+		}
+		tokenWithdrawalService, err := tokenwithdrawal.NewService(chainClient, tokenContract, store, tokenAsset)
+		if err != nil {
+			return fmt.Errorf("创建 Token 提币服务失败：%w", err)
+		}
+		tokenWithdrawalWorker, err := tokenwithdrawal.NewWorker(chainClient, tokenContract, store, provider, logger, tokenwithdrawal.WorkerConfig{
+			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
+			ChainID:          big.NewInt(evm.SepoliaChainID),
+			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
+			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
+		})
+		if err != nil {
+			return fmt.Errorf("创建 Token 提币 Worker 失败：%w", err)
+		}
+		a.tokenAsset = tokenAsset
+		a.tokenScanner = tokenScanner
+		a.tokenWithdrawals = tokenWithdrawalService
+		a.tokenWithdrawalWorker = tokenWithdrawalWorker
 	}
+	if cfg.ERC20.SweepEnabled {
+		gasStationWorker, err := gasstation.NewWorker(chainClient, tokenContract, store, provider, logger, gasstation.Config{
+			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
+			ChainID: big.NewInt(evm.SepoliaChainID), GasSafetyBPS: cfg.ERC20.GasSafetyBPS,
+			GasTopupMaxWei: cfg.ERC20.GasTopupMaxWei, PlatformMinBalanceWei: cfg.PlatformWallet.MinETHBalanceWei,
+			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
+			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
+		})
+		if err != nil {
+			return fmt.Errorf("创建 Gas Station Worker 失败：%w", err)
+		}
+		tokenSweepWorker, err := tokensweep.NewWorker(chainClient, tokenContract, store, provider, logger, tokensweep.Config{
+			Interval: cfg.ERC20.SweepInterval, Confirmations: cfg.ERC20.Confirmations,
+			ChainID: big.NewInt(evm.SepoliaChainID), Symbol: cfg.ERC20.Symbol,
+			RebroadcastAfter: cfg.EVMReplacement.RebroadcastAfter, BumpAfter: cfg.EVMReplacement.BumpAfter,
+			BumpPercent: cfg.EVMReplacement.BumpPercent, MaxBumps: cfg.EVMReplacement.MaxBumps,
+			MaxFeeCapWei: cfg.EVMReplacement.MaxFeeCapWei,
+		})
+		if err != nil {
+			return fmt.Errorf("创建 Token Sweep Worker 失败：%w", err)
+		}
+		a.gasStation = gasStationWorker
+		a.tokenSweeper = tokenSweepWorker
+	}
+	return nil
+}
+
+// buildRouter 注册全部 HTTP 健康检查、认证及后台管理路由。
+func (a *App) buildRouter() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", application.health)
-	mux.HandleFunc("GET /livez", application.livez)
-	mux.HandleFunc("GET /readyz", application.health)
-	mux.HandleFunc("POST /api/v1/auth/login", application.login)
+	mux.HandleFunc("GET /healthz", a.health)
+	mux.HandleFunc("GET /livez", a.livez)
+	mux.HandleFunc("GET /readyz", a.health)
+	mux.HandleFunc("POST /api/v1/auth/login", a.login)
 
-	mux.HandleFunc("GET /api/v1/auth/me", application.requireAdminAuth(application.me))
-	mux.HandleFunc("GET /api/v1/users", application.requireAdminAuth(application.listUsers))
-	mux.HandleFunc("POST /api/v1/users", application.requireAdminAuth(application.createUser))
-	mux.HandleFunc("PATCH /api/v1/users/{user_id}", application.requireAdminAuth(application.updateUser))
-	mux.HandleFunc("GET /api/v1/assets", application.requireAdminAuth(application.listAssets))
-	mux.HandleFunc("GET /api/v1/users/{user_id}/wallet", application.requireAdminAuth(application.getWallet))
-	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-wallet", application.requireAdminAuth(application.getBitcoinWallet))
-	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-deposits", application.requireAdminAuth(application.listBitcoinDeposits))
-	mux.HandleFunc("GET /api/v1/users/{user_id}/balances", application.requireAdminAuth(application.listUserBalances))
-	mux.HandleFunc("GET /api/v1/users/{user_id}/deposits", application.requireAdminAuth(application.listDeposits))
-	mux.HandleFunc("GET /api/v1/users/{user_id}/token-deposits", application.requireAdminAuth(application.listTokenDeposits))
-	mux.HandleFunc("GET /api/v1/users/{user_id}/withdrawals", application.requireAdminAuth(application.listWithdrawals))
-	mux.HandleFunc("GET /api/v1/users/{user_id}/token-withdrawals", application.requireAdminAuth(application.listTokenWithdrawals))
-	mux.HandleFunc("POST /api/v1/users/{user_id}/withdrawal-quote", application.requireAdminAuth(application.quoteWithdrawal))
-	mux.HandleFunc("POST /api/v1/users/{user_id}/withdrawals", application.requireAdminAuth(application.createWithdrawal))
-	if application.tokenWithdrawals != nil {
-		mux.HandleFunc("POST /api/v1/users/{user_id}/token-withdrawal-quote", application.requireAdminAuth(application.quoteTokenWithdrawal))
-		mux.HandleFunc("POST /api/v1/users/{user_id}/token-withdrawals", application.requireAdminAuth(application.createTokenWithdrawal))
+	mux.HandleFunc("GET /api/v1/auth/me", a.requireAdminAuth(a.me))
+	mux.HandleFunc("GET /api/v1/users", a.requireAdminAuth(a.listUsers))
+	mux.HandleFunc("POST /api/v1/users", a.requireAdminAuth(a.createUser))
+	mux.HandleFunc("PATCH /api/v1/users/{user_id}", a.requireAdminAuth(a.updateUser))
+	mux.HandleFunc("GET /api/v1/assets", a.requireAdminAuth(a.listAssets))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/wallet", a.requireAdminAuth(a.getWallet))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-wallet", a.requireAdminAuth(a.getBitcoinWallet))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/btc-deposits", a.requireAdminAuth(a.listBitcoinDeposits))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/balances", a.requireAdminAuth(a.listUserBalances))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/deposits", a.requireAdminAuth(a.listDeposits))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/token-deposits", a.requireAdminAuth(a.listTokenDeposits))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/withdrawals", a.requireAdminAuth(a.listWithdrawals))
+	mux.HandleFunc("GET /api/v1/users/{user_id}/token-withdrawals", a.requireAdminAuth(a.listTokenWithdrawals))
+	mux.HandleFunc("POST /api/v1/users/{user_id}/withdrawal-quote", a.requireAdminAuth(a.quoteWithdrawal))
+	mux.HandleFunc("POST /api/v1/users/{user_id}/withdrawals", a.requireAdminAuth(a.createWithdrawal))
+	if a.tokenWithdrawals != nil {
+		mux.HandleFunc("POST /api/v1/users/{user_id}/token-withdrawal-quote", a.requireAdminAuth(a.quoteTokenWithdrawal))
+		mux.HandleFunc("POST /api/v1/users/{user_id}/token-withdrawals", a.requireAdminAuth(a.createTokenWithdrawal))
 	}
-	mux.HandleFunc("GET /api/v1/withdrawals/{withdrawal_id}", application.requireAdminAuth(application.getWithdrawal))
-	mux.HandleFunc("GET /api/v1/token-withdrawals/{withdrawal_id}", application.requireAdminAuth(application.getTokenWithdrawal))
-	mux.HandleFunc("GET /api/v1/transactions", application.requireAdminAuth(application.listTransactions))
-	mux.HandleFunc("GET /api/v1/sweeps", application.requireAdminAuth(application.listTokenSweeps))
-	mux.HandleFunc("GET /api/v1/btc/sweeps", application.requireAdminAuth(application.listBitcoinSweeps))
-	if application.bitcoinWithdrawals != nil {
-		mux.HandleFunc("POST /api/v1/users/{user_id}/btc-withdrawals", application.requireAdminAuth(application.createBitcoinWithdrawal))
-		mux.HandleFunc("GET /api/v1/users/{user_id}/btc-withdrawals", application.requireAdminAuth(application.listBitcoinWithdrawals))
-		mux.HandleFunc("GET /api/v1/btc-withdrawals/{withdrawal_id}", application.requireAdminAuth(application.getBitcoinWithdrawal))
+	mux.HandleFunc("GET /api/v1/withdrawals/{withdrawal_id}", a.requireAdminAuth(a.getWithdrawal))
+	mux.HandleFunc("GET /api/v1/token-withdrawals/{withdrawal_id}", a.requireAdminAuth(a.getTokenWithdrawal))
+	mux.HandleFunc("GET /api/v1/transactions", a.requireAdminAuth(a.listTransactions))
+	mux.HandleFunc("GET /api/v1/sweeps", a.requireAdminAuth(a.listTokenSweeps))
+	mux.HandleFunc("GET /api/v1/btc/sweeps", a.requireAdminAuth(a.listBitcoinSweeps))
+	if a.bitcoinWithdrawals != nil {
+		mux.HandleFunc("POST /api/v1/users/{user_id}/btc-withdrawals", a.requireAdminAuth(a.createBitcoinWithdrawal))
+		mux.HandleFunc("GET /api/v1/users/{user_id}/btc-withdrawals", a.requireAdminAuth(a.listBitcoinWithdrawals))
+		mux.HandleFunc("GET /api/v1/btc-withdrawals/{withdrawal_id}", a.requireAdminAuth(a.getBitcoinWithdrawal))
 	}
-	mux.HandleFunc("GET /api/v1/internal-transfers", application.requireAdminAuth(application.listInternalTransfers))
-	mux.HandleFunc("GET /api/v1/system/platform-wallet", application.requireAdminAuth(application.getPlatformWalletStatus))
-	mux.HandleFunc("GET /api/v1/system/chains/sepolia", application.requireAdminAuth(application.getChainStatus))
-	mux.HandleFunc("GET /api/v1/worker-errors", application.requireAdminAuth(application.listWorkerErrors))
-	application.server = &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           application.requestContext(mux),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       cfg.HTTP.ReadTimeout,
-		WriteTimeout:      cfg.HTTP.WriteTimeout,
-		IdleTimeout:       cfg.HTTP.IdleTimeout,
-	}
-	failed = false
-	chainFailed = false
-	return application, nil
+	mux.HandleFunc("GET /api/v1/internal-transfers", a.requireAdminAuth(a.listInternalTransfers))
+	mux.HandleFunc("GET /api/v1/system/platform-wallet", a.requireAdminAuth(a.getPlatformWalletStatus))
+	mux.HandleFunc("GET /api/v1/system/chains/sepolia", a.requireAdminAuth(a.getChainStatus))
+	mux.HandleFunc("GET /api/v1/worker-errors", a.requireAdminAuth(a.listWorkerErrors))
+	return mux
 }
 
 // Run 启动 HTTP、充值扫描和提币 Worker，并在任一关键组件停止时统一关闭。
