@@ -3,6 +3,7 @@
 > 覆盖 BTC、ETH、ERC-20（三种方案）、SOL、SPL 代币，从「充值上链 → 检测入账 → 归集 → 热转冷」的完整链路。
 > 图为 Mermaid 时序图：GitHub / GitLab 可以直接渲染，VS Code 需要安装 Markdown Preview Mermaid Support 插件。
 > 内容是行业主流方案，仅用于学习演示，不代表本项目的实现。图中序号与下方「步骤说明」表的序号一一对应。
+> 面试复习见 [sweep-interview-qa.md](./sweep-interview-qa.md)（问答速记）和 [sweep-interview-deep-dive.md](./sweep-interview-deep-dive.md)（重点问题深度解析）。
 
 ---
 
@@ -48,16 +49,16 @@
 
 ```mermaid
 flowchart TD
-    A[待归集资产] --> B{资金模型}
-    B -->|UTXO| C["BTC：多输入合并为一笔交易<br/>手续费从输入里扣"]
-    B -->|账户| D{原生币还是代币?}
-    D -->|原生币| E["ETH：每个地址一笔交易<br/>转出 = 余额 − 手续费"]
-    D -->|代币| F{链是否原生支持 Fee Payer?}
-    F -->|是| G["SOL / SPL：平台钱包当 fee payer<br/>批量指令，可转空，SPL 可回收租金"]
-    F -->|否 · EVM| H{方案}
-    H --> H1["① 经典：Gas 钱包先补 ETH<br/>再 transfer（每个地址 2 笔交易）"]
-    H --> H2["② CREATE2 转发合约<br/>Operator 一笔批量部署并 flush"]
-    H --> H3["③ EIP-7702<br/>EOA 签授权，Sponsor 代付批量归集"]
+    A["待归集资产"] --> B{"资金模型"}
+    B -->|UTXO| C["BTC：多输入合并为一笔交易<br>手续费从输入里扣"]
+    B -->|账户| D{"原生币还是代币?"}
+    D -->|原生币| E["ETH：每个地址一笔交易<br>转出 = 余额 - 手续费"]
+    D -->|代币| F{"链是否原生支持 Fee Payer?"}
+    F -->|是| G["SOL / SPL：平台钱包当 fee payer<br>批量指令，可转空，SPL 可回收租金"]
+    F -->|否 EVM| H{"归集方案"}
+    H --> H1["① 经典：Gas 钱包先补 ETH<br>再 transfer（每个地址 2 笔交易）"]
+    H --> H2["② CREATE2 转发合约<br>Operator 一笔批量部署并 flush"]
+    H --> H3["③ EIP-7702<br>EOA 签授权，Sponsor 代付批量归集"]
 ```
 
 ---
@@ -85,7 +86,7 @@ sequenceDiagram
     participant W as 归集服务
     participant K as 签名服务
     participant H as 热钱包
-    participant CW as 冷钱包(多签)
+    participant CW as 冷钱包（多签）
 
     rect rgba(88,166,255,0.12)
     Note over U,C: ① 充值上链
@@ -174,14 +175,14 @@ fee   = 246 vB × 15 sat/vB = 3,690 sat   （输入总额 − 输出 = 手续费
 sequenceDiagram
     autonumber
     participant U as 用户
-    participant D as 充值地址(EOA)
+    participant D as 充值地址（EOA）
     participant C as 以太坊
     participant S as 扫块服务
     participant L as 账务/风控
     participant W as 归集服务
     participant K as 签名服务
     participant H as 热钱包
-    participant CW as 冷钱包(Safe)
+    participant CW as 冷钱包（Safe）
 
     rect rgba(88,166,255,0.12)
     Note over U,C: ① 充值上链
@@ -257,7 +258,7 @@ ERC-20 代币（USDT、USDC 等）的余额**记在代币合约里**，转代币
 sequenceDiagram
     autonumber
     participant U as 用户
-    participant D as 充值地址(EOA)
+    participant D as 充值地址（EOA）
     participant C as 以太坊
     participant S as 扫块服务
     participant L as 账务/风控
@@ -265,7 +266,7 @@ sequenceDiagram
     participant G as Gas 钱包
     participant K as 签名服务
     participant H as 热钱包
-    participant CW as 冷钱包(Safe)
+    participant CW as 冷钱包（Safe）
 
     rect rgba(88,166,255,0.12)
     Note over U,C: ① 充值上链
@@ -345,11 +346,11 @@ sequenceDiagram
     participant L as 账务/风控
     participant U as 用户
     participant C as 以太坊
-    participant F as 充值地址(转发合约)
+    participant F as 充值地址（转发合约）
     participant S as 扫块服务
     participant W as 归集服务
     participant K as 签名服务
-    participant O as Operator(Gas 钱包)
+    participant O as Operator（Gas 钱包）
     participant H as 热钱包
 
     rect rgba(88,166,255,0.12)
@@ -418,11 +419,11 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant D as 充值地址(EOA)
+    participant D as 充值地址（EOA）
     participant L as 账务/风控
     participant W as 归集服务
     participant K as 签名服务
-    participant SP as Sponsor(Gas 钱包)
+    participant SP as Sponsor（Gas 钱包）
     participant C as 以太坊
     participant H as 热钱包
 
@@ -436,7 +437,7 @@ sequenceDiagram
     K-->>W: Sponsor 私钥签名
     W->>SP: 交给 Sponsor 发送
     SP->>C: 广播，Sponsor 代付 Gas
-    C->>D: 设置账户代码 = 0xef0100 ‖ SweepDelegate
+    C->>D: 设置账户代码 = 0xef0100 || SweepDelegate
     D->>H: 以充值地址身份执行 sweep → USDT.transfer(热钱包, 余额)
     W->>L: 核销归集单
     end
@@ -499,9 +500,9 @@ sequenceDiagram
     participant L as 账务/风控
     participant W as 归集服务
     participant K as 签名服务
-    participant G as Gas 钱包(fee payer)
+    participant G as Gas 钱包（fee payer）
     participant H as 热钱包
-    participant CW as 冷钱包(Squads)
+    participant CW as 冷钱包（Squads）
 
     rect rgba(88,166,255,0.12)
     Note over U,C: ① 充值上链
@@ -580,7 +581,7 @@ sequenceDiagram
     participant L as 账务/风控
     participant W as 归集服务
     participant K as 签名服务
-    participant G as Gas 钱包(fee payer)
+    participant G as Gas 钱包（fee payer）
     participant H as 热钱包 ATA
     participant CW as 冷钱包 ATA
 
@@ -611,7 +612,7 @@ sequenceDiagram
     Note over L,CW: ④ 热转冷
     L->>L: 检查热钱包水位，超过上限
     L->>K: 发起热转冷
-    K->>C: 热钱包签名 transferChecked(→ 冷钱包 ATA)
+    K->>C: 热钱包签名 transferChecked（→ 冷钱包 ATA）
     C->>CW: 冷钱包入库
     end
 ```
@@ -683,7 +684,7 @@ stateDiagram-v2
     Built --> Signed
     Signed --> Broadcast
     Broadcast --> Confirmed
-    Broadcast --> Failed: 超时 / 被替换 / 回滚
+    Broadcast --> Failed: 超时、被替换或回滚
     Failed --> Pending: 自动重试
     Failed --> Manual: 多次失败
     Confirmed --> [*]
