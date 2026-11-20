@@ -365,3 +365,133 @@ BROADCAST_UNKNOWN ──> 重播原 raw_tx（保持相同 tx_hash）
 2. **多候选 Hash 确认扫描**：`confirm()` 遍历该笔业务对应的全部 `evm_tx_attempts` 记录（倒序优先查最新加价交易），任一 `tx_hash` 查到 Receipt 即视为该交易最终上链，回写主表最终 `tx_hash` 并按其 `GasUsed * EffectiveGasPrice` 结算实际费用。
 3. **Nonce 越过检测**：发送或查询时若遇到 `nonce too low`，或者通过 `PendingNonceAt` / `NonceAt`（confirmed nonce）发现链上已确认 nonce `> item.Nonce`，先遍历检查全部 `evm_tx_attempts` 的 Receipt；若全部为 `ethereum.NotFound`，说明同 nonce 已被外部交易占用或丢失，立即迁移至 `MANUAL_REVIEW` 并写入 `worker_errors`。
 
+
+---
+
+## 9. 第二轮修复（2026-11-20 复核遗留）
+
+> 复核基于 HEAD `085c2c5`。结论：A1/A3/A4/B3/C/D/E/F 主体正确；A2、A5、B1、B2 部分完成，另有新引入的阻塞问题。
+> 现状：迁移实际已用到 `000008`（000005 为管理员鉴权，000008 为性能索引，与第 0 节表格不同，以实际为准）。本轮新迁移从 `000009` 开始，编号见各批次。
+> 已存在迁移的 up 文件不得修改；仅允许按 J5 修改 `000007` 的 down 文件。
+
+| 批次 | 内容 | 主要文件 | 迁移号 | 依赖 |
+|------|------|----------|--------|------|
+| G | BTC 遗留（含阻塞问题） | `internal/chain/bitcoin`、`internal/btc`、`store/postgres/bitcoin*.go` | 000010（如需要） | 无，最先做 |
+| H | EVM 加价与 nonce 遗留 | `internal/withdrawal`、`internal/token/*/worker.go`、`chain/evm/worker_helpers.go`、`balance_withdrawal_transaction.go` | 000009 | 无 |
+| I | 扫描器漏账风险 | `internal/deposit/scanner.go`、`internal/token/deposit/scanner.go`、`internal/btc/scanner_worker.go`、`repository.go` | 无 | BTC 扫描部分等 G 合并 |
+| J | 鉴权与运维遗留 | `internal/app/auth_handler.go`、`app.go`、`internal/config`、`migrations/000007_*.down.sql` | 000011（如需要） | 无 |
+
+G、H、J 可以并行；I 的 EVM 部分可以并行，BTC 部分等 G 合并后再做。
+
+### 批次 G：BTC 遗留
+
+- **G1（阻塞，最高优先级）BTC RPC 错误解析**
+  - 问题：`internal/chain/bitcoin/client.go:219` 用的是 `jsonrpc 1.0`，Bitcoin Core 对这种请求出错时返回 HTTP 500；而 `:240` 遇到非 200 直接报错，不解析响应体。结果 -5（交易不存在）永远解析不出来，A2 新增的"按 txid 查链"在交易不存在时一律报错，SIGNED 和 BROADCAST_UNKNOWN 的提币、归集全部卡住。
+  - 方案：非 200 时也尝试解析 body 中的 `error` 并返回 `*RPCError`，解析不了再报 HTTP 状态错误。`internal/btc/withdrawal_worker.go:195-197` 删除 `"not found"` 子串匹配，只认 code -5。部署文档写明节点需要 `txindex=1`。
+  - 验收：用 `httptest` 模拟 Bitcoin Core 返回 HTTP 500 + `{"error":{"code":-5,...}}`，断言得到 `*RPCError{Code:-5}`；worker 测试改为走真实 client + httptest，而不是 fake 直接返回 RPCError。
+- **G2 `ReleaseExpiredBTCUTXOLocks` 删除或收紧**（`store/postgres/bitcoin.go:671-677`）：它不看单据状态就释放过期锁。改为只释放 FAILED 单据或已不存在单据的锁；如果没有使用场景就直接删除，同时删除对应测试。**选择说明**：已选择直接删除 `ReleaseExpiredBTCUTXOLocks`（全仓没有任何调用方与测试依赖，且按租约过期释放会绕过单据状态检查，对已签名/广播未知提币带来重复选币风险）。
+- **G3 完成时按快照消耗 UTXO**：`CompleteBTCWithdrawal`（`bitcoin_withdrawal_worker.go:377-382`）和 `CompleteBTCSweep`（`bitcoin.go:157`）改为按 `selected_inputs_json` 或归集记录里的 UTXO ID 更新为 SPENT，并要求 RowsAffected 等于输入数，不相等就回滚并转 MANUAL_REVIEW。
+- **G4 vsize 估算**（`internal/btc/select.go:10-20`）：overhead 计入 segwit marker/flag，结果向上取整；补一个 1 输入 2 输出 = 141 vB 的单测。
+- **G5 选币锁范围**（`bitcoin_withdrawal_worker.go:105-114`）：改为先不加锁按金额取有限条候选（例如前 50 条），再对选中的行做 `FOR UPDATE SKIP LOCKED` 并复核。
+- **G6 归集 dust 收口**（`internal/btc/sweep_worker.go:90-93`）：金额不足以支付手续费或低于 dust 时，调用 `FailBTCSweep` 并写入一条 worker_errors，不再每轮重试。
+- **G7 补测试**：
+  - 存在 USER_DEPOSIT 的 UNSPENT UTXO 时，提币不会选中它；
+  - `CompleteBTCWithdrawal` 拒绝 FAILED 和 CREATED 状态；
+  - `CompleteBTCSweep` 重复调用是幂等的。
+
+### 批次 H：EVM 加价与 nonce 遗留
+
+- **H1 加价失败退回重播并且只告警一次**
+  - 问题：`internal/withdrawal/worker.go:497-499,528-530`、`token/withdrawal/worker.go:586`、`token/sweep/worker.go:685`、`token/gasstation/worker.go:650` 中，加价时余额不足就 `return nil`。之后每轮都重新签名、写一条 worker_errors，而且不再重播原交易。`EVM_BUMP_FEE_CAP_EXCEEDED` 也是每轮都写。
+  - 方案：
+    - 加价前先校验余额，校验不过就不签名；
+    - 加价失败后，如果达到重播间隔就走 `rebroadcast`；
+    - 持久化 `bump_blocked_at` 和原因，同一原因只写一次 worker_errors；
+    - 持续阻塞超过配置阈值后转 MANUAL_REVIEW。
+  - 四条链路都要改，优先在 `worker_helpers.go` 里统一实现。
+- **H2 归集加价补气**：归集需要加价而地址 ETH 不足时，先创建一笔追加补气任务（复用 Gas Station 流程），补气到账后再加价；或者把归集的最大加价次数限制在补气安全余量能覆盖的范围内，二选一，并在本节写明选择。
+- **H3 分配 nonce 后不再调用会失败的 RPC**
+  - 问题：`withdrawal/worker.go:180`、`token/withdrawal/worker.go:190`、`token/sweep/worker.go:244` 在 `sign()` 里重新调用 EstimateGas。
+  - 方案：
+    - 在 prepare 阶段（分配 nonce 的同一个事务里）把 gasLimit、maxFee、tip 落库，sign 只读这些值做签名；
+    - `worker_helpers.go:352-401` 的内存失败计数改为持久化，超过阈值后转 MANUAL_REVIEW，不要只在内存里暂停。
+- **H4 重签不得超过冻结的预留费**（`withdrawal/worker.go:180-209`、`SaveSignedWithdrawal`）：恢复路径重签时，如果 `gasLimit×maxFee > reserved_fee_wei`，先调用 `IncreaseWithdrawalFee`；余额不足就把 feeCap 限制在冻结额以内。保证 `FinalizeWithdrawal` 不会出现 `ErrActualFeeExceedsHold`。
+- **H5 迁移 000009 回填存量数据**：
+  - 已有 tx_hash 但没有 attempt 记录的单子，插入 `attempt_no=1` 的 evm_tx_attempts；
+  - `broadcasted_at` 和 `last_broadcast_at` 回填为 `COALESCE(..., updated_at)`；
+  - 四张业务表都要处理；
+  - down 只删除回填产生的数据。
+- **H6 Gas Station 余额校验**（`token/gasstation/worker.go:231`）：分配 nonce 前，校验平台余额不少于 `补气金额 + gasLimit×maxFee + PlatformMinBalanceWei`。
+- **H7 补测试**：
+  - 广播时遇到 nonce too low；
+  - ETH 加价时用户余额不足（断言只写一次错误并且会重播）；
+  - 带存量数据执行迁移 000009；
+  - insufficient funds 和 nonce too low 不触发端点切换。
+
+### 批次 I：扫描器漏账风险
+
+- **I1 地址增量加载会漏地址**（`repository.go:282`，`deposit/scanner.go:216-231`，token 扫描器 `:240`）
+  - 问题：`id > lastAddressID` 依赖自增 ID 的提交顺序，并发事务下 ID 较小的地址可能晚提交，从而被永久跳过。
+  - 方案：增量查询改为回看窗口，例如 `id > lastAddressID - 1000` 或 `created_at > 上次时间 - 5 分钟`，再在内存里去重；同时每 N 轮做一次全量刷新。
+- **I2 Token 扫描逐条核对日志区块**（`token/deposit/scanner.go:374-376、389、437-445`）：getLogs 返回的每条日志，都要用对应块高的区块头核对 BlockHash，不一致就视为重组，本批不提交。末块区块头要在 getLogs 之后再校验一次。
+- **I3 扫块失败不阻塞确认入账**（`deposit/scanner.go:183-185`、token 扫描器 `:205-207`、`btc/scanner_worker.go:111-127`）：扫块阶段出错后，本轮仍然执行 confirm 和入账阶段，只跳过扫块。
+- **I4 BTC 回退的健壮性**（G 合并后做）：
+  - `btc/scanner_worker.go:162-168`：查询回退目标块哈希失败时直接返回错误，只有回退成功才执行孤立；
+  - `bitcoin.go:270`：单个用户待确认余额不足时，不要让整个回退失败，只把该笔转 MANUAL_REVIEW 并告警；
+  - 回退时只孤立区块哈希确实变化了的充值。
+- **I5 回退深度校验**（`config.go:222、238`）：启动时校验 `REORG_REWIND_BLOCKS ≥ 确认数`。
+- **I6 重组核对不依赖本轮扫块**（`deposit/scanner.go:310`）：已入账充值的重组核对改为独立执行，分批循环直到处理完，不受 confirmBatchSize 限制，也不依赖本轮有没有扫块。
+
+### 批次 J：鉴权与运维遗留
+
+- **J1 登录限流和锁定**（`internal/app/auth_handler.go:74-105`）：按 IP + 用户名做令牌桶限流（参数从配置读取）；连续失败 N 次后锁定一段时间。锁定状态可以放内存或落库（落库用迁移 000011），在本节写明选择。
+- **J2 防账号枚举**（`auth_handler.go:88-100`）：用户不存在时也和一个固定的 dummy hash 做 bcrypt 比较；先校验密码，再判断是否禁用，并且用户不存在、密码错误、账号被禁用统一返回同一个错误码。
+- **J3 禁用后令牌立即失效**（`auth_handler.go:271-283`）：中间件验签后查询管理员是否 disabled，可以带短 TTL 的内存缓存；也可以在 token 里写入 `token_version`，禁用或改密时版本号加 1。
+- **J4 健康检查不泄漏内部信息**（`app.go:338-340、581-617`）：未鉴权的 healthz/readyz 只返回状态枚举；`*_last_error` 和 `btcErr.Error()` 只放在需要鉴权的系统状态接口里。
+- **J5 `000007` 的 down 改为显式拒绝**：down 中先检查是否存在 ORPHANED 充值或 DEPOSIT_REVERSAL 流水，存在就 `RAISE EXCEPTION` 说明不可回滚，不要直接删数据。
+- **J6 小项**：
+  - API Key 通道不要硬编码 `AdminID: 1`（`auth_handler.go:255`），改为配置项或专用的系统管理员；
+  - API_KEY 要求至少 32 字节；
+  - `ReadHeaderTimeout` 和关闭超时改为从配置读取（`app.go:154、455`）；
+  - Shutdown 失败时用 `errors.Join` 保留先退出组件的错误（`app.go:454-457`）；
+  - 等待 worker 超时后记录哪些组件没有退出；
+  - 000008 的索引说明：生产大表要用 `CREATE INDEX CONCURRENTLY` 单独执行（在部署文档里写明）。
+
+### 第二轮通用提示词补充（拼在第 1 节前缀之后）
+
+```text
+这是第二轮修复，针对的是复核发现的遗留问题，详见 docs/development/backend-remediation-plan.md 第 9 节。
+1. 本轮新增迁移从 000009 开始，只使用分配给你的版本号；已存在迁移的 up 文件不得修改。
+2. 每个问题先写一个能复现的失败测试（集成测试用真实 PostgreSQL：TEST_DATABASE_URL，本地可用 deploy/compose.yaml 启动的库），再修改代码。
+3. 不要用 fake 直接返回期望的错误类型来"证明"修复。涉及 RPC 错误解析的测试，必须用 httptest 模拟真实节点的 HTTP 响应。
+4. 完成后贴出 go vet ./...、go test ./...、TEST_DATABASE_URL=... go test -count=1 ./internal/store/postgres ./migrations 的结果。
+   internal/wallet 的文件权限测试在 Windows 上本来就会失败，不需要处理，但要在报告里注明。
+```
+
+### 各批次提示词
+
+```text
+<第 1 节前缀> + <第二轮补充>
+你负责批次 G（BTC 遗留），按 G1 → G7 完成。G1 是阻塞问题，先单独提交一次。G2 选择删除还是收紧，在第 9 节 G2 条目后补一句说明。
+```
+
+```text
+<第 1 节前缀> + <第二轮补充>
+你负责批次 H（EVM 加价与 nonce 遗留），按 H1 → H7 完成，迁移号使用 000009。
+H1、H3 的改动优先放进 chain/evm/worker_helpers.go，四条链路（ETH 提币、Token 提币、Token 归集、Gas Station）统一使用，不要每条链路各写一份。
+H2 先在第 9 节写明选择的方案，再实现。
+```
+
+```text
+<第 1 节前缀> + <第二轮补充>
+你负责批次 I（扫描器漏账风险），先完成 I1、I2、I3（EVM 部分）、I5、I6。
+I3 的 BTC 部分和 I4 要等批次 G 合并后再做：开始前用 git log 确认，没有合并就停下来告诉用户。
+每一项都要有一个测试，证明在修复前会漏账或卡住。
+```
+
+```text
+<第 1 节前缀> + <第二轮补充>
+你负责批次 J（鉴权与运维遗留），按 J1 → J6 完成；如果需要新表，迁移号使用 000011。
+J1 的锁定状态放内存还是落库，先在第 9 节写明，再实现。
+修改登录接口的错误码时同步更新 docs/api.md，并列出前端受影响的位置，但不要修改前端代码。
+```

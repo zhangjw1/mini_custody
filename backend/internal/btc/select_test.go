@@ -68,3 +68,14 @@ func TestSelectUTXOsBoundaries(t *testing.T) {
 		}
 	})
 }
+
+// TestEstimateVSizeAccountsForSegwitMarkerFlag 验证 P2WPKH vSize 计入 SegWit marker/flag 并向上取整。
+func TestEstimateVSizeAccountsForSegwitMarkerFlag(t *testing.T) {
+	vsize, err := EstimateVSize(1, 2)
+	if err != nil {
+		t.Fatalf("EstimateVSize(1, 2) error = %v", err)
+	}
+	if vsize != 141 {
+		t.Fatalf("EstimateVSize(1, 2) = %d, want 141", vsize)
+	}
+}

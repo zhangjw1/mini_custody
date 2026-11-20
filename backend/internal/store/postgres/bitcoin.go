@@ -97,6 +97,16 @@ func (s *Store) FailBTCSweep(ctx context.Context, id int64, code, message string
 	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='UNSPENT', locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND status='LOCKED'`, utxoID); err != nil {
 		return err
 	}
+	if err = insertWorkerErrorInTx(ctx, tx, WorkerError{
+		Worker:        "btc-sweep-worker",
+		Stage:         "build",
+		ReferenceType: "BTC_SWEEP",
+		ReferenceID:   &id,
+		ErrorCode:     strings.TrimSpace(code),
+		ErrorMessage:  strings.TrimSpace(message),
+	}); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -154,10 +164,49 @@ func (s *Store) CompleteBTCSweep(ctx context.Context, id, confirmations, blockHe
 	if _, err = tx.Exec(ctx, `UPDATE btc_sweeps SET status='COMPLETED', confirmations=GREATEST(confirmations,$2), block_height=$3, updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND status IN ('BROADCASTED','CONFIRMING')`, id, confirmations, blockHeight); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE btc_utxos SET status='SPENT', spend_txid=(SELECT txid FROM btc_sweeps WHERE id=$1), locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND status='LOCKED'`, id, utxoID); err != nil {
+	consumeCmd, err := tx.Exec(ctx, `UPDATE btc_utxos SET status='SPENT', spend_txid=(SELECT txid FROM btc_sweeps WHERE id=$1), locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND status='LOCKED'`, id, utxoID)
+	if err != nil {
 		return err
 	}
+	if consumeCmd.RowsAffected() != 1 {
+		_ = tx.Rollback(context.Background())
+		reason := fmt.Sprintf("BTC 归集完成时 UTXO(%d) 消耗行数=%d，与预期 1 不符，已回滚并转人工核查", utxoID, consumeCmd.RowsAffected())
+		if markErr := s.markBTCSweepManualReviewOnConsumeMismatch(ctx, id, reason); markErr != nil {
+			return errors.Join(errors.New(reason), markErr)
+		}
+		return errors.New(reason)
+	}
 	if _, err = tx.Exec(ctx, `INSERT INTO btc_utxos(deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) SELECT NULL,s.to_address_id,$2,s.txid,0,s.output_value_sats,a.script_pub_key,$3,'UNSPENT' FROM btc_sweeps s JOIN btc_addresses a ON a.id=s.to_address_id WHERE s.id=$1 ON CONFLICT(network,txid,vout) WHERE status <> 'UNKNOWN' DO NOTHING`, id, NetworkBitcoinSignet, blockHeight); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// markBTCSweepManualReviewOnConsumeMismatch 在独立事务中将 UTXO 消耗数量异常的归集转入人工核查并写入告警。
+func (s *Store) markBTCSweepManualReviewOnConsumeMismatch(ctx context.Context, id int64, reason string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	cmd, err := tx.Exec(ctx, `
+		UPDATE btc_sweeps
+		SET status='MANUAL_REVIEW', error_code='UTXO_CONSUME_MISMATCH', error_message=$2, updated_at=CURRENT_TIMESTAMP
+		WHERE id=$1 AND status IN ('BROADCASTED','CONFIRMING')`, id, reason)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() != 1 {
+		return ErrInvalidState
+	}
+	if err := insertWorkerErrorInTx(ctx, tx, WorkerError{
+		Worker:        "btc-sweep-worker",
+		Stage:         "confirm",
+		ReferenceType: "BTC_SWEEP",
+		ReferenceID:   &id,
+		ErrorCode:     "UTXO_CONSUME_MISMATCH",
+		ErrorMessage:  reason,
+	}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -665,16 +714,6 @@ func lockDepositUTXOAndCreateSweepInTx(ctx context.Context, tx pgx.Tx, depositID
 		return err
 	}
 	return nil
-}
-
-// ReleaseExpiredBTCUTXOLocks 仅释放提币租约超时的 UTXO 锁，绝不释放归集锁。
-func (s *Store) ReleaseExpiredBTCUTXOLocks(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE btc_utxos
-		SET status=$3, locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP
-		WHERE status=$4 AND locked_until<CURRENT_TIMESTAMP AND locked_by<>$1 AND locked_by LIKE $2`,
-		btc.SweepLockBy, btc.WithdrawalLockPrefix+"%", btc.UTXOStatusUnspent, btc.UTXOStatusLocked)
-	return err
 }
 
 // CreateBTCWithdrawal 幂等创建提币并在用户余额行锁下占用金额。

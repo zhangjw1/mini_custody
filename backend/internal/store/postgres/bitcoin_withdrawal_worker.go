@@ -17,7 +17,10 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/btc"
 )
 
-const btcUTXOLockInterval = "10 minutes"
+const (
+	btcUTXOLockInterval       = "10 minutes"
+	btcCandidateSelectionRows = 50
+)
 
 // ListProcessableBTCWithdrawals 查询可恢复 BTC 提币任务。
 func (s *Store) ListProcessableBTCWithdrawals(ctx context.Context, limit int) ([]btc.Withdrawal, error) {
@@ -102,6 +105,7 @@ func (s *Store) LockWithdrawalInputs(ctx context.Context, id, amount int64, lock
 		return nil, nil, nil, nil, ErrInvalidState
 	}
 
+	// 第一步先不加锁按金额降序拉取有限条候选，避免全表扫描与全局行锁。
 	rows, err := tx.Query(ctx, `
 		SELECT u.id, u.txid, u.vout, u.value_sats, u.script_pub_key, u.block_height, a.derivation_path
 		FROM btc_utxos u
@@ -110,15 +114,14 @@ func (s *Store) LockWithdrawalInputs(ctx context.Context, id, amount int64, lock
 		  AND u.status = 'UNSPENT'
 		  AND a.purpose = $2
 		  AND a.enabled
-		ORDER BY u.block_height, u.id
-		FOR UPDATE OF u SKIP LOCKED`, NetworkBitcoinSignet, btc.AddressPurposePlatformChange)
+		ORDER BY u.value_sats DESC, u.block_height ASC, u.id ASC
+		LIMIT $3`, NetworkBitcoinSignet, btc.AddressPurposePlatformChange, btcCandidateSelectionRows)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 	defer rows.Close()
 
-	all := make([]btc.UTXO, 0)
-	paths := make(map[int64]string)
+	candidates := make([]btc.UTXO, 0)
 	for rows.Next() {
 		var u btc.UTXO
 		var script, path string
@@ -129,15 +132,63 @@ func (s *Store) LockWithdrawalInputs(ctx context.Context, id, amount int64, lock
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
-		all = append(all, u)
-		paths[u.ID] = path
+		candidates = append(candidates, u)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	rows.Close()
 
-	chosen, _, err := btc.SelectUTXOs(all, amount, rate)
+	preselected, _, err := btc.SelectUTXOs(candidates, amount, rate)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	chosenIDs := make([]int64, 0, len(preselected))
+	for _, u := range preselected {
+		chosenIDs = append(chosenIDs, u.ID)
+	}
+
+	// 第二步仅对预选中的目标 UTXO ID 加 FOR UPDATE SKIP LOCKED 并复核状态与金额。
+	lockedRows, err := tx.Query(ctx, `
+		SELECT u.id, u.txid, u.vout, u.value_sats, u.script_pub_key, u.block_height, a.derivation_path
+		FROM btc_utxos u
+		JOIN btc_addresses a ON a.id = u.address_id
+		WHERE u.id = ANY($1)
+		  AND u.network = $2
+		  AND u.status = 'UNSPENT'
+		  AND a.purpose = $3
+		  AND a.enabled
+		ORDER BY u.value_sats DESC, u.block_height ASC, u.id ASC
+		FOR UPDATE OF u SKIP LOCKED`, chosenIDs, NetworkBitcoinSignet, btc.AddressPurposePlatformChange)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	defer lockedRows.Close()
+
+	lockedUTXOs := make([]btc.UTXO, 0, len(chosenIDs))
+	paths := make(map[int64]string, len(chosenIDs))
+	for lockedRows.Next() {
+		var u btc.UTXO
+		var script, path string
+		if err = lockedRows.Scan(&u.ID, &u.TxID, &u.Vout, &u.ValueSats, &script, &u.BlockHeight, &path); err != nil {
+			return nil, nil, nil, nil, err
+		}
+		u.ScriptPubKey, err = hex.DecodeString(script)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		lockedUTXOs = append(lockedUTXOs, u)
+		paths[u.ID] = path
+	}
+	if err = lockedRows.Err(); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	lockedRows.Close()
+
+	if len(lockedUTXOs) != len(chosenIDs) {
+		return nil, nil, nil, nil, ErrInvalidState
+	}
+	chosen, _, err := btc.SelectUTXOs(lockedUTXOs, amount, rate)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -311,11 +362,12 @@ func (s *Store) CompleteBTCWithdrawal(ctx context.Context, id, confirmations, he
 
 	var userID, amount, changeSats int64
 	var status, txid string
+	var selectedJSON []byte
 	if err = tx.QueryRow(ctx, `
-		SELECT user_id, amount_sats, change_sats, status, COALESCE(txid, '')
+		SELECT user_id, amount_sats, change_sats, status, COALESCE(txid, ''), COALESCE(selected_inputs_json, '[]'::jsonb)
 		FROM btc_withdrawals
 		WHERE id = $1
-		FOR UPDATE`, id).Scan(&userID, &amount, &changeSats, &status, &txid); err != nil {
+		FOR UPDATE`, id).Scan(&userID, &amount, &changeSats, &status, &txid, &selectedJSON); err != nil {
 		return mapNotFound(err)
 	}
 	if status == btc.WithdrawalCompleted {
@@ -374,11 +426,34 @@ func (s *Store) CompleteBTCWithdrawal(ctx context.Context, id, confirmations, he
 	}, "写入 BTC 提币结算流水"); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `
+	lockedInputs, _, err := decodeLockedInputs(selectedJSON)
+	if err != nil {
+		_ = tx.Rollback(context.Background())
+		reason := fmt.Sprintf("BTC 提币完成时输入快照无效：%v，已回滚并转人工核查", err)
+		if markErr := s.markBTCWithdrawalManualReviewOnConsumeMismatch(ctx, id, reason); markErr != nil {
+			return errors.Join(errors.New(reason), markErr)
+		}
+		return errors.New(reason)
+	}
+	utxoIDs := make([]int64, 0, len(lockedInputs))
+	for _, in := range lockedInputs {
+		utxoIDs = append(utxoIDs, in.ID)
+	}
+	consumeCmd, err := tx.Exec(ctx, `
 		UPDATE btc_utxos
 		SET status = $3, spend_txid = $2, locked_by = NULL, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
-		WHERE status = $4 AND locked_by = $1`, btc.WithdrawalLocker(id), strings.ToLower(txid), btc.UTXOStatusSpent, btc.UTXOStatusLocked); err != nil {
+		WHERE id = ANY($1) AND status = $4 AND locked_by = $5`,
+		utxoIDs, strings.ToLower(txid), btc.UTXOStatusSpent, btc.UTXOStatusLocked, btc.WithdrawalLocker(id))
+	if err != nil {
 		return err
+	}
+	if consumeCmd.RowsAffected() != int64(len(utxoIDs)) {
+		_ = tx.Rollback(context.Background())
+		reason := fmt.Sprintf("BTC 提币完成时 UTXO 消耗行数=%d，与输入快照数量=%d 不符，已回滚并转人工核查", consumeCmd.RowsAffected(), len(utxoIDs))
+		if markErr := s.markBTCWithdrawalManualReviewOnConsumeMismatch(ctx, id, reason); markErr != nil {
+			return errors.Join(errors.New(reason), markErr)
+		}
+		return errors.New(reason)
 	}
 
 	if changeSats > 0 {
@@ -405,6 +480,37 @@ func (s *Store) CompleteBTCWithdrawal(ctx context.Context, id, confirmations, he
 		}
 	}
 
+	return tx.Commit(ctx)
+}
+
+// markBTCWithdrawalManualReviewOnConsumeMismatch 在独立事务中将 UTXO 消耗行数与输入快照不匹配的提币转入人工核查并写告警。
+func (s *Store) markBTCWithdrawalManualReviewOnConsumeMismatch(ctx context.Context, id int64, reason string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	cmd, err := tx.Exec(ctx, `
+		UPDATE btc_withdrawals
+		SET status = $3, error_code = 'UTXO_CONSUME_MISMATCH', error_message = $2, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 AND status IN ($4, $5)`,
+		id, reason, btc.WithdrawalManualReview, btc.WithdrawalBroadcasted, btc.WithdrawalConfirming)
+	if err != nil {
+		return err
+	}
+	if cmd.RowsAffected() != 1 {
+		return ErrInvalidState
+	}
+	if err := insertWorkerErrorInTx(ctx, tx, WorkerError{
+		Worker:        "btc-withdrawal-worker",
+		Stage:         "confirm",
+		ReferenceType: "BTC_WITHDRAWAL",
+		ReferenceID:   &id,
+		ErrorCode:     "UTXO_CONSUME_MISMATCH",
+		ErrorMessage:  reason,
+	}); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 

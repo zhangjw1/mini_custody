@@ -144,3 +144,31 @@ func TestSweepWorkerPersistsBeforeBroadcast(t *testing.T) {
 		t.Fatalf("saved=%d broadcast=%d calls=%d", store.saved, store.broadcasted, chain.sent)
 	}
 }
+
+// TestSweepWorkerFailsDustUTXOAndStopsRetrying 验证金额不足支付手续费或低于 dust 时调用 FailBTCSweep 收口不再阻塞重试。
+func TestSweepWorkerFailsDustUTXOAndStopsRetrying(t *testing.T) {
+	provider, _ := wallet.NewMnemonicKeyProvider(sweepTestMnemonic)
+	source, _ := provider.BitcoinAddress(context.Background(), wallet.BitcoinUserPath(1))
+	target, _ := provider.BitcoinAddress(context.Background(), wallet.BitcoinTreasuryPath)
+	chain := &testBitcoinHTTPChain{}
+
+	for _, sats := range []int64{100, 350} {
+		store := &fakeSweepStore{item: Sweep{
+			ID:     12,
+			Status: SweepCreated,
+			From:   Address{Path: wallet.BitcoinUserPath(1)},
+			To:     Address{ScriptPubKey: target.ScriptPubKey},
+			UTXO:   UTXO{TxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Vout: 0, ValueSats: sats, ScriptPubKey: source.ScriptPubKey},
+		}}
+		worker, err := NewSweepWorker(chain.client(t), store, provider, time.Second, 2, 3, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := worker.Process(context.Background(), store.item); err != nil {
+			t.Fatalf("sats=%d Process() error = %v, want nil after FailBTCSweep", sats, err)
+		}
+		if store.failed != 1 {
+			t.Fatalf("sats=%d failed=%d, want 1", sats, store.failed)
+		}
+	}
+}

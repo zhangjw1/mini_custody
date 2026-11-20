@@ -7,17 +7,20 @@ import (
 )
 
 const (
-	p2wpkhTxOverheadVBytes int64 = 10
-	p2wpkhInputVBytes      int64 = 68
-	p2wpkhOutputVBytes     int64 = 31
+	// P2WPKH 交易权重常量：10B 基础头(40 WU) + 2B SegWit marker/flag(2 WU) = 42 WU；
+	// 单个 P2WPKH 输入 41B*4 + 108B 见证 = 272 WU；单个 P2WPKH 输出 31B*4 = 124 WU。
+	p2wpkhTxHeaderWeight int64 = 42
+	p2wpkhInputWeight    int64 = 272
+	p2wpkhOutputWeight   int64 = 124
 )
 
-// EstimateVSize 计算 P2WPKH 交易的预估虚拟字节大小。
+// EstimateVSize 计算 P2WPKH SegWit 交易的预估虚拟字节大小（计入 marker/flag 并向上取整）。
 func EstimateVSize(inputs, outputs int) (int64, error) {
 	if inputs <= 0 || outputs <= 0 {
 		return 0, errors.New("BTC 交易输入输出数量无效")
 	}
-	return p2wpkhTxOverheadVBytes + p2wpkhInputVBytes*int64(inputs) + p2wpkhOutputVBytes*int64(outputs), nil
+	weight := p2wpkhTxHeaderWeight + p2wpkhInputWeight*int64(inputs) + p2wpkhOutputWeight*int64(outputs)
+	return (weight + 3) / 4, nil
 }
 
 // EstimateFee 统一计算指定输入输出数量与费率下的手续费（satoshi）。

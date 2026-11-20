@@ -89,6 +89,12 @@ func (w *SweepWorker) Process(ctx context.Context, item Sweep) error {
 	case SweepCreated:
 		built, err := BuildSweep(w.provider, item.From.Path, item.UTXO, item.To, w.feeRate)
 		if err != nil {
+			if errors.Is(err, ErrInsufficientSweepValue) {
+				return w.store.FailBTCSweep(ctx, item.ID, "SWEEP_INSUFFICIENT_VALUE", err.Error())
+			}
+			if errors.Is(err, ErrSweepDust) {
+				return w.store.FailBTCSweep(ctx, item.ID, "SWEEP_DUST", err.Error())
+			}
 			return err
 		}
 		persisted, err := w.store.SaveBTCSweepSigned(ctx, item.ID, built.RawTx, built.TxID, built.OutputValueSats, built.FeeSats, built.FeeRateSatVB)
