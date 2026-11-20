@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,14 +15,20 @@ import (
 	"time"
 
 	"github.com/xiaoqi/mini-custody/backend/internal/auth"
+	"github.com/xiaoqi/mini-custody/backend/internal/chain/evm"
 	"github.com/xiaoqi/mini-custody/backend/internal/config"
 	"github.com/xiaoqi/mini-custody/backend/internal/store/postgres"
+	tokendeposit "github.com/xiaoqi/mini-custody/backend/internal/token/deposit"
+	"github.com/xiaoqi/mini-custody/backend/internal/token/gasstation"
+	tokensweep "github.com/xiaoqi/mini-custody/backend/internal/token/sweep"
 	"github.com/xiaoqi/mini-custody/backend/internal/wallet"
 )
 
 // contractStore 为 HTTP API 契约测试提供固定数据。
 type contractStore struct {
-	createdAt time.Time
+	createdAt     time.Time
+	adminDisabled bool
+	adminPwdHash  string
 }
 
 // ListAssets 返回 ETH 和 USDC 测试资产。
@@ -50,10 +57,13 @@ func (c *contractStore) AdminByUsername(_ context.Context, username string) (pos
 	if username != "admin" {
 		return postgres.AdminUser{}, postgres.ErrNotFound
 	}
-	hash, _ := auth.HashPassword("Admin@2026")
+	hash := c.adminPwdHash
+	if hash == "" {
+		hash, _ = auth.HashPassword("Admin@2026")
+	}
 	return postgres.AdminUser{
 		ID: 1, Username: "admin", PasswordHash: hash, DisplayName: "系统管理员",
-		Role: postgres.AdminRole, CreatedAt: c.createdAt, UpdatedAt: c.createdAt,
+		Role: postgres.AdminRole, Disabled: c.adminDisabled, CreatedAt: c.createdAt, UpdatedAt: c.createdAt,
 	}, nil
 }
 
@@ -329,7 +339,7 @@ func TestAdminAuthMiddlewareAndUserManagement(t *testing.T) {
 
 	// 携带配置的 X-API-Key 允许访问管理员接口。
 	apiKeyReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
-	apiKeyReq.Header.Set("X-API-Key", "test-api-key")
+	apiKeyReq.Header.Set("X-API-Key", "test-api-key-0123456789abcdef0123")
 	apiKeyResp := httptest.NewRecorder()
 	handler.ServeHTTP(apiKeyResp, apiKeyReq)
 	if apiKeyResp.Code != http.StatusOK {
@@ -409,7 +419,11 @@ func contractHandler(t *testing.T) http.Handler {
 		t.Fatalf("LoadLocation() error = %v", err)
 	}
 	createdAt := time.Date(2026, 8, 15, 11, 10, 0, 0, location)
-	store := &contractStore{createdAt: createdAt}
+	pwdHash, err := auth.HashPassword("Admin@2026")
+	if err != nil {
+		t.Fatalf("HashPassword() error = %v", err)
+	}
+	store := &contractStore{createdAt: createdAt, adminPwdHash: pwdHash}
 	provider, err := wallet.NewMnemonicKeyProvider("tag volcano eight thank tide danger coast health above argue embrace heavy")
 	if err != nil {
 		t.Fatalf("NewMnemonicKeyProvider() error = %v", err)
@@ -418,7 +432,11 @@ func contractHandler(t *testing.T) http.Handler {
 		config: config.Config{
 			Timezone:               location,
 			SepoliaExplorerBaseURL: "https://sepolia.etherscan.io",
-			Auth:                   config.AuthConfig{JWTTTL: time.Hour, APIKey: "test-api-key"},
+			Auth: config.AuthConfig{
+				JWTTTL:         time.Hour,
+				APIKey:         "test-api-key-0123456789abcdef0123",
+				APIKeyUsername: "system-ops",
+			},
 		},
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		apiStore:  store,
@@ -448,4 +466,212 @@ func contractHandler(t *testing.T) http.Handler {
 	mux.HandleFunc("GET /api/v1/system/platform-wallet", application.requireAdminAuth(application.getPlatformWalletStatus))
 	mux.HandleFunc("GET /api/v1/worker-errors", application.requireAdminAuth(application.listWorkerErrors))
 	return application.requestContext(mux)
+}
+
+// TestAuthHardeningJ1ToJ3 验证登录限流锁定、防账号枚举统一错误码与禁用后 JWT 立即失效。
+func TestAuthHardeningJ1ToJ3(t *testing.T) {
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := auth.HashPassword("Admin@2026")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &contractStore{createdAt: time.Now(), adminPwdHash: hash}
+	application := &App{
+		config: config.Config{
+			Timezone: location,
+			Auth: config.AuthConfig{
+				JWTTTL:                 time.Hour,
+				LoginRateLimitPerSec:   100,
+				LoginRateLimitBurst:    100,
+				LoginMaxFailedAttempts: 3,
+				LoginLockDuration:      time.Minute,
+			},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		apiStore:  store,
+		authStore: store,
+		jwtSecret: []byte("0123456789abcdef0123456789abcdef"),
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/auth/login", application.login)
+	mux.HandleFunc("GET /api/v1/auth/me", application.requireAdminAuth(application.me))
+	mux.HandleFunc("GET /api/v1/users", application.requireAdminAuth(application.listUsers))
+	handler := application.requestContext(mux)
+
+	// J2：用户不存在、密码错误、禁用账号必须统一返回 401 INVALID_CREDENTIALS，不能暴露 ADMIN_DISABLED。
+	store.adminDisabled = true
+	for _, body := range []string{
+		`{"username":"missing-user","password":"wrong"}`,
+		`{"username":"admin","password":"wrong-password"}`,
+		`{"username":"admin","password":"Admin@2026"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(body))
+		req.RemoteAddr = "10.0.0.1:1234"
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusUnauthorized || !strings.Contains(resp.Body.String(), `"code":"INVALID_CREDENTIALS"`) {
+			t.Fatalf("login %s -> status=%d body=%s, want 401 INVALID_CREDENTIALS", body, resp.Code, resp.Body.String())
+		}
+		if strings.Contains(resp.Body.String(), "ADMIN_DISABLED") {
+			t.Fatalf("login %s leaked ADMIN_DISABLED: %s", body, resp.Body.String())
+		}
+	}
+
+	// J3：登录获得有效 JWT 后若管理员被禁用，下一次请求必须在中间件直接被拒绝。
+	store.adminDisabled = false
+	token := loginForContractToken(t, handler)
+	store.adminDisabled = true
+	usersReq := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+	usersReq.Header.Set("Authorization", "Bearer "+token)
+	usersResp := httptest.NewRecorder()
+	handler.ServeHTTP(usersResp, usersReq)
+	if usersResp.Code != http.StatusUnauthorized {
+		t.Fatalf("disabled admin JWT /api/v1/users status=%d body=%s, want 401", usersResp.Code, usersResp.Body.String())
+	}
+
+	// J1：同一 IP + 用户名连续失败达到上限后被锁定（返回 429）。
+	store.adminDisabled = false
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"bad"}`))
+		req.RemoteAddr = "10.0.0.9:5678"
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d status=%d, want 401", i+1, resp.Code)
+		}
+	}
+	lockedReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"Admin@2026"}`))
+	lockedReq.RemoteAddr = "10.0.0.9:5678"
+	lockedResp := httptest.NewRecorder()
+	handler.ServeHTTP(lockedResp, lockedReq)
+	if lockedResp.Code != http.StatusTooManyRequests {
+		t.Fatalf("locked login status=%d body=%s, want 429", lockedResp.Code, lockedResp.Body.String())
+	}
+
+	// J1 令牌桶限流：Burst=1 时同 IP+用户名 连发两次触发 429 RATE_LIMITED。
+	rateApp := &App{
+		config: config.Config{
+			Timezone: location,
+			Auth: config.AuthConfig{
+				JWTTTL:                 time.Hour,
+				LoginRateLimitPerSec:   0.1,
+				LoginRateLimitBurst:    1,
+				LoginMaxFailedAttempts: 10,
+				LoginLockDuration:      time.Minute,
+			},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		apiStore:  store,
+		authStore: store,
+		jwtSecret: []byte("0123456789abcdef0123456789abcdef"),
+	}
+	rateMux := http.NewServeMux()
+	rateMux.HandleFunc("POST /api/v1/auth/login", rateApp.login)
+	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"bad"}`))
+	req1.RemoteAddr = "10.0.0.88:4321"
+	resp1 := httptest.NewRecorder()
+	rateMux.ServeHTTP(resp1, req1)
+	if resp1.Code != http.StatusUnauthorized {
+		t.Fatalf("first burst login status=%d, want 401", resp1.Code)
+	}
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"bad"}`))
+	req2.RemoteAddr = "10.0.0.88:4321"
+	resp2 := httptest.NewRecorder()
+	rateMux.ServeHTTP(resp2, req2)
+	if resp2.Code != http.StatusTooManyRequests || !strings.Contains(resp2.Body.String(), `"code":"RATE_LIMITED"`) {
+		t.Fatalf("second burst login status=%d body=%s, want 429 RATE_LIMITED", resp2.Code, resp2.Body.String())
+	}
+}
+
+// TestHealthEndpointsRedactErrorsAndExposeDetailsAfterAuth 验证未鉴权健康检查只返回状态枚举，详细错误仅在鉴权系统接口返回。
+func TestHealthEndpointsRedactErrorsAndExposeDetailsAfterAuth(t *testing.T) {
+	location, _ := time.LoadLocation("Asia/Shanghai")
+	hash, _ := auth.HashPassword("Admin@2026")
+	store := &contractStore{createdAt: time.Now(), adminPwdHash: hash}
+	application := &App{
+		config: config.Config{
+			Timezone: location,
+			Auth:     config.AuthConfig{JWTTTL: time.Hour},
+			Bitcoin:  config.BitcoinConfig{Enabled: true, Network: "signet"},
+		},
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		apiStore:  store,
+		authStore: store,
+		jwtSecret: []byte("0123456789abcdef0123456789abcdef"),
+		healthHooks: &healthTestHooks{
+			pingDB: func(context.Context) error { return nil },
+			chainHealth: func(context.Context) evm.HealthSnapshot {
+				return evm.HealthSnapshot{Status: "DOWN", Endpoint: "primary", ChainID: "11155111", LastError: "sepolia-secret-rpc-error"}
+			},
+			tokenSnap: func() tokendeposit.HealthSnapshot {
+				return tokendeposit.HealthSnapshot{Status: "DOWN", LastError: "token-secret-rpc-error"}
+			},
+			gasSnap: func() gasstation.HealthSnapshot {
+				return gasstation.HealthSnapshot{Status: "DOWN", BalanceWei: big.NewInt(1), MinBalanceWei: big.NewInt(10), LastError: "gas-secret-rpc-error"}
+			},
+			sweepSnap: func() tokensweep.HealthSnapshot {
+				return tokensweep.HealthSnapshot{Status: "DOWN", Symbol: "USDC", BalanceUnits: big.NewInt(0), LastError: "sweep-secret-rpc-error"}
+			},
+			btcHeight: func(context.Context) (int64, error) {
+				return 0, errors.New("节点异常-btc-secret-rpc-error")
+			},
+		},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", application.health)
+	mux.HandleFunc("GET /readyz", application.health)
+	mux.HandleFunc("POST /api/v1/auth/login", application.login)
+	mux.HandleFunc("GET /api/v1/system/chains/sepolia", application.requireAdminAuth(application.getChainStatus))
+	handler := application.requestContext(mux)
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		body := resp.Body.String()
+		if resp.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s status=%d body=%s, want 503", path, resp.Code, body)
+		}
+		for _, secret := range []string{
+			"last_error", "sepolia-secret-rpc-error", "token-secret-rpc-error",
+			"gas-secret-rpc-error", "sweep-secret-rpc-error", "btc-secret-rpc-error", "chain_endpoint",
+		} {
+			if strings.Contains(body, secret) {
+				t.Fatalf("%s leaked %q: %s", path, secret, body)
+			}
+		}
+	}
+
+	token := loginForContractToken(t, handler)
+	sysReq := httptest.NewRequest(http.MethodGet, "/api/v1/system/chains/sepolia", nil)
+	sysReq.Header.Set("Authorization", "Bearer "+token)
+	sysResp := httptest.NewRecorder()
+	handler.ServeHTTP(sysResp, sysReq)
+	if sysResp.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/system/chains/sepolia status=%d body=%s", sysResp.Code, sysResp.Body.String())
+	}
+	sysBody := sysResp.Body.String()
+	for _, want := range []string{"token-secret-rpc-error", "gas-secret-rpc-error", "sweep-secret-rpc-error", "btc-secret-rpc-error"} {
+		if !strings.Contains(sysBody, want) {
+			t.Fatalf("authenticated system status missing %q: %s", want, sysBody)
+		}
+	}
+}
+
+// TestWaitRemainingComponentsLogsUnexitedOnTimeout 验证组件退出超时会在日志与错误中明确列出未退出组件名称。
+func TestWaitRemainingComponentsLogsUnexitedOnTimeout(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	ch := make(chan componentResult, 1)
+	ch <- componentResult{name: "deposit"}
+	err := waitRemainingComponents(logger, ch, []string{"deposit", "withdrawal", "btc-sweep"}, 20*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "btc-sweep") || !strings.Contains(err.Error(), "withdrawal") {
+		t.Fatalf("waitRemainingComponents() err = %v, want pending component names", err)
+	}
+	if !strings.Contains(buf.String(), "btc-sweep") || !strings.Contains(buf.String(), "withdrawal") {
+		t.Fatalf("log output missing pending component names: %s", buf.String())
+	}
 }

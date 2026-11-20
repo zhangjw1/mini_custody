@@ -71,19 +71,28 @@ type BitcoinConfig struct {
 
 // AuthConfig 描述管理后台 JWT 鉴权、自动化 API Key 与首个管理员初始化配置。
 type AuthConfig struct {
-	JWTSecret            string
-	JWTTTL               time.Duration
-	APIKey               string
-	BootstrapUsername    string
-	BootstrapPassword    string
-	BootstrapDisplayName string
+	JWTSecret              string
+	JWTTTL                 time.Duration
+	APIKey                 string
+	APIKeyAdminID          int64
+	APIKeyUsername         string
+	LoginRateLimitPerSec   float64
+	LoginRateLimitBurst    int
+	LoginMaxFailedAttempts int
+	LoginLockDuration      time.Duration
+	BootstrapUsername      string
+	BootstrapPassword      string
+	BootstrapDisplayName   string
 }
 
-// HTTPConfig 描述 HTTP 服务器读写与空闲超时配置。
+// HTTPConfig 描述 HTTP 服务器读写、请求头、关闭与空闲超时配置。
 type HTTPConfig struct {
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	IdleTimeout  time.Duration
+	ReadHeaderTimeout     time.Duration
+	ReadTimeout           time.Duration
+	WriteTimeout          time.Duration
+	IdleTimeout           time.Duration
+	ShutdownTimeout       time.Duration
+	WorkerShutdownTimeout time.Duration
 }
 
 // EVMReplacementConfig 描述 EVM 卡单重播与 Gas 加价替换策略参数。
@@ -249,22 +258,47 @@ func load(requireCustody bool) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	apiKeyAdminID, err := nonNegativeInt64OrDefault("API_KEY_ADMIN_ID", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	loginRateLimit, err := positiveFloat64OrDefault("LOGIN_RATE_LIMIT_PER_SEC", 5)
+	if err != nil {
+		return Config{}, err
+	}
+	loginBurst, err := nonNegativeIntOrDefault("LOGIN_RATE_LIMIT_BURST", 10)
+	if err != nil {
+		return Config{}, err
+	}
+	loginMaxFailures, err := nonNegativeIntOrDefault("LOGIN_MAX_FAILED_ATTEMPTS", 5)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		AppEnv:   envOrDefault("APP_ENV", "development"),
 		HTTPAddr: envOrDefault("HTTP_ADDR", ":8080"),
 		HTTP: HTTPConfig{
-			ReadTimeout:  durationOrDefault("HTTP_READ_TIMEOUT", 15*time.Second),
-			WriteTimeout: durationOrDefault("HTTP_WRITE_TIMEOUT", 30*time.Second),
-			IdleTimeout:  durationOrDefault("HTTP_IDLE_TIMEOUT", time.Minute),
+			ReadHeaderTimeout:     durationOrDefault("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
+			ReadTimeout:           durationOrDefault("HTTP_READ_TIMEOUT", 15*time.Second),
+			WriteTimeout:          durationOrDefault("HTTP_WRITE_TIMEOUT", 30*time.Second),
+			IdleTimeout:           durationOrDefault("HTTP_IDLE_TIMEOUT", time.Minute),
+			ShutdownTimeout:       durationOrDefault("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
+			WorkerShutdownTimeout: durationOrDefault("HTTP_WORKER_SHUTDOWN_TIMEOUT", 15*time.Second),
 		},
 		Auth: AuthConfig{
-			JWTSecret:            strings.TrimSpace(settings.GetString("JWT_SECRET")),
-			JWTTTL:               durationOrDefault("JWT_TTL", 24*time.Hour),
-			APIKey:               strings.TrimSpace(settings.GetString("API_KEY")),
-			BootstrapUsername:    envOrDefault("ADMIN_BOOTSTRAP_USERNAME", "admin"),
-			BootstrapPassword:    settings.GetString("ADMIN_BOOTSTRAP_PASSWORD"),
-			BootstrapDisplayName: envOrDefault("ADMIN_BOOTSTRAP_DISPLAY_NAME", "系统管理员"),
+			JWTSecret:              strings.TrimSpace(settings.GetString("JWT_SECRET")),
+			JWTTTL:                 durationOrDefault("JWT_TTL", 24*time.Hour),
+			APIKey:                 strings.TrimSpace(settings.GetString("API_KEY")),
+			APIKeyAdminID:          apiKeyAdminID,
+			APIKeyUsername:         envOrDefault("API_KEY_USERNAME", "system-api-key"),
+			LoginRateLimitPerSec:   loginRateLimit,
+			LoginRateLimitBurst:    loginBurst,
+			LoginMaxFailedAttempts: loginMaxFailures,
+			LoginLockDuration:      durationOrDefault("LOGIN_LOCK_DURATION", 15*time.Minute),
+			BootstrapUsername:      envOrDefault("ADMIN_BOOTSTRAP_USERNAME", "admin"),
+			BootstrapPassword:      settings.GetString("ADMIN_BOOTSTRAP_PASSWORD"),
+			BootstrapDisplayName:   envOrDefault("ADMIN_BOOTSTRAP_DISPLAY_NAME", "系统管理员"),
 		},
 		Timezone:    timezone,
 		DatabaseURL: strings.TrimSpace(settings.GetString("DATABASE_URL")),
@@ -373,7 +407,8 @@ func (c Config) validate(requireCustody bool) error {
 		c.DB.MaxConnLifetime < 0 || c.DB.MaxConnIdleTime < 0 {
 		return errors.New("数据库连接池配置无效")
 	}
-	if c.HTTP.ReadTimeout <= 0 || c.HTTP.WriteTimeout <= 0 || c.HTTP.IdleTimeout <= 0 {
+	if c.HTTP.ReadHeaderTimeout <= 0 || c.HTTP.ReadTimeout <= 0 || c.HTTP.WriteTimeout <= 0 ||
+		c.HTTP.IdleTimeout <= 0 || c.HTTP.ShutdownTimeout <= 0 || c.HTTP.WorkerShutdownTimeout <= 0 {
 		return errors.New("HTTP 超时配置无效")
 	}
 	if c.Auth.JWTTTL <= 0 {
@@ -381,6 +416,16 @@ func (c Config) validate(requireCustody bool) error {
 	}
 	if c.Auth.JWTSecret != "" && len(c.Auth.JWTSecret) < 32 {
 		return errors.New("JWT_SECRET 长度不能少于 32 字节")
+	}
+	if c.Auth.APIKey != "" && len(c.Auth.APIKey) < 32 {
+		return errors.New("API_KEY 长度不能少于 32 字节")
+	}
+	if c.Auth.APIKeyAdminID < 0 || strings.TrimSpace(c.Auth.APIKeyUsername) == "" {
+		return errors.New("API_KEY 管理员身份配置无效")
+	}
+	if c.Auth.LoginRateLimitPerSec <= 0 || c.Auth.LoginRateLimitBurst <= 0 ||
+		c.Auth.LoginMaxFailedAttempts <= 0 || c.Auth.LoginLockDuration <= 0 {
+		return errors.New("登录限流与锁定配置无效")
 	}
 	if strings.EqualFold(c.AppEnv, "production") && len(c.Auth.JWTSecret) < 32 {
 		return errors.New("生产环境必须配置至少 32 字节的 JWT_SECRET")
@@ -624,6 +669,32 @@ func nonNegativeUint64OrDefault(key string, fallback uint64) (uint64, error) {
 	parsed, err := strconv.ParseUint(value, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s 配置必须是非负整数", key)
+	}
+	return parsed, nil
+}
+
+// nonNegativeInt64OrDefault 读取非负 64 位整数配置，格式错误或负数时返回中文错误。
+func nonNegativeInt64OrDefault(key string, fallback int64) (int64, error) {
+	value := strings.TrimSpace(settings.GetString(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s 配置必须是非负整数", key)
+	}
+	return parsed, nil
+}
+
+// positiveFloat64OrDefault 读取正浮点数配置，格式错误或非正数时返回中文错误。
+func positiveFloat64OrDefault(key string, fallback float64) (float64, error) {
+	value := strings.TrimSpace(settings.GetString(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s 配置必须是正数", key)
 	}
 	return parsed, nil
 }

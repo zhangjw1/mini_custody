@@ -36,7 +36,7 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/auth/login` | 管理员账号密码登录并获取 JWT |
+| POST | `/auth/login` | 管理员账号密码登录并获取 JWT（防枚举统一错误码，含限流/失败锁定） |
 | GET | `/auth/me` | 获取当前管理员身份信息 |
 | GET | `/users` | 查询托管用户列表 |
 | POST | `/users` | 新建托管用户并原子派生充值地址 |
@@ -172,3 +172,13 @@ API 不返回以下内容：
 - 完整 RPC URL 或 RPC Key；
 - 已签名交易的 `raw_tx`；
 - PostgreSQL 原始错误。
+
+## 8. 认证风控与健康检查接口变更（Batch J）
+
+- **`POST /api/v1/auth/login`**：
+  - 按 `IP + 用户名` 维度启用令牌桶限流与连续失败锁定；触发限流返回 `429 RATE_LIMITED`，连续失败超阈值锁定返回 `429 ACCOUNT_LOCKED`（均附带 `Retry-After` 响应头）。
+  - 为防止管理员账号枚举，**账号不存在、密码错误、账号被禁用**统一返回 `401 INVALID_CREDENTIALS`（不再向未登录方返回 `403 ADMIN_DISABLED`）。
+- **令牌实时失效**：Bearer JWT 校验在中间件实时校验管理员启用状态，被禁用后携带旧 Token 请求受保护接口将立即返回 `401 UNAUTHORIZED`。
+- **健康探针与系统诊断分离**：
+  - 未鉴权的 `GET /healthz` 与 `GET /readyz` 仅返回各组件状态枚举（`status`、`database_status`、`chain_status` 等），不暴露 `*_last_error`、`bitcoin_last_error` 或节点端点信息。
+  - 详细错误信息仅在需鉴权的 `GET /api/v1/system/chains/sepolia`（含 `last_error`、`token_scanner.last_error`、`gas_station.last_error`、`token_inventory.last_error` 及 `bitcoin.last_error`）和 `GET /api/v1/system/platform-wallet` 中返回。

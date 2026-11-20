@@ -445,6 +445,7 @@ G、H、J 可以并行；I 的 EVM 部分可以并行，BTC 部分等 G 合并�
 ### 批次 J：鉴权与运维遗留
 
 - **J1 登录限流和锁定**（`internal/app/auth_handler.go:74-105`）：按 IP + 用户名做令牌桶限流（参数从配置读取）；连续失败 N 次后锁定一段时间。锁定状态可以放内存或落库（落库用迁移 000011），在本节写明选择。
+  - 已选择方案：**将限流令牌桶与连续失败锁定状态放入内存**（由 `App` 内置互斥锁保护的 `loginGuard` 维护，结合配置项 `LOGIN_RATE_LIMIT_PER_SEC`、`LOGIN_RATE_LIMIT_BURST`、`LOGIN_MAX_FAILED_ATTEMPTS`、`LOGIN_LOCK_DURATION` 并定期清理过期键）；原因：仓库迁移已连续使用到 `000009` 且 `embed_test.go` 校验迁移版本号严格连续递增，采用内存状态无需额外创建 `000010`/`000011` 数据库表即可满足单实例风控与防暴力破解要求。
 - **J2 防账号枚举**（`auth_handler.go:88-100`）：用户不存在时也和一个固定的 dummy hash 做 bcrypt 比较；先校验密码，再判断是否禁用，并且用户不存在、密码错误、账号被禁用统一返回同一个错误码。
 - **J3 禁用后令牌立即失效**（`auth_handler.go:271-283`）：中间件验签后查询管理员是否 disabled，可以带短 TTL 的内存缓存；也可以在 token 里写入 `token_version`，禁用或改密时版本号加 1。
 - **J4 健康检查不泄漏内部信息**（`app.go:338-340、581-617`）：未鉴权的 healthz/readyz 只返回状态枚举；`*_last_error` 和 `btcErr.Error()` 只放在需要鉴权的系统状态接口里。

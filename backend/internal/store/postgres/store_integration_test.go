@@ -2641,3 +2641,75 @@ func TestIntegrationBTCRewindIsolatesPendingBalanceFailure(t *testing.T) {
 		t.Fatalf("REORG_RECHECK_MANUAL_REVIEW worker_errors count = %d, want 1", errCount)
 	}
 }
+
+// TestIntegrationMigration000007DownRefusesWhenReorgDataExists 验证存在 ORPHANED 充值或 DEPOSIT_REVERSAL 流水时回滚 000007 直接拒绝并报错。
+func TestIntegrationMigration000007DownRefusesWhenReorgDataExists(t *testing.T) {
+	databaseURL, configErr := config.TestDatabaseURL()
+	if configErr != nil {
+		t.Fatalf("load test config: %v", configErr)
+	}
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	timezone, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminPool, err := Open(ctx, databaseURL, timezone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := fmt.Sprintf("mini_custody_m7_%d_%d", os.Getpid(), time.Now().UnixNano())
+	schemaID := pgx.Identifier{schema}.Sanitize()
+	if _, err := adminPool.Exec(ctx, `CREATE SCHEMA `+schemaID); err != nil {
+		adminPool.Close()
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = adminPool.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schemaID+` CASCADE`)
+		adminPool.Close()
+	}()
+	pool, err := OpenInSchema(ctx, databaseURL, timezone, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	runner := migrations.NewRunner(pool)
+	if err := runner.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 从头回滚到 000007：先降 000009、000008，再插入 ORPHANED 数据测试 000007 down 拒绝。
+	if err := runner.Down(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Down(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var userID, addrID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO users(code, display_name) VALUES('m7-user', 'M7测试用户') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO wallet_addresses(user_id, network, address, derivation_index, derivation_path) VALUES($1, 'ethereum-sepolia', '0x4444444444444444444444444444444444444444', 1, 'm/44''/60''/0''/0/1') RETURNING id`, userID).Scan(&addrID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO deposits(user_id, address_id, network, asset, tx_hash, tx_index, block_number, block_hash, amount_wei, confirmations, status)
+		VALUES($1, $2, 'ethereum-sepolia', 'ETH', $3, 0, 10, $4, 1000, 0, 'ORPHANED')`,
+		userID, addrID, fmt.Sprintf("0x%064x", 70001), fmt.Sprintf("0x%064x", 70002)); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Down(ctx); err == nil {
+		t.Fatal("expected 000007 down migration to raise exception when ORPHANED deposit exists")
+	}
+	var count int
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM deposits WHERE status = 'ORPHANED'`).Scan(&count)
+	if count != 1 {
+		t.Fatalf("ORPHANED deposit count = %d, want 1 preserved", count)
+	}
+	if err := runner.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

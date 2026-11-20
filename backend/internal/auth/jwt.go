@@ -29,8 +29,18 @@ type Claims struct {
 	AdminID  int64  `json:"sub"`
 	Username string `json:"username"`
 	Role     string `json:"role"`
+	PwdFP    string `json:"pfp,omitempty"`
 	IssuedAt int64  `json:"iat"`
 	ExpireAt int64  `json:"exp"`
+}
+
+// PasswordFingerprint 计算密码哈希前缀指纹，用于在改密后使旧令牌立即失效。
+func PasswordFingerprint(passwordHash string) string {
+	if passwordHash == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(passwordHash))
+	return fmt.Sprintf("%x", sum[:8])
 }
 
 // jwtHeader 描述固定使用的 HS256 JWT 头部。

@@ -72,6 +72,9 @@ curl -X POST http://localhost:8080/api/v1/users/1/withdrawals \
 
 `cmd/walletgen` 只用于离线生成和验证加密根密钥；`cmd/migrate` 是可选的数据库运维命令，不是独立服务。
 
+> [!IMPORTANT]
+> **生产大表索引变更说明（`000008_perf_indexes`）**：若目标数据库存量表（如 `balance_entries`、`deposits`、`withdrawals`、`token_deposits`、`worker_errors`）数据量较大，直接随应用启动执行全表锁建索引可能长时间阻塞读写。请在生产维护窗口前通过独立事务外连接预先执行 `CREATE INDEX CONCURRENTLY ...` 创建 `000008_perf_indexes.up.sql` 中的索引（使用 `IF NOT EXISTS` 可与后续迁移平滑对齐）。
+
 配置专用 PostgreSQL 测试库后，可以运行真实事务和并发测试：
 
 ```bash

@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -56,6 +58,19 @@ type App struct {
 	withdrawals             *withdrawal.Service
 	withdrawalWorker        *withdrawal.Worker
 	server                  *http.Server
+	loginMu                 sync.Mutex
+	loginStates             map[string]*loginAttemptState
+	healthHooks             *healthTestHooks
+}
+
+// healthTestHooks 仅供包内单元测试注入健康检查依赖状态，生产环境为 nil。
+type healthTestHooks struct {
+	pingDB      func(context.Context) error
+	chainHealth func(context.Context) evm.HealthSnapshot
+	tokenSnap   func() tokendeposit.HealthSnapshot
+	gasSnap     func() gasstation.HealthSnapshot
+	sweepSnap   func() tokensweep.HealthSnapshot
+	btcHeight   func(context.Context) (int64, error)
 }
 
 // componentResult 描述单体应用中一个长期运行组件的退出结果。
@@ -148,10 +163,14 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	if err := application.wireERC20(ctx, cfg, chainClient, tokenContract, store, provider, logger); err != nil {
 		return nil, err
 	}
+	readHeaderTimeout := cfg.HTTP.ReadHeaderTimeout
+	if readHeaderTimeout <= 0 {
+		readHeaderTimeout = 5 * time.Second
+	}
 	application.server = &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           application.requestContext(application.buildRouter()),
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
 		IdleTimeout:       cfg.HTTP.IdleTimeout,
@@ -458,64 +477,81 @@ func (a *App) Run(ctx context.Context) error {
 		}})
 	}
 	results := make(chan componentResult, len(components))
+	pendingNames := make([]string, 0, len(components))
 	for _, item := range components {
 		item := item
+		pendingNames = append(pendingNames, item.name)
 		// 前面components只是定义了组件，后面go func()中才是真正的启动组件
 		go func() { results <- componentResult{name: item.name, err: item.run()} }()
+	}
+	workerWaitTimeout := a.config.HTTP.WorkerShutdownTimeout
+	if workerWaitTimeout <= 0 {
+		workerWaitTimeout = 15 * time.Second
 	}
 	// 阻塞等待第一个退出的组件或外部取消信号。
 	select {
 	case result := <-results:
 		cancel()
+		var shutdownErr error
 		if result.name != "web" {
-			if shutdownErr := a.shutdownServer(); shutdownErr != nil {
-				waitRemainingComponents(results, len(components)-1, 15*time.Second)
-				return shutdownErr
+			shutdownErr = a.shutdownServer()
+		}
+		remainingNames := make([]string, 0, len(pendingNames)-1)
+		for _, name := range pendingNames {
+			if name != result.name {
+				remainingNames = append(remainingNames, name)
 			}
 		}
-		if firstErr := waitRemainingComponents(results, len(components)-1, 15*time.Second); result.err == nil && firstErr != nil {
-			result.err = firstErr
-		}
+		waitErr := waitRemainingComponents(a.logger, results, remainingNames, workerWaitTimeout)
+		var componentErr error
 		if result.err != nil {
-			return fmt.Errorf("应用组件 %s 已停止：%w", result.name, result.err)
+			componentErr = fmt.Errorf("应用组件 %s 已停止：%w", result.name, result.err)
 		}
-		return nil
+		return errors.Join(componentErr, shutdownErr, waitErr)
 	case <-ctx.Done():
 		cancel()
 		shutdownErr := a.shutdownServer()
-		waitErr := waitRemainingComponents(results, len(components), 15*time.Second)
-		if shutdownErr != nil {
-			return shutdownErr
-		}
+		waitErr := waitRemainingComponents(a.logger, results, pendingNames, workerWaitTimeout)
 		if waitErr != nil {
-			return fmt.Errorf("关闭应用组件失败：%w", waitErr)
+			waitErr = fmt.Errorf("关闭应用组件失败：%w", waitErr)
 		}
-		return nil
+		return errors.Join(shutdownErr, waitErr)
 	}
 }
 
-// waitRemainingComponents 带超时等待其余后台组件退出，避免过早关闭数据库连接池。
-func waitRemainingComponents(results <-chan componentResult, remaining int, timeout time.Duration) error {
-	if remaining <= 0 {
+// waitRemainingComponents 带超时等待其余后台组件退出，超时后日志明确记录未退出组件清单。
+func waitRemainingComponents(logger *slog.Logger, results <-chan componentResult, pendingNames []string, timeout time.Duration) error {
+	if len(pendingNames) == 0 {
 		return nil
+	}
+	pending := make(map[string]struct{}, len(pendingNames))
+	for _, name := range pendingNames {
+		pending[name] = struct{}{}
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	var firstErr error
-	for i := 0; i < remaining; i++ {
+	var errs []error
+	for len(pending) > 0 {
 		select {
 		case item := <-results:
-			if firstErr == nil && item.err != nil {
-				firstErr = item.err
+			delete(pending, item.name)
+			if item.err != nil {
+				errs = append(errs, fmt.Errorf("组件 %s 退出失败：%w", item.name, item.err))
 			}
 		case <-timer.C:
-			if firstErr != nil {
-				return firstErr
+			unexited := make([]string, 0, len(pending))
+			for name := range pending {
+				unexited = append(unexited, name)
 			}
-			return errors.New("等待后台组件退出超时")
+			sort.Strings(unexited)
+			if logger != nil {
+				logger.Warn("等待后台组件退出超时，仍有组件未退出", "pending_components", unexited)
+			}
+			errs = append(errs, fmt.Errorf("等待后台组件退出超时，未退出组件：%s", strings.Join(unexited, ", ")))
+			return errors.Join(errs...)
 		}
 	}
-	return firstErr
+	return errors.Join(errs...)
 }
 
 // resolveJWTSecret 加载并校验 JWT 签名密钥，未配置时在开发环境自动生成临时密钥。
@@ -549,7 +585,14 @@ func ensureBootstrapAdmin(ctx context.Context, store *postgres.Store, cfg config
 
 // shutdownServer 在限定时间内优雅关闭 HTTP 服务。
 func (a *App) shutdownServer() error {
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if a.server == nil {
+		return nil
+	}
+	shutdownTimeout := a.config.HTTP.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 10 * time.Second
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := a.server.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("关闭 Web 服务失败：%w", err)
@@ -565,7 +608,7 @@ func (a *App) livez(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// health 检查数据库连接与链上组件就绪状态，余额偏低仅作为告警而不返回 503。
+// health 对未鉴权健康探针仅返回状态枚举，不暴露底层错误文案、端点和余额明细。
 func (a *App) health(w http.ResponseWriter, _ *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -574,69 +617,94 @@ func (a *App) health(w http.ResponseWriter, _ *http.Request) {
 		"status": "ok",
 		"time":   time.Now().In(a.timezoneOrUTC()).Format(time.RFC3339),
 	}
-	if err := a.pool.Ping(ctx); err != nil {
+	var dbErr error
+	if a.healthHooks != nil && a.healthHooks.pingDB != nil {
+		dbErr = a.healthHooks.pingDB(ctx)
+	} else if a.pool != nil {
+		dbErr = a.pool.Ping(ctx)
+	}
+	if dbErr != nil {
+		response["database_status"] = "DOWN"
 		status = http.StatusServiceUnavailable
 		response["status"] = "unavailable"
+	} else {
+		response["database_status"] = "HEALTHY"
 	}
-	chainHealth := a.chain.Health(ctx)
-	response["chain_status"] = chainHealth.Status
-	response["chain_endpoint"] = chainHealth.Endpoint
-	response["chain_id"] = chainHealth.ChainID
-	response["network_height"] = fmt.Sprintf("%d", chainHealth.NetworkHeight)
-	response["scan_height"] = fmt.Sprintf("%d", chainHealth.ScanHeight)
-	if chainHealth.Status == "DOWN" {
-		status = http.StatusServiceUnavailable
-		response["status"] = "unavailable"
+	if a.healthHooks != nil && a.healthHooks.chainHealth != nil {
+		chainHealth := a.healthHooks.chainHealth(ctx)
+		response["chain_status"] = chainHealth.Status
+		if chainHealth.Status == "DOWN" {
+			status = http.StatusServiceUnavailable
+			response["status"] = "unavailable"
+		}
+	} else if a.chain != nil {
+		chainHealth := a.chain.Health(ctx)
+		response["chain_status"] = chainHealth.Status
+		if chainHealth.Status == "DOWN" {
+			status = http.StatusServiceUnavailable
+			response["status"] = "unavailable"
+		}
 	}
-	if a.tokenScanner != nil {
+	if a.healthHooks != nil && a.healthHooks.tokenSnap != nil {
+		tokenHealth := a.healthHooks.tokenSnap()
+		response["token_status"] = tokenHealth.Status
+		if tokenHealth.Status == "DOWN" {
+			status = http.StatusServiceUnavailable
+			response["status"] = "unavailable"
+		}
+	} else if a.tokenScanner != nil {
 		tokenHealth := a.tokenScanner.Snapshot()
 		response["token_status"] = tokenHealth.Status
-		response["token_network_height"] = fmt.Sprintf("%d", tokenHealth.NetworkHeight)
-		response["token_scan_height"] = fmt.Sprintf("%d", tokenHealth.ScanHeight)
-		response["token_lag_blocks"] = fmt.Sprintf("%d", tokenHealth.LagBlocks)
-		if tokenHealth.LastError != "" {
-			response["token_last_error"] = tokenHealth.LastError
-		}
 		if tokenHealth.Status == "DOWN" {
 			status = http.StatusServiceUnavailable
 			response["status"] = "unavailable"
 		}
 	}
-	if a.gasStation != nil {
+	if a.healthHooks != nil && a.healthHooks.gasSnap != nil {
+		gasHealth := a.healthHooks.gasSnap()
+		response["gas_station_status"] = gasHealth.Status
+		if gasHealth.Status == "DOWN" {
+			status = http.StatusServiceUnavailable
+			response["status"] = "unavailable"
+		}
+	} else if a.gasStation != nil {
 		gasHealth := a.gasStation.Snapshot()
 		response["gas_station_status"] = gasHealth.Status
-		response["gas_station_balance_wei"] = gasHealth.BalanceWei.String()
-		response["gas_station_minimum_wei"] = gasHealth.MinBalanceWei.String()
-		if gasHealth.LastError != "" {
-			response["gas_station_last_error"] = gasHealth.LastError
-		}
 		if gasHealth.Status == "DOWN" {
 			status = http.StatusServiceUnavailable
 			response["status"] = "unavailable"
 		}
 	}
-	if a.tokenSweeper != nil {
+	if a.healthHooks != nil && a.healthHooks.sweepSnap != nil {
+		sweepHealth := a.healthHooks.sweepSnap()
+		response["token_inventory_status"] = sweepHealth.Status
+		if sweepHealth.Status == "DOWN" {
+			status = http.StatusServiceUnavailable
+			response["status"] = "unavailable"
+		}
+	} else if a.tokenSweeper != nil {
 		sweepHealth := a.tokenSweeper.Snapshot()
 		response["token_inventory_status"] = sweepHealth.Status
-		response["token_inventory_balance_units"] = sweepHealth.BalanceUnits.String()
-		if sweepHealth.LastError != "" {
-			response["token_inventory_last_error"] = sweepHealth.LastError
-		}
 		if sweepHealth.Status == "DOWN" {
 			status = http.StatusServiceUnavailable
 			response["status"] = "unavailable"
 		}
 	}
-	if a.bitcoinClient != nil {
-		height, btcErr := a.bitcoinClient.BlockCount(ctx)
-		if btcErr != nil {
+	if a.healthHooks != nil && a.healthHooks.btcHeight != nil {
+		if _, btcErr := a.healthHooks.btcHeight(ctx); btcErr != nil {
 			response["bitcoin_status"] = "DOWN"
-			response["bitcoin_last_error"] = btcErr.Error()
 			status = http.StatusServiceUnavailable
 			response["status"] = "unavailable"
 		} else {
 			response["bitcoin_status"] = "HEALTHY"
-			response["bitcoin_network_height"] = fmt.Sprintf("%d", height)
+		}
+	} else if a.bitcoinClient != nil {
+		if _, btcErr := a.bitcoinClient.BlockCount(ctx); btcErr != nil {
+			response["bitcoin_status"] = "DOWN"
+			status = http.StatusServiceUnavailable
+			response["status"] = "unavailable"
+		} else {
+			response["bitcoin_status"] = "HEALTHY"
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")

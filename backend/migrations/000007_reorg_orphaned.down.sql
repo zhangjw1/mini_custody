@@ -1,3 +1,13 @@
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM balance_entries WHERE entry_type = 'DEPOSIT_REVERSAL')
+        OR EXISTS (SELECT 1 FROM btc_deposits WHERE status = 'ORPHANED')
+        OR EXISTS (SELECT 1 FROM token_deposits WHERE status = 'ORPHANED')
+        OR EXISTS (SELECT 1 FROM deposits WHERE status = 'ORPHANED') THEN
+        RAISE EXCEPTION '存在 ORPHANED 充值或 DEPOSIT_REVERSAL 冲正流水，禁止回滚 000007 迁移以免破坏账本历史';
+    END IF;
+END $$;
+
 DELETE FROM balance_entries WHERE entry_type = 'DEPOSIT_REVERSAL';
 DELETE FROM btc_utxos WHERE status = 'UNKNOWN';
 DELETE FROM btc_deposits WHERE status = 'ORPHANED';

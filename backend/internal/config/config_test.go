@@ -330,6 +330,30 @@ func TestLoadRejectsReorgRewindSmallerThanConfirmations(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsShortAPIKey 验证 J6 要求非空 API_KEY 至少为 32 字节。
+func TestLoadRejectsShortAPIKey(t *testing.T) {
+	setRequiredConfigEnvironment(t)
+	t.Setenv("API_KEY", "short-api-key")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want error when API_KEY < 32 bytes")
+	}
+	t.Setenv("API_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("API_KEY_ADMIN_ID", "9")
+	t.Setenv("API_KEY_USERNAME", "ops-bot")
+	t.Setenv("HTTP_READ_HEADER_TIMEOUT", "7s")
+	t.Setenv("HTTP_SHUTDOWN_TIMEOUT", "12s")
+	t.Setenv("HTTP_WORKER_SHUTDOWN_TIMEOUT", "20s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with valid API_KEY error = %v", err)
+	}
+	if cfg.Auth.APIKeyAdminID != 9 || cfg.Auth.APIKeyUsername != "ops-bot" ||
+		cfg.HTTP.ReadHeaderTimeout != 7*time.Second || cfg.HTTP.ShutdownTimeout != 12*time.Second ||
+		cfg.HTTP.WorkerShutdownTimeout != 20*time.Second {
+		t.Fatalf("unexpected Batch J config: auth=%+v http=%+v", cfg.Auth, cfg.HTTP)
+	}
+}
+
 // setRequiredConfigEnvironment 设置加载配置所需的最小非敏感测试值。
 func setRequiredConfigEnvironment(t *testing.T) {
 	t.Helper()

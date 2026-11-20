@@ -11,6 +11,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/xiaoqi/mini-custody/backend/internal/amount"
+	"github.com/xiaoqi/mini-custody/backend/internal/chain/evm"
 	"github.com/xiaoqi/mini-custody/backend/internal/logging"
 	"github.com/xiaoqi/mini-custody/backend/internal/store/postgres"
 )
@@ -155,6 +156,15 @@ type chainResponse struct {
 	TokenScanner   *tokenScannerResponse      `json:"token_scanner,omitempty"`
 	GasStation     *gasStationResponse        `json:"gas_station,omitempty"`
 	TokenInventory *tokenInventoryResponse    `json:"token_inventory,omitempty"`
+	Bitcoin        *bitcoinStatusResponse     `json:"bitcoin,omitempty"`
+}
+
+// bitcoinStatusResponse 描述需鉴权查看的 Bitcoin 节点状态与错误明细。
+type bitcoinStatusResponse struct {
+	Status        string `json:"status"`
+	Network       string `json:"network,omitempty"`
+	NetworkHeight int64  `json:"network_height,omitempty"`
+	LastError     string `json:"last_error,omitempty"`
 }
 
 // tokenScannerResponse 描述 ERC-20 充值扫描器的独立进度和错误状态。
@@ -367,9 +377,14 @@ func (a *App) listTransactions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, pageResponse[transactionResponse]{Items: response, Page: page, PageSize: pageSize, HasMore: hasMore})
 }
 
-// getChainStatus 返回不额外发起 RPC 的 Sepolia 健康快照。
-func (a *App) getChainStatus(w http.ResponseWriter, _ *http.Request) {
-	health := a.chain.Snapshot()
+// getChainStatus 返回不额外发起 RPC 的 Sepolia 健康快照及各链详细错误状态（需管理员鉴权）。
+func (a *App) getChainStatus(w http.ResponseWriter, r *http.Request) {
+	var health evm.HealthSnapshot
+	if a.healthHooks != nil && a.healthHooks.chainHealth != nil {
+		health = a.healthHooks.chainHealth(r.Context())
+	} else if a.chain != nil {
+		health = a.chain.Snapshot()
+	}
 	lag := uint64(0)
 	if health.NetworkHeight > health.ScanHeight {
 		lag = health.NetworkHeight - health.ScanHeight
@@ -387,7 +402,14 @@ func (a *App) getChainStatus(w http.ResponseWriter, _ *http.Request) {
 		Lag: lag, LastError: health.LastError, CheckedAt: health.CheckedAt,
 		Capabilities: capabilities,
 	}
-	if a.tokenScanner != nil {
+	if a.healthHooks != nil && a.healthHooks.tokenSnap != nil {
+		tokenHealth := a.healthHooks.tokenSnap()
+		response.TokenScanner = &tokenScannerResponse{
+			Status: tokenHealth.Status, NetworkHeight: tokenHealth.NetworkHeight,
+			ScanHeight: tokenHealth.ScanHeight, Lag: tokenHealth.LagBlocks,
+			LastError: tokenHealth.LastError, CheckedAt: tokenHealth.CheckedAt,
+		}
+	} else if a.tokenScanner != nil {
 		tokenHealth := a.tokenScanner.Snapshot()
 		response.TokenScanner = &tokenScannerResponse{
 			Status: tokenHealth.Status, NetworkHeight: tokenHealth.NetworkHeight,
@@ -395,7 +417,17 @@ func (a *App) getChainStatus(w http.ResponseWriter, _ *http.Request) {
 			LastError: tokenHealth.LastError, CheckedAt: tokenHealth.CheckedAt,
 		}
 	}
-	if a.gasStation != nil {
+	if a.healthHooks != nil && a.healthHooks.gasSnap != nil {
+		gasHealth := a.healthHooks.gasSnap()
+		balanceETH, _ := amount.FormatETH(gasHealth.BalanceWei)
+		minimumETH, _ := amount.FormatETH(gasHealth.MinBalanceWei)
+		response.GasStation = &gasStationResponse{
+			Status: gasHealth.Status, Address: gasHealth.Address,
+			BalanceWei: gasHealth.BalanceWei.String(), BalanceETH: balanceETH,
+			MinimumWei: gasHealth.MinBalanceWei.String(), MinimumETH: minimumETH,
+			LastError: gasHealth.LastError, CheckedAt: gasHealth.CheckedAt,
+		}
+	} else if a.gasStation != nil {
 		gasHealth := a.gasStation.Snapshot()
 		balanceETH, _ := amount.FormatETH(gasHealth.BalanceWei)
 		minimumETH, _ := amount.FormatETH(gasHealth.MinBalanceWei)
@@ -406,13 +438,43 @@ func (a *App) getChainStatus(w http.ResponseWriter, _ *http.Request) {
 			LastError: gasHealth.LastError, CheckedAt: gasHealth.CheckedAt,
 		}
 	}
-	if a.tokenSweeper != nil {
+	if a.healthHooks != nil && a.healthHooks.sweepSnap != nil {
+		inventory := a.healthHooks.sweepSnap()
+		response.TokenInventory = &tokenInventoryResponse{
+			Status: inventory.Status, Symbol: inventory.Symbol, Address: inventory.Address,
+			BalanceUnits: inventory.BalanceUnits.String(), LastError: inventory.LastError,
+			CheckedAt: inventory.CheckedAt,
+		}
+	} else if a.tokenSweeper != nil {
 		inventory := a.tokenSweeper.Snapshot()
 		response.TokenInventory = &tokenInventoryResponse{
 			Status: inventory.Status, Symbol: inventory.Symbol, Address: inventory.Address,
 			BalanceUnits: inventory.BalanceUnits.String(), LastError: inventory.LastError,
 			CheckedAt: inventory.CheckedAt,
 		}
+	}
+	if a.healthHooks != nil && a.healthHooks.btcHeight != nil {
+		btcCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		height, btcErr := a.healthHooks.btcHeight(btcCtx)
+		cancel()
+		btcResp := &bitcoinStatusResponse{Status: "HEALTHY", Network: a.config.Bitcoin.Network, NetworkHeight: height}
+		if btcErr != nil {
+			btcResp.Status = "DOWN"
+			btcResp.NetworkHeight = 0
+			btcResp.LastError = btcErr.Error()
+		}
+		response.Bitcoin = btcResp
+	} else if a.bitcoinClient != nil {
+		btcCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		height, btcErr := a.bitcoinClient.BlockCount(btcCtx)
+		cancel()
+		btcResp := &bitcoinStatusResponse{Status: "HEALTHY", Network: a.config.Bitcoin.Network, NetworkHeight: height}
+		if btcErr != nil {
+			btcResp.Status = "DOWN"
+			btcResp.NetworkHeight = 0
+			btcResp.LastError = btcErr.Error()
+		}
+		response.Bitcoin = btcResp
 	}
 	writeJSON(w, http.StatusOK, response)
 }
