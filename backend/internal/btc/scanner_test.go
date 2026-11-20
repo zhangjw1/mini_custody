@@ -2,6 +2,8 @@ package btc
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,21 +11,29 @@ import (
 )
 
 type fakeScannerChain struct {
-	tip    int64
-	hashes map[int64]string
-	blocks map[string]bitcoin.Block
+	tip         int64
+	hashes      map[int64]string
+	hashErrors  map[int64]error
+	blocks      map[string]bitcoin.Block
+	blockErrors map[string]error
 }
 
 // BlockCount 返回测试链高度。
 func (f *fakeScannerChain) BlockCount(context.Context) (int64, error) { return f.tip, nil }
 
-// BlockHash 返回测试区块哈希。
+// BlockHash 返回测试区块哈希或模拟错误。
 func (f *fakeScannerChain) BlockHash(_ context.Context, h int64) (string, error) {
+	if err := f.hashErrors[h]; err != nil {
+		return "", err
+	}
 	return f.hashes[h], nil
 }
 
-// Block 返回测试区块内容。
+// Block 返回测试区块内容或模拟错误。
 func (f *fakeScannerChain) Block(_ context.Context, hash string) (bitcoin.Block, error) {
+	if err := f.blockErrors[hash]; err != nil {
+		return bitcoin.Block{}, err
+	}
 	return f.blocks[hash], nil
 }
 
@@ -74,11 +84,28 @@ func (f *fakeScannerStore) CreditBTCDeposit(_ context.Context, id, conf int64) e
 	return nil
 }
 
-// RewindBTCCheckpoint 记录测试检查点回退。
-func (f *fakeScannerStore) RewindBTCCheckpoint(_ context.Context, height int64, hash string) error {
+// ListBTCDepositsAfterBlock 返回指定高度之后尚未孤立的测试 BTC 充值。
+func (f *fakeScannerStore) ListBTCDepositsAfterBlock(_ context.Context, afterHeight int64) ([]ConfirmingDeposit, error) {
+	result := make([]ConfirmingDeposit, 0)
+	for _, item := range f.confirming {
+		if item.BlockHeight > afterHeight && !f.orphaned[item.ID] {
+			result = append(result, item)
+		}
+	}
+	return result, nil
+}
+
+// RewindBTCCheckpointWithDeposits 记录测试检查点回退并只孤立区块哈希确实变化了的充值。
+func (f *fakeScannerStore) RewindBTCCheckpointWithDeposits(_ context.Context, height int64, hash string, changedDepositIDs []int64) error {
 	f.rewinds++
 	f.checkpoint = height
 	f.cpHash = hash
+	if f.orphaned == nil {
+		f.orphaned = make(map[int64]bool)
+	}
+	for _, id := range changedDepositIDs {
+		f.orphaned[id] = true
+	}
 	return nil
 }
 
@@ -151,5 +178,110 @@ func TestScannerConfirmIsolatesOrphanedDepositAndCreditsOthers(t *testing.T) {
 	}
 	if store.rewinds != 1 || len(store.errors) == 0 {
 		t.Fatalf("rewinds=%d errors=%v", store.rewinds, store.errors)
+	}
+}
+
+// TestScannerStillConfirmsWhenBTCBlockScanFails 验证 BTC 扫块失败时不阻塞待确认充值继续确认入账。
+func TestScannerStillConfirmsWhenBTCBlockScanFails(t *testing.T) {
+	chain := &fakeScannerChain{
+		tip: 12,
+		hashes: map[int64]string{
+			10: "aaaa",
+			11: "bbbb",
+		},
+		blockErrors: map[string]error{"bbbb": errors.New("节点读取区块超时")},
+	}
+	store := &fakeScannerStore{
+		addresses:  map[string]Address{},
+		checkpoint: 10,
+		cpHash:     "aaaa",
+		confirming: []ConfirmingDeposit{{ID: 1, BlockHeight: 10, BlockHash: "aaaa"}},
+	}
+	scanner, err := NewScanner(chain, store, store.addresses, 10, 3, 10, time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() error = nil, want block scan error")
+	}
+	if store.credited[1] != 3 {
+		t.Fatalf("expected BTC deposit 1 credited despite scan error, got %v", store.credited)
+	}
+}
+
+// TestScannerDoesNotOrphanWhenRewindBlockHashFails 验证回退目标区块哈希查询失败时中止孤块冲正且不误孤立充值。
+func TestScannerDoesNotOrphanWhenRewindBlockHashFails(t *testing.T) {
+	chain := &fakeScannerChain{
+		tip: 12,
+		hashes: map[int64]string{
+			10: "bbbb",
+			12: "cccc",
+		},
+		hashErrors: map[int64]error{7: errors.New("节点查询回退区块哈希失败")},
+	}
+	store := &fakeScannerStore{
+		addresses:  map[string]Address{},
+		checkpoint: 12,
+		cpHash:     "cccc",
+		confirming: []ConfirmingDeposit{{ID: 1, BlockHeight: 10, BlockHash: "aaaa"}},
+	}
+	scanner, err := NewScanner(chain, store, store.addresses, 10, 3, 10, time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() error = nil, want rewind hash query error")
+	}
+	if store.orphaned[1] || store.rewinds != 0 {
+		t.Fatalf("must not orphan deposit or rewind when rewind block hash fails: orphaned=%v rewinds=%d", store.orphaned, store.rewinds)
+	}
+}
+
+// TestScannerRewindOrphansOnlyChangedBlockDeposits 验证回退窗口内仅区块哈希实际发生变化的充值被孤立，未分叉区块的充值保留待确认状态。
+func TestScannerRewindOrphansOnlyChangedBlockDeposits(t *testing.T) {
+	h9 := strings.Repeat("9", 64)
+	h10 := strings.Repeat("a", 64)
+	h11Old := strings.Repeat("b", 64)
+	h11New := strings.Repeat("c", 64)
+	h12Old := strings.Repeat("d", 64)
+	h12New := strings.Repeat("e", 64)
+	chain := &fakeScannerChain{
+		tip: 12,
+		hashes: map[int64]string{
+			9:  h9,
+			10: h10,
+			11: h11New,
+			12: h12New,
+		},
+		blocks: map[string]bitcoin.Block{
+			h10:    {Hash: h10, Height: 10},
+			h11New: {Hash: h11New, Height: 11},
+			h12New: {Hash: h12New, Height: 12},
+		},
+	}
+	store := &fakeScannerStore{
+		addresses:  map[string]Address{},
+		checkpoint: 12,
+		cpHash:     h12Old,
+		confirming: []ConfirmingDeposit{
+			{ID: 1, BlockHeight: 10, BlockHash: h10},
+			{ID: 2, BlockHeight: 11, BlockHash: h11Old},
+		},
+	}
+	scanner, err := NewScanner(chain, store, store.addresses, 10, 3, 10, time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if store.rewinds != 1 {
+		t.Fatalf("rewinds = %d, want 1", store.rewinds)
+	}
+	if store.orphaned[1] {
+		t.Fatalf("deposit 1 on unchanged block 10 must NOT be orphaned")
+	}
+	if !store.orphaned[2] {
+		t.Fatalf("deposit 2 on reorged block 11 MUST be orphaned")
 	}
 }

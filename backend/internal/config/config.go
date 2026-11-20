@@ -391,6 +391,9 @@ func (c Config) validate(requireCustody bool) error {
 	if c.SepoliaConfirmations == 0 || c.SepoliaScanInterval <= 0 || c.SepoliaScanBatchSize == 0 || c.SepoliaScanBatchSize > 100 {
 		return errors.New("Sepolia 充值扫描配置无效")
 	}
+	if c.SepoliaReorgRewindBlocks < c.SepoliaConfirmations {
+		return errors.New("SEPOLIA_REORG_REWIND_BLOCKS 不能小于 SEPOLIA_CONFIRMATIONS")
+	}
 	if c.EVMReplacement.RebroadcastAfter <= 0 || c.EVMReplacement.BumpAfter <= 0 ||
 		c.EVMReplacement.BumpBlockedManualReviewAfter < 0 ||
 		c.EVMReplacement.BumpPercent < 10 || c.EVMReplacement.MaxBumps < 0 ||
@@ -430,6 +433,9 @@ func (c Config) validate(requireCustody bool) error {
 	}
 	if c.ERC20.Confirmations == 0 || c.ERC20.ScanBatchSize == 0 || c.ERC20.ScanBatchSize > maximumERC20ScanBatchSize {
 		return errors.New("ERC-20 充值扫描配置无效")
+	}
+	if c.ERC20.ReorgRewindBlocks < c.ERC20.Confirmations {
+		return errors.New("ERC20_REORG_REWIND_BLOCKS 不能小于 ERC20_CONFIRMATIONS")
 	}
 	if c.ERC20.SweepInterval <= 0 {
 		return errors.New("ERC-20 归集间隔必须大于零")

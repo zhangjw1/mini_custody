@@ -266,11 +266,17 @@ func (s *Store) OrphanDeposit(ctx context.Context, depositID int64) (Deposit, bo
 
 // ListDepositsAfterBlock 查询指定区块高度之后需要复核主链一致性的非孤块充值记录。
 func (s *Store) ListDepositsAfterBlock(ctx context.Context, afterBlock int64, limit int) ([]Deposit, error) {
+	return s.ListDepositsAfterBlockCursor(ctx, afterBlock+1, afterBlock, 0, limit)
+}
+
+// ListDepositsAfterBlockCursor 使用键集游标分页查询不早于最小高度的非孤块充值记录。
+func (s *Store) ListDepositsAfterBlockCursor(ctx context.Context, minBlock, afterBlock, afterID int64, limit int) ([]Deposit, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+depositColumns+` FROM deposits
-		WHERE block_number > $1 AND status <> $2
-		ORDER BY block_number, id LIMIT $3`,
-		afterBlock, DepositOrphaned, normalizedLimit(limit),
+		WHERE block_number >= $1 AND status <> $2
+		  AND (block_number > $3 OR (block_number = $3 AND id > $4))
+		ORDER BY block_number, id LIMIT $5`,
+		minBlock, DepositOrphaned, afterBlock, afterID, normalizedLimit(limit),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("查询重组区间充值记录失败：%w", err)
@@ -281,6 +287,30 @@ func (s *Store) ListDepositsAfterBlock(ctx context.Context, afterBlock int64, li
 		item, err := s.scanDeposit(rows)
 		if err != nil {
 			return nil, fmt.Errorf("读取重组区间充值记录失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// ListCreditedDepositsAfterCursor 使用键集游标分页查询需要独立审计主链一致性的已入账充值记录。
+func (s *Store) ListCreditedDepositsAfterCursor(ctx context.Context, minBlock, afterBlock, afterID int64, limit int) ([]Deposit, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+depositColumns+` FROM deposits
+		WHERE block_number >= $1 AND status = $2
+		  AND (block_number > $3 OR (block_number = $3 AND id > $4))
+		ORDER BY block_number, id LIMIT $5`,
+		minBlock, DepositCredited, afterBlock, afterID, normalizedLimit(limit),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询已入账充值审计记录失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]Deposit, 0)
+	for rows.Next() {
+		item, err := s.scanDeposit(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取已入账充值审计记录失败：%w", err)
 		}
 		items = append(items, item)
 	}

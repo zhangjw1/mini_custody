@@ -17,8 +17,11 @@ import (
 )
 
 const (
-	defaultScannerName = "eth-deposit"
-	confirmBatchSize   = evm.DefaultConfirmBatchSize
+	defaultScannerName         = "eth-deposit"
+	confirmBatchSize           = evm.DefaultConfirmBatchSize
+	addressLookbackWindow      = int64(1000)
+	fullAddressRefreshInterval = 50
+	creditedAuditMinLookback   = uint64(256)
 )
 
 var (
@@ -65,6 +68,12 @@ type batchDepositStore interface {
 	RecordDepositsBatchAndCheckpoint(ctx context.Context, observations []postgres.DepositObservation, checkpoint postgres.ChainCheckpoint) ([]postgres.Deposit, int, error)
 }
 
+// depositCursorStore 定义可选的键集游标分页接口，用于突破单批上限全量审计重组充值。
+type depositCursorStore interface {
+	ListDepositsAfterBlockCursor(ctx context.Context, minBlock, afterBlock, afterID int64, limit int) ([]postgres.Deposit, error)
+	ListCreditedDepositsAfterCursor(ctx context.Context, minBlock, afterBlock, afterID int64, limit int) ([]postgres.Deposit, error)
+}
+
 // Config 定义 Sepolia 充值扫描起点、确认数、安全深度和重组回退策略。
 type Config struct {
 	StartBlock        *uint64
@@ -78,12 +87,13 @@ type Config struct {
 
 // Scanner 扫描 Sepolia 区块并将普通 ETH 充值安全记入平台账本。
 type Scanner struct {
-	chain         ChainClient
-	store         Store
-	logger        *slog.Logger
-	config        Config
-	addresses     map[common.Address]postgres.WalletAddress
-	lastAddressID int64
+	chain               ChainClient
+	store               Store
+	logger              *slog.Logger
+	config              Config
+	addresses           map[common.Address]postgres.WalletAddress
+	lastAddressID       int64
+	addressRefreshCount int
 }
 
 // NewScanner 创建并校验充值扫描器依赖和配置。
@@ -99,6 +109,9 @@ func NewScanner(chain ChainClient, store Store, logger *slog.Logger, cfg Config)
 	}
 	if cfg.ReorgRewindBlocks == 0 {
 		cfg.ReorgRewindBlocks = cfg.Confirmations
+	}
+	if cfg.ReorgRewindBlocks < cfg.Confirmations {
+		return nil, errors.New("充值扫描器回退深度不能小于确认数")
 	}
 	return &Scanner{
 		chain:     chain,
@@ -156,7 +169,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 	}
 }
 
-// RunOnce 执行一轮重组校验、安全深度区块发现和隔离式充值确认。
+// RunOnce 执行一轮重组校验、安全深度区块发现、独立已入账审计和隔离式充值确认。
 func (s *Scanner) RunOnce(ctx context.Context) error {
 	if err := s.refreshAddresses(ctx); err != nil {
 		return err
@@ -166,6 +179,14 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("查询 Sepolia 最新区块失败：%w", err)
 	}
 	headerCache := make(map[uint64]*types.Header)
+	scanErr := s.scanStep(ctx, latest, headerCache)
+	auditErr := s.reconcileCreditedDeposits(ctx, latest, headerCache)
+	confirmErr := s.confirmPending(ctx, latest, headerCache)
+	return errors.Join(scanErr, auditErr, confirmErr)
+}
+
+// scanStep 执行本轮检查点校验、区块扫描及当轮重组窗口回退核对，异常只中断扫块而不阻塞确认与审计。
+func (s *Scanner) scanStep(ctx context.Context, latest uint64, headerCache map[uint64]*types.Header) error {
 	next, expectedParentHash, scannedHeight, hasReorged, rewoundTo, err := s.prepareScanCursor(ctx, headerCache)
 	if err != nil {
 		return err
@@ -175,14 +196,16 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 	if canScan {
 		scanLimit = latest - s.config.SafeDepth
 	}
+	var scanErr error
 	for attempt := 0; attempt < 2 && canScan && next <= scanLimit; attempt++ {
 		last := scanLimit
 		if remaining := s.config.BatchSize - 1; remaining < scanLimit-next {
 			last = next + remaining
 		}
-		lastHash, parentMismatch, mismatchHeight, scanErr := s.scanBatch(ctx, next, last, expectedParentHash, headerCache)
-		if scanErr != nil {
-			return scanErr
+		lastHash, parentMismatch, mismatchHeight, err := s.scanBatch(ctx, next, last, expectedParentHash, headerCache)
+		if err != nil {
+			scanErr = err
+			break
 		}
 		if parentMismatch {
 			prevHeight := uint64(0)
@@ -191,7 +214,8 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 			}
 			newRewindTo, newRewindHash, rewindErr := s.rewindFromBlock(ctx, prevHeight, headerCache)
 			if rewindErr != nil {
-				return rewindErr
+				scanErr = rewindErr
+				break
 			}
 			hasReorged = true
 			rewoundTo = newRewindTo
@@ -205,17 +229,22 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 		break
 	}
 	if hasReorged {
-		if err := s.reconcileReorgWindow(ctx, rewoundTo, scannedHeight, headerCache); err != nil {
-			return err
+		if reconcileErr := s.reconcileReorgWindow(ctx, rewoundTo, scannedHeight, headerCache); reconcileErr != nil {
+			return errors.Join(scanErr, reconcileErr)
 		}
 	}
-	return s.confirmPending(ctx, latest, headerCache)
+	return scanErr
 }
 
-// refreshAddresses 从数据库增量或全量同步托管地址索引，使新增地址无需重启即可被扫描。
+// refreshAddresses 结合回看窗口增量加载和周期全量刷新同步托管地址索引，防止并发乱序提交漏掉小 ID 地址。
 func (s *Scanner) refreshAddresses(ctx context.Context) error {
-	if incStore, ok := s.store.(incrementalAddressStore); ok {
-		addresses, err := incStore.ListWalletAddressesAfterID(ctx, s.lastAddressID)
+	useFull := s.addressRefreshCount == 0 || s.addressRefreshCount%fullAddressRefreshInterval == 0
+	if incStore, ok := s.store.(incrementalAddressStore); ok && !useFull {
+		lookbackID := s.lastAddressID - addressLookbackWindow
+		if lookbackID < 0 {
+			lookbackID = 0
+		}
+		addresses, err := incStore.ListWalletAddressesAfterID(ctx, lookbackID)
 		if err != nil {
 			return fmt.Errorf("增量加载托管钱包地址失败：%w", err)
 		}
@@ -228,6 +257,7 @@ func (s *Scanner) refreshAddresses(ctx context.Context) error {
 				s.lastAddressID = address.ID
 			}
 		}
+		s.addressRefreshCount++
 		return nil
 	}
 	addresses, err := s.store.ListWalletAddresses(ctx)
@@ -235,13 +265,21 @@ func (s *Scanner) refreshAddresses(ctx context.Context) error {
 		return fmt.Errorf("加载托管钱包地址失败：%w", err)
 	}
 	index := make(map[common.Address]postgres.WalletAddress, len(addresses))
+	var maxID int64
 	for _, address := range addresses {
 		if !common.IsHexAddress(address.Address) {
 			return fmt.Errorf("托管钱包地址格式无效：address_id=%d", address.ID)
 		}
 		index[common.HexToAddress(address.Address)] = address
+		if address.ID > maxID {
+			maxID = address.ID
+		}
 	}
 	s.addresses = index
+	if maxID > s.lastAddressID {
+		s.lastAddressID = maxID
+	}
+	s.addressRefreshCount++
 	return nil
 }
 
@@ -302,49 +340,122 @@ func (s *Scanner) rewindFromBlock(ctx context.Context, fromBlock uint64, headerC
 	return rewindBlock, rewindHash, nil
 }
 
-// reconcileReorgWindow 在重组回退重扫后复核区间内充值记录，孤立已消失的待确认充值并对已入账充值发出告警。
+// reconcileReorgWindow 在重组回退重扫后分批分页复核区间内未入账充值记录，孤立已不在主链上的待确认充值。
 func (s *Scanner) reconcileReorgWindow(ctx context.Context, afterBlock, upToBlock uint64, headerCache map[uint64]*types.Header) error {
 	if afterBlock > math.MaxInt64 {
 		return errors.New("Sepolia 重组核对高度超出范围")
 	}
-	deposits, err := s.store.ListDepositsAfterBlock(ctx, int64(afterBlock), confirmBatchSize)
-	if err != nil {
-		return fmt.Errorf("查询重组区间 Sepolia 充值失败：%w", err)
-	}
-	heights := make([]uint64, 0, len(deposits))
-	for _, deposit := range deposits {
-		if deposit.BlockNumber >= 0 && uint64(deposit.BlockNumber) <= upToBlock {
-			heights = append(heights, uint64(deposit.BlockNumber))
+	minBlock := int64(afterBlock) + 1
+	cursorBlock := int64(afterBlock)
+	cursorID := int64(0)
+	cursorStore, hasCursor := s.store.(depositCursorStore)
+	for {
+		var (
+			deposits []postgres.Deposit
+			err      error
+		)
+		if hasCursor {
+			deposits, err = cursorStore.ListDepositsAfterBlockCursor(ctx, minBlock, cursorBlock, cursorID, confirmBatchSize)
+		} else {
+			deposits, err = s.store.ListDepositsAfterBlock(ctx, cursorBlock, confirmBatchSize)
 		}
-	}
-	s.prefetchHeaders(ctx, headerCache, heights)
-	for _, deposit := range deposits {
-		if deposit.BlockNumber < 0 || uint64(deposit.BlockNumber) > upToBlock {
-			continue
-		}
-		header, err := s.cachedHeaderByNumber(ctx, headerCache, uint64(deposit.BlockNumber))
 		if err != nil {
-			s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "REORG_HEADER_QUERY_FAILED", err.Error())
-			continue
+			return fmt.Errorf("查询重组区间 Sepolia 充值失败：%w", err)
 		}
-		if header != nil && strings.EqualFold(header.Hash().Hex(), deposit.BlockHash) {
-			continue
+		if len(deposits) == 0 {
+			return nil
 		}
-		if deposit.Status == postgres.DepositCredited {
+		heights := make([]uint64, 0, len(deposits))
+		for _, deposit := range deposits {
+			if deposit.BlockNumber >= 0 && uint64(deposit.BlockNumber) <= upToBlock && deposit.Status != postgres.DepositCredited {
+				heights = append(heights, uint64(deposit.BlockNumber))
+			}
+		}
+		s.prefetchHeaders(ctx, headerCache, heights)
+		for _, deposit := range deposits {
+			cursorBlock = deposit.BlockNumber
+			cursorID = deposit.ID
+			if deposit.BlockNumber < 0 || uint64(deposit.BlockNumber) > upToBlock || deposit.Status == postgres.DepositCredited {
+				continue
+			}
+			header, err := s.cachedHeaderByNumber(ctx, headerCache, uint64(deposit.BlockNumber))
+			if err != nil {
+				s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "REORG_HEADER_QUERY_FAILED", err.Error())
+				continue
+			}
+			if header != nil && strings.EqualFold(header.Hash().Hex(), deposit.BlockHash) {
+				continue
+			}
+			msg := fmt.Sprintf("Sepolia 充值 %d 原区块 %d (%s) 重组后已不在主链，执行孤块冲正", deposit.ID, deposit.BlockNumber, deposit.BlockHash)
+			s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "BLOCK_HASH_MISMATCH", msg)
+			if _, orphaned, err := s.store.OrphanDeposit(ctx, deposit.ID); err != nil {
+				s.recordDepositError(ctx, "orphan_deposit", deposit.ID, "ORPHAN_DEPOSIT_FAILED", err.Error())
+			} else if orphaned {
+				s.logger.Warn("Sepolia 孤块充值已冲正", "deposit_id", deposit.ID, "block_number", deposit.BlockNumber)
+			}
+		}
+		if !hasCursor || len(deposits) < confirmBatchSize || uint64(cursorBlock) > upToBlock {
+			return nil
+		}
+	}
+}
+
+// reconcileCreditedDeposits 独立按批游标分页审计窗口内全部已入账充值的主链区块哈希，不依赖本轮扫块且不受单批上限限制。
+func (s *Scanner) reconcileCreditedDeposits(ctx context.Context, latest uint64, headerCache map[uint64]*types.Header) error {
+	cursorStore, ok := s.store.(depositCursorStore)
+	if !ok {
+		return nil
+	}
+	lookback := creditedAuditMinLookback
+	if s.config.ReorgRewindBlocks*2 > lookback {
+		lookback = s.config.ReorgRewindBlocks * 2
+	}
+	if s.config.Confirmations*2 > lookback {
+		lookback = s.config.Confirmations * 2
+	}
+	minBlock := int64(0)
+	if latest > lookback {
+		minBlock = int64(latest - lookback)
+	}
+	cursorBlock := minBlock - 1
+	cursorID := int64(0)
+	for {
+		deposits, err := cursorStore.ListCreditedDepositsAfterCursor(ctx, minBlock, cursorBlock, cursorID, confirmBatchSize)
+		if err != nil {
+			return fmt.Errorf("查询已入账 Sepolia 充值审计批次失败：%w", err)
+		}
+		if len(deposits) == 0 {
+			return nil
+		}
+		heights := make([]uint64, 0, len(deposits))
+		for _, deposit := range deposits {
+			if deposit.BlockNumber >= 0 {
+				heights = append(heights, uint64(deposit.BlockNumber))
+			}
+		}
+		s.prefetchHeaders(ctx, headerCache, heights)
+		for _, deposit := range deposits {
+			cursorBlock = deposit.BlockNumber
+			cursorID = deposit.ID
+			if deposit.BlockNumber < 0 {
+				continue
+			}
+			header, err := s.cachedHeaderByNumber(ctx, headerCache, uint64(deposit.BlockNumber))
+			if err != nil {
+				s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "REORG_HEADER_QUERY_FAILED", err.Error())
+				continue
+			}
+			if header != nil && strings.EqualFold(header.Hash().Hex(), deposit.BlockHash) {
+				continue
+			}
 			msg := fmt.Sprintf("已入账 Sepolia 充值 %d 原区块 %d (%s) 发生重组，保持用户余额不变请人工核查", deposit.ID, deposit.BlockNumber, deposit.BlockHash)
 			s.logger.Error(msg, "deposit_id", deposit.ID)
 			s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "CREDITED_DEPOSIT_REORG", msg)
-			continue
 		}
-		msg := fmt.Sprintf("Sepolia 充值 %d 原区块 %d (%s) 重组后已不在主链，执行孤块冲正", deposit.ID, deposit.BlockNumber, deposit.BlockHash)
-		s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "BLOCK_HASH_MISMATCH", msg)
-		if _, orphaned, err := s.store.OrphanDeposit(ctx, deposit.ID); err != nil {
-			s.recordDepositError(ctx, "orphan_deposit", deposit.ID, "ORPHAN_DEPOSIT_FAILED", err.Error())
-		} else if orphaned {
-			s.logger.Warn("Sepolia 孤块充值已冲正", "deposit_id", deposit.ID, "block_number", deposit.BlockNumber)
+		if len(deposits) < confirmBatchSize {
+			return nil
 		}
 	}
-	return nil
 }
 
 // depositCandidate 描述等待过滤内部转账哈希的候选 ETH 充值交易。

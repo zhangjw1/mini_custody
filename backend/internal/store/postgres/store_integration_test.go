@@ -2582,3 +2582,62 @@ func TestIntegrationMigration000009BackfillAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestIntegrationBTCRewindIsolatesPendingBalanceFailure 验证 BTC 回退时单用户待确认余额不足只把该笔转入 REORG_RECHECK 并告警，不阻塞其他用户冲正和检查点回退。
+func TestIntegrationBTCRewindIsolatesPendingBalanceFailure(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	provider, err := wallet.NewMnemonicKeyProvider(integrationTestMnemonic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.EnsureBitcoinWallets(ctx, provider); err != nil {
+		t.Fatal(err)
+	}
+	addresses, err := store.ListBTCAddresses(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var addrA, addrB btc.Address
+	for _, a := range addresses {
+		if addrA.ID == 0 {
+			addrA = a
+		} else {
+			addrB = a
+			break
+		}
+	}
+	if addrA.ID == 0 || addrB.ID == 0 {
+		t.Fatal("need 2 demo BTC addresses")
+	}
+	blockHash10 := strings.Repeat("b", 64)
+	obsA := btc.DepositObservation{UserID: addrA.UserID, AddressID: addrA.ID, TxID: strings.Repeat("a", 64), Vout: 0, BlockHash: blockHash10, BlockHeight: 10, AmountSats: 1000, ScriptPubKey: addrA.ScriptPubKey}
+	obsB := btc.DepositObservation{UserID: addrB.UserID, AddressID: addrB.ID, TxID: strings.Repeat("d", 64), Vout: 0, BlockHash: blockHash10, BlockHeight: 10, AmountSats: 2000, ScriptPubKey: addrB.ScriptPubKey}
+	if _, err = store.RecordBTCDepositsAndCheckpoint(ctx, []btc.DepositObservation{obsA, obsB}, btc.Checkpoint{Network: btc.Network, Scanner: "btc-deposit", LastScannedBlock: 10, LastScannedHash: blockHash10}); err != nil {
+		t.Fatal(err)
+	}
+	// 人为制造用户 A 待确认余额不足以扣回的场景。
+	if _, err = store.pool.Exec(ctx, `UPDATE asset_balances SET pending_deposit_wei = 0 WHERE user_id = $1 AND asset = 'BTC'`, addrA.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RewindBTCCheckpoint(ctx, 9, strings.Repeat("c", 64)); err != nil {
+		t.Fatalf("RewindBTCCheckpoint() should isolate single-user pending shortage without failing entire rewind, got err = %v", err)
+	}
+	var statusA, statusB string
+	_ = store.pool.QueryRow(ctx, `SELECT status FROM btc_deposits WHERE txid=$1`, obsA.TxID).Scan(&statusA)
+	_ = store.pool.QueryRow(ctx, `SELECT status FROM btc_deposits WHERE txid=$1`, obsB.TxID).Scan(&statusB)
+	if statusA != "REORG_RECHECK" || statusB != DepositOrphaned {
+		t.Fatalf("statusA=%s (want REORG_RECHECK), statusB=%s (want ORPHANED)", statusA, statusB)
+	}
+	var pendingB string
+	_ = store.pool.QueryRow(ctx, `SELECT pending_deposit_wei::text FROM asset_balances WHERE user_id=$1 AND asset='BTC'`, addrB.UserID).Scan(&pendingB)
+	if pendingB != "0" {
+		t.Fatalf("pendingB=%s, want 0", pendingB)
+	}
+	var errCount int
+	_ = store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM worker_errors WHERE reference_type='BTC_DEPOSIT' AND error_code='REORG_RECHECK_MANUAL_REVIEW'`).Scan(&errCount)
+	if errCount != 1 {
+		t.Fatalf("REORG_RECHECK_MANUAL_REVIEW worker_errors count = %d, want 1", errCount)
+	}
+}

@@ -27,11 +27,12 @@ func ConfigureBitcoinNetwork(network string) error {
 }
 
 const (
-	DepositDetected   = "DETECTED"
-	DepositConfirming = "CONFIRMING"
-	DepositConfirmed  = "CONFIRMED"
-	DepositCredited   = "CREDITED"
-	DepositOrphaned   = "ORPHANED"
+	DepositDetected     = "DETECTED"
+	DepositConfirming   = "CONFIRMING"
+	DepositConfirmed    = "CONFIRMED"
+	DepositCredited     = "CREDITED"
+	DepositOrphaned     = "ORPHANED"
+	DepositReorgRecheck = "REORG_RECHECK"
 )
 
 const (

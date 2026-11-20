@@ -310,6 +310,26 @@ func TestConfigLoadsDBPoolSettings(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsReorgRewindSmallerThanConfirmations 验证重扫回退深度小于确认数时启动配置校验直接报错。
+func TestLoadRejectsReorgRewindSmallerThanConfirmations(t *testing.T) {
+	setRequiredConfigEnvironment(t)
+	t.Setenv("SEPOLIA_CONFIRMATIONS", "5")
+	t.Setenv("SEPOLIA_REORG_REWIND_BLOCKS", "3")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want error when SEPOLIA_REORG_REWIND_BLOCKS < SEPOLIA_CONFIRMATIONS")
+	}
+
+	setRequiredConfigEnvironment(t)
+	t.Setenv("SEPOLIA_CONFIRMATIONS", "3")
+	t.Setenv("SEPOLIA_REORG_REWIND_BLOCKS", "3")
+	t.Setenv("ERC20_ENABLED", "true")
+	t.Setenv("ERC20_CONFIRMATIONS", "6")
+	t.Setenv("ERC20_REORG_REWIND_BLOCKS", "4")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want error when ERC20_REORG_REWIND_BLOCKS < ERC20_CONFIRMATIONS")
+	}
+}
+
 // setRequiredConfigEnvironment 设置加载配置所需的最小非敏感测试值。
 func setRequiredConfigEnvironment(t *testing.T) {
 	t.Helper()

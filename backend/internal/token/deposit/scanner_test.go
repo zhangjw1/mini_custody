@@ -61,11 +61,12 @@ type blockRange struct {
 }
 
 type fakeContract struct {
-	address common.Address
-	logs    []types.Log
-	events  map[uint]erc20.TransferEvent
-	err     error
-	calls   []blockRange
+	address  common.Address
+	logs     []types.Log
+	events   map[uint]erc20.TransferEvent
+	err      error
+	calls    []blockRange
+	onFilter func()
 }
 
 // Address 返回测试 Token 合约地址。
@@ -74,6 +75,9 @@ func (f *fakeContract) Address() common.Address { return f.address }
 // FilterTransferLogs 记录区块范围并返回测试日志。
 func (f *fakeContract) FilterTransferLogs(_ context.Context, fromBlock, toBlock uint64) ([]types.Log, error) {
 	f.calls = append(f.calls, blockRange{from: fromBlock, to: toBlock})
+	if f.onFilter != nil {
+		f.onFilter()
+	}
 	return f.logs, f.err
 }
 
@@ -167,12 +171,36 @@ func (f *fakeStore) ListConfirmingTokenDeposits(context.Context, int64, int) ([]
 }
 
 // ListTokenDepositsAfterBlock 返回指定高度之后的非孤块测试 Token 充值记录。
-func (f *fakeStore) ListTokenDepositsAfterBlock(_ context.Context, assetID, afterBlock int64, _ int) ([]postgres.TokenDeposit, error) {
+func (f *fakeStore) ListTokenDepositsAfterBlock(ctx context.Context, assetID, afterBlock int64, limit int) ([]postgres.TokenDeposit, error) {
+	return f.ListTokenDepositsAfterBlockCursor(ctx, assetID, afterBlock+1, afterBlock, 0, limit)
+}
+
+// ListTokenDepositsAfterBlockCursor 按键集游标分页返回测试非孤块 Token 充值记录。
+func (f *fakeStore) ListTokenDepositsAfterBlockCursor(_ context.Context, assetID, minBlock, afterBlock, afterID int64, limit int) ([]postgres.TokenDeposit, error) {
 	result := make([]postgres.TokenDeposit, 0)
 	for _, item := range f.confirming {
-		if item.AssetID == assetID && item.BlockNumber > afterBlock && item.Status != postgres.DepositOrphaned {
+		if item.AssetID == assetID && item.BlockNumber >= minBlock && item.Status != postgres.DepositOrphaned &&
+			(item.BlockNumber > afterBlock || (item.BlockNumber == afterBlock && item.ID > afterID)) {
 			result = append(result, item)
 		}
+	}
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+// ListCreditedTokenDepositsAfterCursor 按键集游标分页返回测试已入账 Token 充值记录。
+func (f *fakeStore) ListCreditedTokenDepositsAfterCursor(_ context.Context, assetID, minBlock, afterBlock, afterID int64, limit int) ([]postgres.TokenDeposit, error) {
+	result := make([]postgres.TokenDeposit, 0)
+	for _, item := range f.confirming {
+		if item.AssetID == assetID && item.BlockNumber >= minBlock && item.Status == postgres.DepositCredited &&
+			(item.BlockNumber > afterBlock || (item.BlockNumber == afterBlock && item.ID > afterID)) {
+			result = append(result, item)
+		}
+	}
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
 	}
 	return result, nil
 }
@@ -223,12 +251,23 @@ func (f *fakeStore) RecordWorkerError(_ context.Context, item postgres.WorkerErr
 func TestScannerSortsFiltersAndResumesFromCheckpoint(t *testing.T) {
 	monitored := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	unmonitored := common.HexToAddress("0x2222222222222222222222222222222222222222")
-	chain := &fakeChain{latest: 12, headers: headersForRange(10, 14)}
+	headers := headersForRange(10, 14)
+	chain := &fakeChain{latest: 12, headers: headers}
+	ev1 := testEvent(monitored, 10, 1)
+	ev1.BlockHash = headers[10].Hash()
+	ev2 := testEvent(unmonitored, 10, 2)
+	ev2.BlockHash = headers[10].Hash()
+	ev3 := testEvent(monitored, 12, 3)
+	ev3.BlockHash = headers[12].Hash()
 	contract := &fakeContract{
 		address: common.HexToAddress("0x1c7d4b196cb0c7b01d743fbc6116a902379c7238"),
-		logs:    []types.Log{{BlockNumber: 12, TxIndex: 1, Index: 3}, {BlockNumber: 10, TxIndex: 2, Index: 2}, {BlockNumber: 10, TxIndex: 1, Index: 1}},
+		logs: []types.Log{
+			{BlockNumber: 12, BlockHash: headers[12].Hash(), TxIndex: 1, Index: 3},
+			{BlockNumber: 10, BlockHash: headers[10].Hash(), TxIndex: 2, Index: 2},
+			{BlockNumber: 10, BlockHash: headers[10].Hash(), TxIndex: 1, Index: 1},
+		},
 		events: map[uint]erc20.TransferEvent{
-			1: testEvent(monitored, 10, 1), 2: testEvent(unmonitored, 10, 2), 3: testEvent(monitored, 12, 3),
+			1: ev1, 2: ev2, 3: ev3,
 		},
 	}
 	store := newFakeStore(monitored)
@@ -437,5 +476,133 @@ func TestScannerCachesHeadersWithinTick(t *testing.T) {
 	}
 	if len(store.credited) != 3 {
 		t.Fatalf("expected all 3 deposits credited, got %v", store.credited)
+	}
+}
+
+// TestTokenScannerLookbackRecoversOutOfOrderAddress 验证并发乱序提交的小 ID 托管地址可被回看窗口和全量刷新捕获。
+func TestTokenScannerLookbackRecoversOutOfOrderAddress(t *testing.T) {
+	first := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	late := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	headers := headersForRange(10, 12)
+	chain := &fakeChain{latest: 12, headers: headers}
+	contract := &fakeContract{
+		address: common.HexToAddress("0x1c7d4b196cb0c7b01d743fbc6116a902379c7238"),
+		events:  make(map[uint]erc20.TransferEvent),
+	}
+	store := &fakeStore{
+		addresses: []postgres.WalletAddress{{ID: 1500, UserID: 1, Network: postgres.NetworkSepolia, Address: stringsLower(first.Hex())}},
+		updated:   make(map[int64]int64), credited: make(map[int64]int),
+	}
+	start := uint64(10)
+	scanner := newTestScanner(t, chain, contract, store, &start)
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("first RunOnce() error = %v", err)
+	}
+	ev := testEvent(late, 12, 9)
+	ev.BlockHash = headers[12].Hash()
+	contract.logs = []types.Log{{BlockNumber: 12, BlockHash: headers[12].Hash(), TxIndex: 1, Index: 9}}
+	contract.events[9] = ev
+	store.addresses = append(store.addresses, postgres.WalletAddress{ID: 1200, UserID: 2, Network: postgres.NetworkSepolia, Address: stringsLower(late.Hex())})
+	store.checkpoint.LastScannedBlock = 11
+	store.checkpoint.LastScannedHash = stringsLower(headers[11].Hash().Hex())
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("lookback RunOnce() error = %v", err)
+	}
+	if len(store.recorded) != 1 || store.recorded[0].UserID != 2 {
+		t.Fatalf("expected lookback address 1200 observed, recorded = %+v", store.recorded)
+	}
+}
+
+// TestTokenScannerRewindsWhenLogBlockHashMismatchesHeader 验证日志 BlockHash 与区块头不一致时按重组回退且不落库。
+func TestTokenScannerRewindsWhenLogBlockHashMismatchesHeader(t *testing.T) {
+	monitored := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	headers := headersForRange(7, 12)
+	chain := &fakeChain{latest: 12, headers: headers}
+	staleHash := common.HexToHash("0xdead11")
+	ev := testEvent(monitored, 11, 1)
+	ev.BlockHash = staleHash
+	contract := &fakeContract{
+		address: common.HexToAddress("0x1c7d4b196cb0c7b01d743fbc6116a902379c7238"),
+		logs:    []types.Log{{BlockNumber: 11, BlockHash: staleHash, TxIndex: 0, Index: 1}},
+		events:  map[uint]erc20.TransferEvent{1: ev},
+	}
+	// 回退后第二轮扫不到假日志。
+	var round int
+	contract.onFilter = func() {
+		round++
+		if round > 1 {
+			contract.logs = nil
+		}
+	}
+	store := newFakeStore(monitored)
+	store.checkpoint = &postgres.ChainCheckpoint{
+		Network: postgres.NetworkSepolia, Scanner: "erc20:test",
+		LastScannedBlock: 10, LastScannedHash: stringsLower(headers[10].Hash().Hex()),
+	}
+	scanner := newTestScanner(t, chain, contract, store, nil)
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if len(store.rewinds) == 0 || len(store.recorded) != 0 {
+		t.Fatalf("expected reorg rewind without recording mismatched log, rewinds=%+v recorded=%+v", store.rewinds, store.recorded)
+	}
+}
+
+// TestTokenScannerRevalidatesToBlockHeaderAfterGetLogs 验证 getLogs 期间末块发生重组时不会复用旧缓存提交过期哈希。
+func TestTokenScannerRevalidatesToBlockHeaderAfterGetLogs(t *testing.T) {
+	monitored := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	headers := headersForRange(9, 12)
+	oldToHash := stringsLower(headers[12].Hash().Hex())
+	chain := &fakeChain{latest: 12, headers: headers}
+	newToHeader := &types.Header{
+		Number:     big.NewInt(12),
+		ParentHash: headers[11].Hash(),
+		Extra:      []byte("reorged-block-12"),
+	}
+	newToHash := stringsLower(newToHeader.Hash().Hex())
+	var mutated bool
+	contract := &fakeContract{
+		address: common.HexToAddress("0x1c7d4b196cb0c7b01d743fbc6116a902379c7238"),
+		onFilter: func() {
+			if !mutated {
+				mutated = true
+				chain.headers[12] = newToHeader
+			}
+		},
+	}
+	store := newFakeStore(monitored)
+	store.checkpoint = &postgres.ChainCheckpoint{
+		Network: postgres.NetworkSepolia, Scanner: "erc20:test",
+		LastScannedBlock: 9, LastScannedHash: stringsLower(headers[9].Hash().Hex()),
+	}
+	scanner := newTestScanner(t, chain, contract, store, nil)
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if store.checkpoint == nil || store.checkpoint.LastScannedHash == oldToHash || store.checkpoint.LastScannedHash != newToHash {
+		t.Fatalf("checkpoint hash = %s, want revalidated post-getLogs hash %s (not stale %s)", store.checkpoint.LastScannedHash, newToHash, oldToHash)
+	}
+}
+
+// TestTokenScannerStillConfirmsAndCreditsWhenScanFails 验证 Token 扫块失败时不阻塞已有待确认充值确认与入账。
+func TestTokenScannerStillConfirmsAndCreditsWhenScanFails(t *testing.T) {
+	monitored := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	headers := headersForRange(10, 12)
+	chain := &fakeChain{latest: 12, headers: headers}
+	contract := &fakeContract{address: common.HexToAddress("0x1c7d4b196cb0c7b01d743fbc6116a902379c7238"), err: errors.New("getLogs 超时")}
+	store := newFakeStore(monitored)
+	store.checkpoint = &postgres.ChainCheckpoint{
+		Network: postgres.NetworkSepolia, Scanner: "erc20:test",
+		LastScannedBlock: 10, LastScannedHash: stringsLower(headers[10].Hash().Hex()),
+	}
+	store.confirming = []postgres.TokenDeposit{
+		{ID: 5, AssetID: 1, BlockNumber: 10, BlockHash: stringsLower(headers[10].Hash().Hex()), Status: postgres.DepositConfirming},
+	}
+	scanner := newTestScanner(t, chain, contract, store, nil)
+	if err := scanner.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() error = nil, want scan failure")
+	}
+	if store.credited[5] != 1 {
+		t.Fatalf("expected token deposit 5 credited despite getLogs error, got %v", store.credited)
 	}
 }

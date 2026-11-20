@@ -20,9 +20,10 @@ type ScannerStore interface {
 	BTCCheckpoint(context.Context) (int64, string, error)
 	RecordBTCDepositsAndCheckpoint(context.Context, []DepositObservation, Checkpoint) (int, error)
 	ListConfirmingBTCDeposits(context.Context, int) ([]ConfirmingDeposit, error)
+	ListBTCDepositsAfterBlock(context.Context, int64) ([]ConfirmingDeposit, error)
 	UpdateBTCDepositConfirmations(context.Context, int64, int64) error
 	CreditBTCDeposit(context.Context, int64, int64) error
-	RewindBTCCheckpoint(context.Context, int64, string) error
+	RewindBTCCheckpointWithDeposits(context.Context, int64, string, []int64) error
 	OrphanBTCDeposit(context.Context, int64) error
 	RecordBTCWorkerError(ctx context.Context, stage, referenceType string, referenceID *int64, errorCode, errorMessage string) error
 }
@@ -98,38 +99,68 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 			if rewind < 0 {
 				rewind = 0
 			}
-			rewindHash, rewindErr := s.chain.BlockHash(ctx, rewind)
-			if rewindErr != nil {
+			if rewindErr := s.rewindAndOrphanChanged(ctx, rewind); rewindErr != nil {
 				return rewindErr
-			}
-			if err = s.store.RewindBTCCheckpoint(ctx, rewind, rewindHash); err != nil {
-				return err
 			}
 			start = rewind + 1
 		}
 	}
+	var scanErr error
 	for n := int64(0); n < s.batch && start+n <= tip; n++ {
 		h := start + n
 		hash, err := s.chain.BlockHash(ctx, h)
 		if err != nil {
-			return err
+			scanErr = err
+			break
 		}
 		block, err := s.chain.Block(ctx, hash)
 		if err != nil {
-			return err
+			scanErr = err
+			break
 		}
 		obs, err := ScanBlock(block, s.addresses)
 		if err != nil {
-			return err
+			scanErr = err
+			break
 		}
 		if _, err = s.store.RecordBTCDepositsAndCheckpoint(ctx, obs, Checkpoint{Network: Network, Scanner: "btc-deposit", LastScannedBlock: h, LastScannedHash: hash}); err != nil {
-			return err
+			scanErr = err
+			break
 		}
 	}
-	return s.confirm(ctx, tip)
+	confirmErr := s.confirm(ctx, tip)
+	return errors.Join(scanErr, confirmErr)
 }
 
-// confirm 更新确认数并在复核原区块哈希后完成入账，单条异常隔离跳过而不阻塞后续入账。
+// rewindAndOrphanChanged 先核查回退目标块与各充值所在块的最新主链哈希，仅对哈希实际发生变化的充值执行冲正。
+func (s *Scanner) rewindAndOrphanChanged(ctx context.Context, rewind int64) error {
+	rewindHash, err := s.chain.BlockHash(ctx, rewind)
+	if err != nil {
+		return fmt.Errorf("查询 BTC 回退区块 %d 哈希失败：%w", rewind, err)
+	}
+	deposits, err := s.store.ListBTCDepositsAfterBlock(ctx, rewind)
+	if err != nil {
+		return fmt.Errorf("查询回退区间 BTC 充值失败：%w", err)
+	}
+	chainHashes := make(map[int64]string, len(deposits))
+	changedIDs := make([]int64, 0)
+	for _, dep := range deposits {
+		chainHash, ok := chainHashes[dep.BlockHeight]
+		if !ok {
+			chainHash, err = s.chain.BlockHash(ctx, dep.BlockHeight)
+			if err != nil {
+				return fmt.Errorf("复核 BTC 充值区块 %d 哈希失败：%w", dep.BlockHeight, err)
+			}
+			chainHashes[dep.BlockHeight] = chainHash
+		}
+		if chainHash != dep.BlockHash {
+			changedIDs = append(changedIDs, dep.ID)
+		}
+	}
+	return s.store.RewindBTCCheckpointWithDeposits(ctx, rewind, rewindHash, changedIDs)
+}
+
+// confirm 更新确认数并在复核原区块哈希后完成入账，回退块哈希查询失败时直接中止而不误孤立充值。
 func (s *Scanner) confirm(ctx context.Context, tip int64) error {
 	items, err := s.store.ListConfirmingBTCDeposits(ctx, 200)
 	if err != nil {
@@ -158,11 +189,15 @@ func (s *Scanner) confirm(ctx context.Context, tip int64) error {
 			if rewind < 0 {
 				rewind = 0
 			}
-			if last, _, cpErr := s.store.BTCCheckpoint(ctx); cpErr == nil && last >= item.BlockHeight {
-				if rewindHash, rHashErr := s.chain.BlockHash(ctx, rewind); rHashErr == nil {
-					if rErr := s.store.RewindBTCCheckpoint(ctx, rewind, rewindHash); rErr != nil {
-						s.recordDepositError(ctx, "rewind_checkpoint", item.ID, "BTC_REORG_REWIND_FAILED", rErr.Error())
-					}
+			last, _, cpErr := s.store.BTCCheckpoint(ctx)
+			if cpErr != nil {
+				s.recordDepositError(ctx, "rewind_checkpoint", item.ID, "BTC_REORG_REWIND_FAILED", cpErr.Error())
+				return fmt.Errorf("查询 BTC 检查点失败，停止孤立充值 %d：%w", item.ID, cpErr)
+			}
+			if last >= item.BlockHeight {
+				if rewindErr := s.rewindAndOrphanChanged(ctx, rewind); rewindErr != nil {
+					s.recordDepositError(ctx, "rewind_checkpoint", item.ID, "BTC_REORG_REWIND_FAILED", rewindErr.Error())
+					return rewindErr
 				}
 			}
 			if orphanErr := s.store.OrphanBTCDeposit(ctx, item.ID); orphanErr != nil {

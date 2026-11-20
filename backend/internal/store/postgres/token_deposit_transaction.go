@@ -236,11 +236,17 @@ func (s *Store) OrphanTokenDeposit(ctx context.Context, depositID int64) (TokenD
 
 // ListTokenDepositsAfterBlock 查询指定高度之后需复核主链一致性的非孤块 Token 充值记录。
 func (s *Store) ListTokenDepositsAfterBlock(ctx context.Context, assetID, afterBlock int64, limit int) ([]TokenDeposit, error) {
+	return s.ListTokenDepositsAfterBlockCursor(ctx, assetID, afterBlock+1, afterBlock, 0, limit)
+}
+
+// ListTokenDepositsAfterBlockCursor 使用键集游标分页查询不早于最小高度的非孤块 Token 充值记录。
+func (s *Store) ListTokenDepositsAfterBlockCursor(ctx context.Context, assetID, minBlock, afterBlock, afterID int64, limit int) ([]TokenDeposit, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+tokenDepositColumns+` FROM token_deposits
-		WHERE asset_id = $1 AND block_number > $2 AND status <> $3
-		ORDER BY block_number, id LIMIT $4`,
-		assetID, afterBlock, DepositOrphaned, normalizedLimit(limit),
+		WHERE asset_id = $1 AND block_number >= $2 AND status <> $3
+		  AND (block_number > $4 OR (block_number = $4 AND id > $5))
+		ORDER BY block_number, id LIMIT $6`,
+		assetID, minBlock, DepositOrphaned, afterBlock, afterID, normalizedLimit(limit),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("查询重组区间 Token 充值记录失败：%w", err)
@@ -251,6 +257,30 @@ func (s *Store) ListTokenDepositsAfterBlock(ctx context.Context, assetID, afterB
 		item, err := s.scanTokenDeposit(rows)
 		if err != nil {
 			return nil, fmt.Errorf("读取重组区间 Token 充值记录失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// ListCreditedTokenDepositsAfterCursor 使用键集游标分页查询需要独立审计主链一致性的已入账 Token 充值记录。
+func (s *Store) ListCreditedTokenDepositsAfterCursor(ctx context.Context, assetID, minBlock, afterBlock, afterID int64, limit int) ([]TokenDeposit, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+tokenDepositColumns+` FROM token_deposits
+		WHERE asset_id = $1 AND block_number >= $2 AND status = $3
+		  AND (block_number > $4 OR (block_number = $4 AND id > $5))
+		ORDER BY block_number, id LIMIT $6`,
+		assetID, minBlock, DepositCredited, afterBlock, afterID, normalizedLimit(limit),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询已入账 Token 充值审计记录失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]TokenDeposit, 0)
+	for rows.Next() {
+		item, err := s.scanTokenDeposit(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取已入账 Token 充值审计记录失败：%w", err)
 		}
 		items = append(items, item)
 	}

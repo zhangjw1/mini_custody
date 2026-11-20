@@ -223,13 +223,37 @@ func (f *fakeStore) ListConfirmingDeposits(context.Context, int) ([]postgres.Dep
 	return result, nil
 }
 
-// ListDepositsAfterBlock 返回指定区块之后的非孤块测试充值记录。
-func (f *fakeStore) ListDepositsAfterBlock(_ context.Context, afterBlock int64, _ int) ([]postgres.Deposit, error) {
+// ListDepositsAfterBlock 返回指定区块之后的非孤块测试充值记录并严格遵守批次大小。
+func (f *fakeStore) ListDepositsAfterBlock(ctx context.Context, afterBlock int64, limit int) ([]postgres.Deposit, error) {
+	return f.ListDepositsAfterBlockCursor(ctx, afterBlock+1, afterBlock, 0, limit)
+}
+
+// ListDepositsAfterBlockCursor 按键集游标分页返回测试非孤块充值记录。
+func (f *fakeStore) ListDepositsAfterBlockCursor(_ context.Context, minBlock, afterBlock, afterID int64, limit int) ([]postgres.Deposit, error) {
 	result := make([]postgres.Deposit, 0)
 	for _, item := range f.deposits {
-		if item.BlockNumber > afterBlock && item.Status != postgres.DepositOrphaned {
+		if item.BlockNumber >= minBlock && item.Status != postgres.DepositOrphaned &&
+			(item.BlockNumber > afterBlock || (item.BlockNumber == afterBlock && item.ID > afterID)) {
 			result = append(result, item)
 		}
+	}
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+// ListCreditedDepositsAfterCursor 按键集游标分页返回测试已入账充值记录。
+func (f *fakeStore) ListCreditedDepositsAfterCursor(_ context.Context, minBlock, afterBlock, afterID int64, limit int) ([]postgres.Deposit, error) {
+	result := make([]postgres.Deposit, 0)
+	for _, item := range f.deposits {
+		if item.BlockNumber >= minBlock && item.Status == postgres.DepositCredited &&
+			(item.BlockNumber > afterBlock || (item.BlockNumber == afterBlock && item.ID > afterID)) {
+			result = append(result, item)
+		}
+	}
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
 	}
 	return result, nil
 }
@@ -589,7 +613,7 @@ func TestScannerBatchRPCAndIncrementalAddresses(t *testing.T) {
 		t.Fatalf("observations = %d, checkpoint = %+v", len(store.observations), store.checkpoint)
 	}
 
-	// 新增地址后，第二轮仅增量查询 id > 7，且只扫描新增区块 15。
+	// 新增地址后，第二轮使用 1000 回看窗口（max(7-1000,0)=0）避免漏掉并发乱序提交的小 ID 地址，并扫描新增区块 15。
 	tx5 := testTransaction(4, &target2, 500)
 	b15 := testBlockWithParent(15, b14.Hash(), tx5)
 	chain.latest = 15
@@ -600,10 +624,128 @@ func TestScannerBatchRPCAndIncrementalAddresses(t *testing.T) {
 	if err := scanner.RunOnce(context.Background()); err != nil {
 		t.Fatalf("second RunOnce() error = %v", err)
 	}
-	if len(store.addressQueries) != 2 || store.addressQueries[0] != 0 || store.addressQueries[1] != 7 {
-		t.Fatalf("addressQueries = %v, want [0 7]", store.addressQueries)
+	if len(store.addressQueries) != 2 || store.addressQueries[0] != 0 || store.addressQueries[1] != 0 {
+		t.Fatalf("addressQueries = %v, want [0 0] with lookback window", store.addressQueries)
 	}
 	if len(store.observations) != 3 || store.observations[2].UserID != 6 {
 		t.Fatalf("expected incremental address deposit observed, got %+v", store.observations)
+	}
+}
+
+// TestScannerLookbackAndPeriodicFullRefreshRecoverOutOfOrderAddress 验证并发乱序提交的小 ID 地址可通过回看窗口与周期全量刷新补扫，不会永久漏账。
+func TestScannerLookbackAndPeriodicFullRefreshRecoverOutOfOrderAddress(t *testing.T) {
+	firstAddr := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	lateInWindowAddr := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	lateOldAddr := common.HexToAddress("0x3333333333333333333333333333333333333333")
+
+	b10 := testBlock(10)
+	b11 := testBlockWithParent(11, b10.Hash(), testTransaction(1, &lateInWindowAddr, 500))
+	chain := &fakeChain{
+		latest:  11,
+		blocks:  map[uint64]*types.Block{10: b10, 11: b11},
+		headers: map[uint64]*types.Header{10: b10.Header(), 11: b11.Header()},
+	}
+	store := &fakeStore{
+		addresses: []postgres.WalletAddress{{ID: 1500, UserID: 1, Address: firstAddr.Hex()}},
+	}
+	start := uint64(10)
+	scanner := newTestScanner(t, chain, store, Config{StartBlock: &start, Confirmations: 3, BatchSize: 10, Interval: time.Second})
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("first RunOnce() error = %v", err)
+	}
+
+	// ID=1400 比 lastAddressID=1500 小，模拟并发事务晚提交但仍在 1000 回看窗口内；应在扫区块 11 时被捕获。
+	store.addresses = append(store.addresses, postgres.WalletAddress{ID: 1400, UserID: 2, Address: lateInWindowAddr.Hex()})
+	store.checkpoint.LastScannedBlock = 10
+	store.checkpoint.LastScannedHash = strings.ToLower(b10.Hash().Hex())
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("lookback RunOnce() error = %v", err)
+	}
+	if len(store.observations) != 1 || store.observations[0].UserID != 2 {
+		t.Fatalf("expected lookback window to recover address 1400, observations = %+v", store.observations)
+	}
+
+	// ID=100 超出 1000 回看窗口，到达周期全量刷新轮次后可找回该地址并捕获后续区块 12 的充值。
+	b12 := testBlockWithParent(12, b11.Hash(), testTransaction(2, &lateOldAddr, 800))
+	store.addresses = append(store.addresses, postgres.WalletAddress{ID: 100, UserID: 3, Address: lateOldAddr.Hex()})
+	for i := 0; i < 49; i++ {
+		if err := scanner.RunOnce(context.Background()); err != nil {
+			t.Fatalf("periodic RunOnce(%d) error = %v", i, err)
+		}
+	}
+	chain.latest = 12
+	chain.blocks[12] = b12
+	chain.headers[12] = b12.Header()
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("periodic full refresh RunOnce() error = %v", err)
+	}
+	if len(store.observations) < 2 || store.observations[1].UserID != 3 {
+		t.Fatalf("expected periodic full refresh to recover old out-of-order address 100, observations = %+v", store.observations)
+	}
+}
+
+// TestScannerStillConfirmsAndCreditsWhenScanFails 验证扫块阶段失败时不阻塞待确认充值继续确认入账。
+func TestScannerStillConfirmsAndCreditsWhenScanFails(t *testing.T) {
+	b10 := testBlock(10)
+	b12 := testBlockWithParent(12, b10.Hash())
+	chain := &fakeChain{
+		latest:      12,
+		blocks:      map[uint64]*types.Block{10: b10, 12: b12},
+		blockErrors: map[uint64]error{11: errors.New("RPC 拉块临时超时")},
+		headers:     map[uint64]*types.Header{10: b10.Header(), 12: b12.Header()},
+	}
+	store := &fakeStore{
+		checkpoint: &postgres.ChainCheckpoint{
+			Network: postgres.NetworkSepolia, Scanner: defaultScannerName,
+			LastScannedBlock: 10, LastScannedHash: strings.ToLower(b10.Hash().Hex()),
+		},
+		deposits: []postgres.Deposit{
+			{ID: 1, UserID: 7, BlockNumber: 10, BlockHash: strings.ToLower(b10.Hash().Hex()), Status: postgres.DepositConfirming},
+		},
+	}
+	scanner := newTestScanner(t, chain, store, Config{Confirmations: 3, BatchSize: 10, Interval: time.Second})
+	if err := scanner.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() error = nil, want scan error propagated")
+	}
+	if store.credited[1] != 3 {
+		t.Fatalf("expected deposit 1 credited despite scan failure, got credited = %v", store.credited)
+	}
+}
+
+// TestScannerAuditsCreditedDepositsIndependentlyBeyondBatchLimit 验证已入账充值重组核对独立执行、分批突破 confirmBatchSize 限制且不依赖扫块。
+func TestScannerAuditsCreditedDepositsIndependentlyBeyondBatchLimit(t *testing.T) {
+	b10 := testBlock(10)
+	b11 := testBlockWithParent(11, b10.Hash())
+	b12 := testBlockWithParent(12, b11.Hash())
+	b13 := testBlockWithParent(13, b12.Hash())
+	chain := &fakeChain{
+		latest: 13,
+		headers: map[uint64]*types.Header{
+			10: b10.Header(), 11: b11.Header(), 12: b12.Header(), 13: b13.Header(),
+		},
+	}
+	deposits := make([]postgres.Deposit, 0, 120)
+	for i := 1; i <= 119; i++ {
+		deposits = append(deposits, postgres.Deposit{
+			ID: int64(i), BlockNumber: 10, BlockHash: strings.ToLower(b10.Hash().Hex()), Status: postgres.DepositCredited,
+		})
+	}
+	// 第 120 条超出 confirmBatchSize(100) 且位于发生重组的区块 12（检查点已停在 13，本轮不触发扫块重扫）。
+	deposits = append(deposits, postgres.Deposit{
+		ID: 120, BlockNumber: 12, BlockHash: common.HexToHash("0xdead12").Hex(), Status: postgres.DepositCredited,
+	})
+	store := &fakeStore{
+		checkpoint: &postgres.ChainCheckpoint{
+			Network: postgres.NetworkSepolia, Scanner: defaultScannerName,
+			LastScannedBlock: 13, LastScannedHash: strings.ToLower(b13.Hash().Hex()),
+		},
+		deposits: deposits,
+	}
+	scanner := newTestScanner(t, chain, store, Config{Confirmations: 3, SafeDepth: 2, BatchSize: 10, Interval: time.Second})
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if len(store.workerErrors) != 1 || store.workerErrors[0].ErrorCode != "CREDITED_DEPOSIT_REORG" || *store.workerErrors[0].ReferenceID != 120 {
+		t.Fatalf("expected CREDITED_DEPOSIT_REORG for deposit 120 beyond confirmBatchSize, got %+v", store.workerErrors)
 	}
 }

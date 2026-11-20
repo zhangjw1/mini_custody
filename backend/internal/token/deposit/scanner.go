@@ -19,7 +19,12 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/token/erc20"
 )
 
-const confirmBatchSize = evm.DefaultConfirmBatchSize
+const (
+	confirmBatchSize           = evm.DefaultConfirmBatchSize
+	addressLookbackWindow      = int64(1000)
+	fullAddressRefreshInterval = 50
+	creditedAuditMinLookback   = uint64(256)
+)
 
 var (
 	ErrStartBlockRequired = errors.New("数据库中没有 Token 扫描检查点，必须配置 ERC20_SCAN_START_BLOCK")
@@ -63,6 +68,12 @@ type incrementalAddressStore interface {
 	ListWalletAddressesAfterID(ctx context.Context, afterID int64) ([]postgres.WalletAddress, error)
 }
 
+// tokenDepositCursorStore 定义可选的键集游标分页接口，用于突破单批上限全量审计重组 Token 充值。
+type tokenDepositCursorStore interface {
+	ListTokenDepositsAfterBlockCursor(ctx context.Context, assetID, minBlock, afterBlock, afterID int64, limit int) ([]postgres.TokenDeposit, error)
+	ListCreditedTokenDepositsAfterCursor(ctx context.Context, assetID, minBlock, afterBlock, afterID int64, limit int) ([]postgres.TokenDeposit, error)
+}
+
 // Config 定义 Token 扫描资产、起点、批次、安全深度、回退块数、确认数和轮询间隔。
 type Config struct {
 	AssetID           int64
@@ -87,15 +98,16 @@ type HealthSnapshot struct {
 
 // Scanner 扫描配置合约 Transfer Event 并完成 Token 充值确认入账。
 type Scanner struct {
-	chain         Chain
-	contract      Contract
-	store         Store
-	logger        *slog.Logger
-	config        Config
-	addresses     map[common.Address]postgres.WalletAddress
-	lastAddressID int64
-	healthMu      sync.RWMutex
-	health        HealthSnapshot
+	chain               Chain
+	contract            Contract
+	store               Store
+	logger              *slog.Logger
+	config              Config
+	addresses           map[common.Address]postgres.WalletAddress
+	lastAddressID       int64
+	addressRefreshCount int
+	healthMu            sync.RWMutex
+	health              HealthSnapshot
 }
 
 // NewScanner 创建并校验 Token 充值扫描器。
@@ -111,6 +123,9 @@ func NewScanner(chain Chain, contract Contract, store Store, logger *slog.Logger
 	}
 	if cfg.ReorgRewindBlocks == 0 {
 		cfg.ReorgRewindBlocks = cfg.Confirmations
+	}
+	if cfg.ReorgRewindBlocks < cfg.Confirmations {
+		return nil, errors.New("Token 充值扫描器回退深度不能小于确认数")
 	}
 	return &Scanner{
 		chain: chain, contract: contract, store: store, logger: logger, config: cfg,
@@ -177,7 +192,7 @@ func (s *Scanner) RunOnce(ctx context.Context) error {
 	return nil
 }
 
-// runOnce 执行一轮含父哈希校验、重组回退与安全深度扫描的实际步骤。
+// runOnce 执行一轮含父哈希校验、重组回退、安全深度扫描、独立已入账审计及确认入账。
 func (s *Scanner) runOnce(ctx context.Context) error {
 	if err := s.refreshAddresses(ctx); err != nil {
 		return err
@@ -188,6 +203,14 @@ func (s *Scanner) runOnce(ctx context.Context) error {
 	}
 	s.setNetworkHeight(latest)
 	headerCache := make(map[uint64]*types.Header)
+	scanErr := s.scanStep(ctx, latest, headerCache)
+	auditErr := s.reconcileCreditedDeposits(ctx, latest, headerCache)
+	confirmErr := s.confirmPending(ctx, latest, headerCache)
+	return errors.Join(scanErr, auditErr, confirmErr)
+}
+
+// scanStep 执行本轮检查点与日志区间扫描，扫块阶段出错只跳过扫块而不阻断确认入账。
+func (s *Scanner) scanStep(ctx context.Context, latest uint64, headerCache map[uint64]*types.Header) error {
 	next, expectedParentHash, scannedHeight, hasReorged, rewoundTo, err := s.prepareScanCursor(ctx, headerCache)
 	if err != nil {
 		return err
@@ -197,14 +220,16 @@ func (s *Scanner) runOnce(ctx context.Context) error {
 	if canScan {
 		scanLimit = latest - s.config.SafeDepth
 	}
+	var scanErr error
 	for attempt := 0; attempt < 2 && canScan && next <= scanLimit; attempt++ {
 		last := scanLimit
 		if remaining := s.config.BatchSize - 1; remaining < scanLimit-next {
 			last = next + remaining
 		}
-		parentReorg, toHash, scanErr := s.scanRange(ctx, next, last, expectedParentHash, headerCache)
-		if scanErr != nil {
-			return scanErr
+		parentReorg, toHash, err := s.scanRange(ctx, next, last, expectedParentHash, headerCache)
+		if err != nil {
+			scanErr = err
+			break
 		}
 		if parentReorg {
 			prevHeight := uint64(0)
@@ -213,7 +238,8 @@ func (s *Scanner) runOnce(ctx context.Context) error {
 			}
 			newRewindTo, newRewindHash, rewindErr := s.rewindFromBlock(ctx, prevHeight, headerCache)
 			if rewindErr != nil {
-				return rewindErr
+				scanErr = rewindErr
+				break
 			}
 			hasReorged = true
 			rewoundTo = newRewindTo
@@ -227,17 +253,22 @@ func (s *Scanner) runOnce(ctx context.Context) error {
 		break
 	}
 	if hasReorged {
-		if err := s.reconcileReorgWindow(ctx, rewoundTo, scannedHeight, headerCache); err != nil {
-			return err
+		if reconcileErr := s.reconcileReorgWindow(ctx, rewoundTo, scannedHeight, headerCache); reconcileErr != nil {
+			return errors.Join(scanErr, reconcileErr)
 		}
 	}
-	return s.confirmPending(ctx, latest, headerCache)
+	return scanErr
 }
 
-// refreshAddresses 增量或全量同步用户托管地址内存索引。
+// refreshAddresses 结合回看窗口增量加载和周期全量刷新同步用户托管地址内存索引，避免并发乱序提交漏地址。
 func (s *Scanner) refreshAddresses(ctx context.Context) error {
-	if incStore, ok := s.store.(incrementalAddressStore); ok {
-		addresses, err := incStore.ListWalletAddressesAfterID(ctx, s.lastAddressID)
+	useFull := s.addressRefreshCount == 0 || s.addressRefreshCount%fullAddressRefreshInterval == 0
+	if incStore, ok := s.store.(incrementalAddressStore); ok && !useFull {
+		lookbackID := s.lastAddressID - addressLookbackWindow
+		if lookbackID < 0 {
+			lookbackID = 0
+		}
+		addresses, err := incStore.ListWalletAddressesAfterID(ctx, lookbackID)
 		if err != nil {
 			return fmt.Errorf("增量加载 Token 托管地址失败：%w", err)
 		}
@@ -250,6 +281,7 @@ func (s *Scanner) refreshAddresses(ctx context.Context) error {
 				s.lastAddressID = address.ID
 			}
 		}
+		s.addressRefreshCount++
 		return nil
 	}
 	addresses, err := s.store.ListWalletAddresses(ctx)
@@ -257,13 +289,21 @@ func (s *Scanner) refreshAddresses(ctx context.Context) error {
 		return fmt.Errorf("加载 Token 托管地址失败：%w", err)
 	}
 	index := make(map[common.Address]postgres.WalletAddress, len(addresses))
+	var maxID int64
 	for _, address := range addresses {
 		if !common.IsHexAddress(address.Address) {
 			return fmt.Errorf("Token 托管地址格式无效：address_id=%d", address.ID)
 		}
 		index[common.HexToAddress(address.Address)] = address
+		if address.ID > maxID {
+			maxID = address.ID
+		}
 	}
 	s.addresses = index
+	if maxID > s.lastAddressID {
+		s.lastAddressID = maxID
+	}
+	s.addressRefreshCount++
 	return nil
 }
 
@@ -324,52 +364,125 @@ func (s *Scanner) rewindFromBlock(ctx context.Context, fromBlock uint64, headerC
 	return rewindBlock, rewindHash, nil
 }
 
-// reconcileReorgWindow 在重组回退重扫后复核区间内 Token 充值记录，孤立已消失记录并对已入账记录发出告警。
+// reconcileReorgWindow 在重组回退重扫后分页复核区间内未入账 Token 充值记录，孤立已不在主链上的待确认记录。
 func (s *Scanner) reconcileReorgWindow(ctx context.Context, afterBlock, upToBlock uint64, headerCache map[uint64]*types.Header) error {
 	if afterBlock > math.MaxInt64 {
 		return errors.New("Token 重组核对高度超出范围")
 	}
-	deposits, err := s.store.ListTokenDepositsAfterBlock(ctx, s.config.AssetID, int64(afterBlock), confirmBatchSize)
-	if err != nil {
-		return fmt.Errorf("查询重组区间 Token 充值失败：%w", err)
-	}
-	heights := make([]uint64, 0, len(deposits))
-	for _, deposit := range deposits {
-		if deposit.BlockNumber >= 0 && uint64(deposit.BlockNumber) <= upToBlock {
-			heights = append(heights, uint64(deposit.BlockNumber))
+	minBlock := int64(afterBlock) + 1
+	cursorBlock := int64(afterBlock)
+	cursorID := int64(0)
+	cursorStore, hasCursor := s.store.(tokenDepositCursorStore)
+	for {
+		var (
+			deposits []postgres.TokenDeposit
+			err      error
+		)
+		if hasCursor {
+			deposits, err = cursorStore.ListTokenDepositsAfterBlockCursor(ctx, s.config.AssetID, minBlock, cursorBlock, cursorID, confirmBatchSize)
+		} else {
+			deposits, err = s.store.ListTokenDepositsAfterBlock(ctx, s.config.AssetID, cursorBlock, confirmBatchSize)
 		}
-	}
-	s.prefetchHeaders(ctx, headerCache, heights)
-	for _, deposit := range deposits {
-		if deposit.BlockNumber < 0 || uint64(deposit.BlockNumber) > upToBlock {
-			continue
-		}
-		header, err := s.cachedHeaderByNumber(ctx, headerCache, uint64(deposit.BlockNumber))
 		if err != nil {
-			s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "REORG_HEADER_QUERY_FAILED", err.Error())
-			continue
+			return fmt.Errorf("查询重组区间 Token 充值失败：%w", err)
 		}
-		if header != nil && strings.EqualFold(header.Hash().Hex(), deposit.BlockHash) {
-			continue
+		if len(deposits) == 0 {
+			return nil
 		}
-		if deposit.Status == postgres.DepositCredited {
+		heights := make([]uint64, 0, len(deposits))
+		for _, deposit := range deposits {
+			if deposit.BlockNumber >= 0 && uint64(deposit.BlockNumber) <= upToBlock && deposit.Status != postgres.DepositCredited {
+				heights = append(heights, uint64(deposit.BlockNumber))
+			}
+		}
+		s.prefetchHeaders(ctx, headerCache, heights)
+		for _, deposit := range deposits {
+			cursorBlock = deposit.BlockNumber
+			cursorID = deposit.ID
+			if deposit.BlockNumber < 0 || uint64(deposit.BlockNumber) > upToBlock || deposit.Status == postgres.DepositCredited {
+				continue
+			}
+			header, err := s.cachedHeaderByNumber(ctx, headerCache, uint64(deposit.BlockNumber))
+			if err != nil {
+				s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "REORG_HEADER_QUERY_FAILED", err.Error())
+				continue
+			}
+			if header != nil && strings.EqualFold(header.Hash().Hex(), deposit.BlockHash) {
+				continue
+			}
+			msg := fmt.Sprintf("Token 充值 %d 原区块 %d (%s) 重组后已不在主链，执行孤块冲正", deposit.ID, deposit.BlockNumber, deposit.BlockHash)
+			s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "BLOCK_HASH_MISMATCH", msg)
+			if _, orphaned, err := s.store.OrphanTokenDeposit(ctx, deposit.ID); err != nil {
+				s.recordDepositError(ctx, "orphan_deposit", deposit.ID, "ORPHAN_TOKEN_DEPOSIT_FAILED", err.Error())
+			} else if orphaned {
+				s.logger.Warn("Token 孤块充值已冲正", "deposit_id", deposit.ID, "block_number", deposit.BlockNumber)
+			}
+		}
+		if !hasCursor || len(deposits) < confirmBatchSize || uint64(cursorBlock) > upToBlock {
+			return nil
+		}
+	}
+}
+
+// reconcileCreditedDeposits 独立分页审计窗口内全部已入账 Token 充值的主链区块哈希。
+func (s *Scanner) reconcileCreditedDeposits(ctx context.Context, latest uint64, headerCache map[uint64]*types.Header) error {
+	cursorStore, ok := s.store.(tokenDepositCursorStore)
+	if !ok {
+		return nil
+	}
+	lookback := creditedAuditMinLookback
+	if s.config.ReorgRewindBlocks*2 > lookback {
+		lookback = s.config.ReorgRewindBlocks * 2
+	}
+	if s.config.Confirmations*2 > lookback {
+		lookback = s.config.Confirmations * 2
+	}
+	minBlock := int64(0)
+	if latest > lookback {
+		minBlock = int64(latest - lookback)
+	}
+	cursorBlock := minBlock - 1
+	cursorID := int64(0)
+	for {
+		deposits, err := cursorStore.ListCreditedTokenDepositsAfterCursor(ctx, s.config.AssetID, minBlock, cursorBlock, cursorID, confirmBatchSize)
+		if err != nil {
+			return fmt.Errorf("查询已入账 Token 充值审计批次失败：%w", err)
+		}
+		if len(deposits) == 0 {
+			return nil
+		}
+		heights := make([]uint64, 0, len(deposits))
+		for _, deposit := range deposits {
+			if deposit.BlockNumber >= 0 {
+				heights = append(heights, uint64(deposit.BlockNumber))
+			}
+		}
+		s.prefetchHeaders(ctx, headerCache, heights)
+		for _, deposit := range deposits {
+			cursorBlock = deposit.BlockNumber
+			cursorID = deposit.ID
+			if deposit.BlockNumber < 0 {
+				continue
+			}
+			header, err := s.cachedHeaderByNumber(ctx, headerCache, uint64(deposit.BlockNumber))
+			if err != nil {
+				s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "REORG_HEADER_QUERY_FAILED", err.Error())
+				continue
+			}
+			if header != nil && strings.EqualFold(header.Hash().Hex(), deposit.BlockHash) {
+				continue
+			}
 			msg := fmt.Sprintf("已入账 Token 充值 %d 原区块 %d (%s) 发生重组，保持用户余额不变请人工核查", deposit.ID, deposit.BlockNumber, deposit.BlockHash)
 			s.logger.Error(msg, "deposit_id", deposit.ID)
 			s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "CREDITED_DEPOSIT_REORG", msg)
-			continue
 		}
-		msg := fmt.Sprintf("Token 充值 %d 原区块 %d (%s) 重组后已不在主链，执行孤块冲正", deposit.ID, deposit.BlockNumber, deposit.BlockHash)
-		s.recordDepositError(ctx, "reorg_reconcile", deposit.ID, "BLOCK_HASH_MISMATCH", msg)
-		if _, orphaned, err := s.store.OrphanTokenDeposit(ctx, deposit.ID); err != nil {
-			s.recordDepositError(ctx, "orphan_deposit", deposit.ID, "ORPHAN_TOKEN_DEPOSIT_FAILED", err.Error())
-		} else if orphaned {
-			s.logger.Warn("Token 孤块充值已冲正", "deposit_id", deposit.ID, "block_number", deposit.BlockNumber)
+		if len(deposits) < confirmBatchSize {
+			return nil
 		}
 	}
-	return nil
 }
 
-// scanRange 查询并提交一个区块闭区间，校验起始块父哈希，范围超限时递归缩小批次。
+// scanRange 查询并提交一个区块闭区间，校验起始块父哈希，getLogs 后清缓存并逐条核对日志与末块区块哈希。
 func (s *Scanner) scanRange(ctx context.Context, fromBlock, toBlock uint64, expectedParentHash string, headerCache map[uint64]*types.Header) (bool, string, error) {
 	if expectedParentHash != "" && fromBlock < toBlock {
 		s.prefetchHeaders(ctx, headerCache, []uint64{fromBlock, toBlock})
@@ -401,6 +514,25 @@ func (s *Scanner) scanRange(ctx context.Context, fromBlock, toBlock uint64, expe
 		}
 		return false, "", err
 	}
+	// I2：getLogs 返回后清除本区间旧区块头缓存，强制重取末块与所有日志所在块的当前区块头核对哈希。
+	for height := range headerCache {
+		if height >= fromBlock && height <= toBlock {
+			delete(headerCache, height)
+		}
+	}
+	postHeights := make([]uint64, 0, len(logs)+1)
+	for _, log := range logs {
+		if log.Removed {
+			return true, "", nil
+		}
+		if log.BlockNumber < fromBlock || log.BlockNumber > toBlock || log.Index > math.MaxInt32 {
+			return false, "", errors.New("Token Transfer Event 区块或日志索引无效")
+		}
+		postHeights = append(postHeights, log.BlockNumber)
+	}
+	postHeights = append(postHeights, toBlock)
+	s.prefetchHeaders(ctx, headerCache, postHeights)
+
 	sort.SliceStable(logs, func(i, j int) bool {
 		if logs[i].BlockNumber != logs[j].BlockNumber {
 			return logs[i].BlockNumber < logs[j].BlockNumber
@@ -412,6 +544,13 @@ func (s *Scanner) scanRange(ctx context.Context, fromBlock, toBlock uint64, expe
 	})
 	observations := make([]postgres.TokenDepositObservation, 0)
 	for _, log := range logs {
+		logHeader, hErr := s.cachedHeaderByNumber(ctx, headerCache, log.BlockNumber)
+		if hErr != nil {
+			return false, "", fmt.Errorf("校验 Token 日志所在区块 %d 失败：%w", log.BlockNumber, hErr)
+		}
+		if logHeader == nil || !strings.EqualFold(logHeader.Hash().Hex(), log.BlockHash.Hex()) {
+			return true, "", nil
+		}
 		event, err := s.contract.DecodeTransferLog(log)
 		if err != nil {
 			if errors.Is(err, erc20.ErrRemovedLog) {
@@ -421,6 +560,9 @@ func (s *Scanner) scanRange(ctx context.Context, fromBlock, toBlock uint64, expe
 		}
 		if event.BlockNumber < fromBlock || event.BlockNumber > toBlock || event.LogIndex > math.MaxInt32 {
 			return false, "", errors.New("Token Transfer Event 区块或日志索引无效")
+		}
+		if !strings.EqualFold(logHeader.Hash().Hex(), event.BlockHash.Hex()) {
+			return true, "", nil
 		}
 		address, monitored := s.addresses[event.To]
 		if !monitored {
@@ -440,6 +582,9 @@ func (s *Scanner) scanRange(ctx context.Context, fromBlock, toBlock uint64, expe
 	}
 	if header == nil || header.Number == nil || header.Number.Uint64() != toBlock {
 		return false, "", errors.New("Token 扫描批次末区块返回无效")
+	}
+	if toBlock == fromBlock && expectedParentHash != "" && !strings.EqualFold(header.ParentHash.Hex(), expectedParentHash) {
+		return true, "", nil
 	}
 	toHash := strings.ToLower(header.Hash().Hex())
 	_, created, err := s.store.RecordTokenDepositsAndCheckpoint(ctx, observations, postgres.ChainCheckpoint{
