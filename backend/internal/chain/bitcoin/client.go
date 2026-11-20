@@ -237,18 +237,19 @@ func (c *Client) call(ctx context.Context, method string, params []any, target a
 	if err != nil {
 		return fmt.Errorf("读取 Bitcoin RPC 响应失败：%w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Bitcoin RPC HTTP 状态 %d", resp.StatusCode)
-	}
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
 		Error  *RPCError       `json:"error"`
 	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return fmt.Errorf("解码 Bitcoin RPC 响应失败：%w", err)
-	}
-	if envelope.Error != nil {
+	unmarshalErr := json.Unmarshal(data, &envelope)
+	if unmarshalErr == nil && envelope.Error != nil {
 		return envelope.Error
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Bitcoin RPC HTTP 状态 %d", resp.StatusCode)
+	}
+	if unmarshalErr != nil {
+		return fmt.Errorf("解码 Bitcoin RPC 响应失败：%w", unmarshalErr)
 	}
 	if target == nil {
 		return nil

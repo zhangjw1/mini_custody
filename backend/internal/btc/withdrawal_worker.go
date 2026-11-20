@@ -189,10 +189,5 @@ func isBitcoinTxNotFound(err error) bool {
 		return false
 	}
 	var rpcErr *bitcoin.RPCError
-	if errors.As(err, &rpcErr) && rpcErr.Code == -5 {
-		return true
-	}
-	lower := strings.ToLower(err.Error())
-	return strings.Contains(lower, "no such mempool or blockchain transaction") ||
-		strings.Contains(lower, "not found")
+	return errors.As(err, &rpcErr) && rpcErr.Code == -5
 }

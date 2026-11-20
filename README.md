@@ -22,6 +22,7 @@ Mini Custody 是一个面向学习和求职展示的多链托管钱包项目。�
 - Go 1.23.5
 - PostgreSQL 17+
 - Ethereum Sepolia RPC
+- Bitcoin Signet / Testnet4 节点（开启 `BITCOIN_ENABLED=true` 时，Bitcoin Core 节点需配置 `txindex=1`，以便通过 `getrawtransaction` 查询非钱包历史交易）
 
 项目仅允许使用测试网资产。不要向项目生成的地址转入主网或其他真实资产。
 

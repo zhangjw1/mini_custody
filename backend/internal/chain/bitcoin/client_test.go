@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -62,5 +64,67 @@ func TestClientVerifiesSignetAndDecodesBlock(t *testing.T) {
 	}
 	if block.Height != 7 || len(block.Tx) != 1 || int64(block.Tx[0].Vout[0].Value) != 1 {
 		t.Fatalf("unexpected block: %#v", block)
+	}
+}
+
+// TestClientParsesRPCErrorOnHTTP500 验证 Bitcoin Core 返回 HTTP 500 且带 JSON-RPC error 时能解析为 *RPCError。
+func TestClientParsesRPCErrorOnHTTP500(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     uint64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"result": nil,
+			"error": map[string]any{
+				"code":    -5,
+				"message": "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+			},
+			"id": req.ID,
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.RawTransaction(context.Background(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if err == nil {
+		t.Fatal("expected *RPCError, got nil")
+	}
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("expected *RPCError, got %T: %v", err, err)
+	}
+	if rpcErr.Code != -5 {
+		t.Fatalf("rpcErr.Code = %d, want -5", rpcErr.Code)
+	}
+}
+
+// TestClientReturnsHTTPStatusWhenNonJSONErrorBody 验证非 200 且响应体不是合法 RPC 错误时返回 HTTP 状态错误。
+func TestClientReturnsHTTPStatusWhenNonJSONErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("bad gateway"))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.RawTransaction(context.Background(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if err == nil {
+		t.Fatal("expected HTTP error, got nil")
+	}
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) {
+		t.Fatalf("unexpected *RPCError: %+v", rpcErr)
 	}
 }
