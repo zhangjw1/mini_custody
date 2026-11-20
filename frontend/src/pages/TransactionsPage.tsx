@@ -35,10 +35,12 @@ const typeOptions = [
   { value: 'TOKEN_WITHDRAWAL', label: 'Token 提币' },
   { value: 'TOKEN_SWEEP', label: 'Token 归集' },
   { value: 'GAS_TOPUP', label: 'Gas 补充' },
+  { value: 'BTC_DEPOSIT', label: 'BTC 充值' },
+  { value: 'BTC_WITHDRAWAL', label: 'BTC 提币' },
 ]
 
 function TransactionType({ type }: { type: Transaction['type'] }) {
-  if (type === 'DEPOSIT' || type === 'TOKEN_DEPOSIT') {
+  if (type === 'DEPOSIT' || type === 'TOKEN_DEPOSIT' || type === 'BTC_DEPOSIT') {
     return (
       <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-700">
         <ArrowDownToLine className="w-3.5 h-3.5" />
@@ -46,7 +48,7 @@ function TransactionType({ type }: { type: Transaction['type'] }) {
       </span>
     )
   }
-  if (type === 'WITHDRAWAL' || type === 'TOKEN_WITHDRAWAL') {
+  if (type === 'WITHDRAWAL' || type === 'TOKEN_WITHDRAWAL' || type === 'BTC_WITHDRAWAL') {
     return (
       <span className="inline-flex items-center gap-1.5 font-semibold text-amber-700">
         <ArrowUpFromLine className="w-3.5 h-3.5" />

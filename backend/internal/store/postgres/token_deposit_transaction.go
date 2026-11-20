@@ -86,18 +86,17 @@ func (s *Store) recordTokenDepositInTx(ctx context.Context, tx pgx.Tx, observati
 	if assetType != AssetTypeERC20 {
 		return TokenDeposit{}, false, errors.New("Token 充值资产类型必须是 ERC20")
 	}
-	var depositID int64
-	err := tx.QueryRow(ctx, `
+	item, err := s.scanTokenDeposit(tx.QueryRow(ctx, `
 		INSERT INTO token_deposits (
 			user_id, address_id, asset_id, tx_hash, log_index, block_number, block_hash,
 			from_address, to_address, amount_units, status
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::numeric, $11)
 		ON CONFLICT (asset_id, tx_hash, log_index) WHERE status <> 'ORPHANED' DO NOTHING
-		RETURNING id`,
+		RETURNING `+tokenDepositColumns,
 		observation.UserID, observation.AddressID, observation.AssetID, observation.TxHash,
 		observation.LogIndex, observation.BlockNumber, observation.BlockHash, observation.FromAddress,
 		observation.ToAddress, observation.AmountUnits.String(), DepositConfirming,
-	).Scan(&depositID)
+	))
 	created := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return TokenDeposit{}, false, fmt.Errorf("写入 Token 充值记录失败：%w", err)
@@ -120,53 +119,54 @@ func (s *Store) recordTokenDepositInTx(ctx context.Context, tx pgx.Tx, observati
 			INSERT INTO balance_entries (
 				user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
 			) VALUES ($1, $2, $3, $4, $5::numeric, 'TOKEN_DEPOSIT', $6)`,
-			observation.UserID, observation.AssetID, balance.Asset, EntryDepositPending, observation.AmountUnits.String(), depositID,
+			observation.UserID, observation.AssetID, balance.Asset, EntryDepositPending, observation.AmountUnits.String(), item.ID,
 		); err != nil {
 			return TokenDeposit{}, false, fmt.Errorf("写入 Token 待确认流水失败：%w", err)
 		}
-	} else {
-		existing, err := s.scanTokenDeposit(tx.QueryRow(ctx, `
-			SELECT `+tokenDepositColumns+` FROM token_deposits
-			WHERE asset_id = $1 AND tx_hash = $2 AND log_index = $3 AND status <> 'ORPHANED'`,
-			observation.AssetID, observation.TxHash, observation.LogIndex,
-		))
-		if err != nil {
-			return TokenDeposit{}, false, fmt.Errorf("读取重复 Token 充值失败：%w", err)
-		}
-		if existing.UserID != observation.UserID || existing.AddressID != observation.AddressID ||
-			existing.FromAddress != observation.FromAddress || existing.ToAddress != observation.ToAddress ||
-			existing.AmountUnits.Cmp(observation.AmountUnits) != 0 {
-			return TokenDeposit{}, false, ErrIdempotencyConflict
-		}
-		if existing.BlockNumber != observation.BlockNumber || existing.BlockHash != observation.BlockHash {
-			if existing.Status == DepositCredited {
-				refID := existing.ID
-				if _, err := recordWorkerErrorWith(ctx, tx, WorkerError{
-					Worker:        "token-deposit-scanner",
-					Stage:         "reorg_check",
-					ReferenceType: "TOKEN_DEPOSIT",
-					ReferenceID:   &refID,
-					ErrorCode:     "CREDITED_DEPOSIT_REORG",
-					ErrorMessage:  fmt.Sprintf("已入账 Token 充值 %d 重组后位置变更为区块 %d (%s)，保持余额不变请人工核查", existing.ID, observation.BlockNumber, observation.BlockHash),
-				}); err != nil {
-					return TokenDeposit{}, false, err
-				}
-			} else if _, err := tx.Exec(ctx, `
+		return item, true, nil
+	}
+
+	existing, err := s.scanTokenDeposit(tx.QueryRow(ctx, `
+		SELECT `+tokenDepositColumns+` FROM token_deposits
+		WHERE asset_id = $1 AND tx_hash = $2 AND log_index = $3 AND status <> 'ORPHANED'`,
+		observation.AssetID, observation.TxHash, observation.LogIndex,
+	))
+	if err != nil {
+		return TokenDeposit{}, false, fmt.Errorf("读取重复 Token 充值失败：%w", err)
+	}
+	if existing.UserID != observation.UserID || existing.AddressID != observation.AddressID ||
+		existing.FromAddress != observation.FromAddress || existing.ToAddress != observation.ToAddress ||
+		existing.AmountUnits.Cmp(observation.AmountUnits) != 0 {
+		return TokenDeposit{}, false, ErrIdempotencyConflict
+	}
+	if existing.BlockNumber != observation.BlockNumber || existing.BlockHash != observation.BlockHash {
+		if existing.Status == DepositCredited {
+			refID := existing.ID
+			if _, err := recordWorkerErrorWith(ctx, tx, WorkerError{
+				Worker:        "token-deposit-scanner",
+				Stage:         "reorg_check",
+				ReferenceType: "TOKEN_DEPOSIT",
+				ReferenceID:   &refID,
+				ErrorCode:     "CREDITED_DEPOSIT_REORG",
+				ErrorMessage:  fmt.Sprintf("已入账 Token 充值 %d 重组后位置变更为区块 %d (%s)，保持余额不变请人工核查", existing.ID, observation.BlockNumber, observation.BlockHash),
+			}); err != nil {
+				return TokenDeposit{}, false, err
+			}
+		} else {
+			updated, err := s.scanTokenDeposit(tx.QueryRow(ctx, `
 				UPDATE token_deposits SET
 					block_number = $2, block_hash = $3, confirmations = 0, updated_at = CURRENT_TIMESTAMP
-				WHERE id = $1`,
+				WHERE id = $1
+				RETURNING `+tokenDepositColumns,
 				existing.ID, observation.BlockNumber, observation.BlockHash,
-			); err != nil {
+			))
+			if err != nil {
 				return TokenDeposit{}, false, fmt.Errorf("更新重组后 Token 充值区块信息失败：%w", err)
 			}
+			existing = updated
 		}
-		depositID = existing.ID
 	}
-	item, err := s.scanTokenDeposit(tx.QueryRow(ctx, `SELECT `+tokenDepositColumns+` FROM token_deposits WHERE id = $1`, depositID))
-	if err != nil {
-		return TokenDeposit{}, false, fmt.Errorf("读取已记录 Token 充值失败：%w", err)
-	}
-	return item, created, nil
+	return existing, false, nil
 }
 
 // OrphanTokenDeposit 在链重组确认 Token Event 不再属于主链时置为 ORPHANED 并写入冲正流水。

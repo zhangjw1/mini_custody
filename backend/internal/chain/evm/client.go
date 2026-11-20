@@ -2,6 +2,7 @@ package evm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -15,6 +16,7 @@ import (
 
 	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -75,8 +77,12 @@ type EVMClient interface {
 	BlockNumber(ctx context.Context) (uint64, error)
 	// BlockByNumber 查询指定高度的完整区块。
 	BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error)
+	// BlocksByNumbers 使用 JSON-RPC Batch 批量查询多个高度的完整区块。
+	BlocksByNumbers(ctx context.Context, numbers []*big.Int) ([]*types.Block, error)
 	// HeaderByNumber 查询指定高度的区块头。
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
+	// HeadersByNumbers 使用 JSON-RPC Batch 批量查询多个高度的区块头。
+	HeadersByNumbers(ctx context.Context, numbers []*big.Int) ([]*types.Header, error)
 	// BalanceAt 查询地址 ETH 余额。
 	BalanceAt(ctx context.Context, account common.Address, number *big.Int) (*big.Int, error)
 	// PendingNonceAt 查询地址待处理 Nonce。
@@ -119,6 +125,7 @@ type Config struct {
 
 type endpoint struct {
 	alias     string
+	rpcClient *rpc.Client
 	client    *ethclient.Client
 	validated bool
 }
@@ -263,6 +270,42 @@ func (c *Client) BlockByNumber(ctx context.Context, number *big.Int) (*types.Blo
 	return result, err
 }
 
+// BlocksByNumbers 通过 BatchCallContext 一次批量获取多个高度的完整区块与交易。
+func (c *Client) BlocksByNumbers(ctx context.Context, numbers []*big.Int) ([]*types.Block, error) {
+	if len(numbers) == 0 {
+		return nil, nil
+	}
+	var blocks []*types.Block
+	err := c.invokeEndpoint(ctx, func(ep endpoint) error {
+		raws := make([]json.RawMessage, len(numbers))
+		elems := make([]rpc.BatchElem, len(numbers))
+		for i, num := range numbers {
+			elems[i] = rpc.BatchElem{
+				Method: "eth_getBlockByNumber",
+				Args:   []any{toBlockNumArg(num), true},
+				Result: &raws[i],
+			}
+		}
+		if err := ep.rpcClient.BatchCallContext(ctx, elems); err != nil {
+			return err
+		}
+		decoded := make([]*types.Block, len(numbers))
+		for i := range elems {
+			if elems[i].Error != nil {
+				return elems[i].Error
+			}
+			block, err := decodeRPCBlock(raws[i])
+			if err != nil {
+				return err
+			}
+			decoded[i] = block
+		}
+		blocks = decoded
+		return nil
+	})
+	return blocks, err
+}
+
 // HeaderByNumber 查询指定高度的区块头。
 func (c *Client) HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error) {
 	var result *types.Header
@@ -272,6 +315,72 @@ func (c *Client) HeaderByNumber(ctx context.Context, number *big.Int) (*types.He
 		return err
 	})
 	return result, err
+}
+
+// HeadersByNumbers 通过 BatchCallContext 一次批量获取多个高度的区块头。
+func (c *Client) HeadersByNumbers(ctx context.Context, numbers []*big.Int) ([]*types.Header, error) {
+	if len(numbers) == 0 {
+		return nil, nil
+	}
+	var headers []*types.Header
+	err := c.invokeEndpoint(ctx, func(ep endpoint) error {
+		results := make([]*types.Header, len(numbers))
+		elems := make([]rpc.BatchElem, len(numbers))
+		for i, num := range numbers {
+			elems[i] = rpc.BatchElem{
+				Method: "eth_getBlockByNumber",
+				Args:   []any{toBlockNumArg(num), false},
+				Result: &results[i],
+			}
+		}
+		if err := ep.rpcClient.BatchCallContext(ctx, elems); err != nil {
+			return err
+		}
+		for i := range elems {
+			if elems[i].Error != nil {
+				return elems[i].Error
+			}
+			if results[i] == nil {
+				return ethereum.NotFound
+			}
+		}
+		headers = results
+		return nil
+	})
+	return headers, err
+}
+
+// decodeRPCBlock 解码 eth_getBlockByNumber 完整区块 JSON 响应，包含头信息与交易列表。
+func decodeRPCBlock(raw json.RawMessage) (*types.Block, error) {
+	var head *types.Header
+	if err := json.Unmarshal(raw, &head); err != nil {
+		return nil, err
+	}
+	if head == nil {
+		return nil, ethereum.NotFound
+	}
+	var body struct {
+		Transactions []*types.Transaction `json:"transactions"`
+		Withdrawals  []*types.Withdrawal  `json:"withdrawals,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil, err
+	}
+	return types.NewBlockWithHeader(head).WithBody(types.Body{
+		Transactions: body.Transactions,
+		Withdrawals:  body.Withdrawals,
+	}), nil
+}
+
+// toBlockNumArg 将区块高度转换为 JSON-RPC 标准十六进制区块参数。
+func toBlockNumArg(number *big.Int) string {
+	if number == nil {
+		return "latest"
+	}
+	if number.Sign() >= 0 {
+		return hexutil.EncodeBig(number)
+	}
+	return rpc.BlockNumber(number.Int64()).String()
 }
 
 // BalanceAt 查询地址在指定区块的 ETH 余额。
@@ -420,6 +529,13 @@ func (c *Client) ActiveEndpoint() string {
 
 // invoke 对单个 EVM RPC 操作执行错误分类、同端点重试和主备切换。
 func (c *Client) invoke(ctx context.Context, call func(*ethclient.Client) error) error {
+	return c.invokeEndpoint(ctx, func(ep endpoint) error {
+		return call(ep.client)
+	})
+}
+
+// invokeEndpoint 对单个已验证端点执行含重试与故障转移的底层 RPC/ETH 调用。
+func (c *Client) invokeEndpoint(ctx context.Context, call func(endpoint) error) error {
 	if c == nil || len(c.endpoints) == 0 {
 		return errors.New("没有可用的 RPC 端点")
 	}
@@ -432,7 +548,7 @@ func (c *Client) invoke(ctx context.Context, call func(*ethclient.Client) error)
 			continue
 		}
 		for attempt := 1; attempt <= c.retry.MaxAttempts; attempt++ {
-			err := call(c.endpoints[index].client)
+			err := call(c.endpoints[index])
 			if err == nil {
 				c.markSuccess(index)
 				return nil
@@ -513,7 +629,7 @@ func newEndpoint(alias, rawURL string, timeout time.Duration) (endpoint, error) 
 	if err != nil {
 		return endpoint{}, fmt.Errorf("连接 %s RPC 端点失败：%w", alias, err)
 	}
-	return endpoint{alias: alias, client: ethclient.NewClient(client)}, nil
+	return endpoint{alias: alias, rpcClient: client, client: ethclient.NewClient(client)}, nil
 }
 
 // normalizeRetryPolicy 填充重试策略默认值并限制抖动范围。

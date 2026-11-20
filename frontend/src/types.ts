@@ -134,7 +134,7 @@ export type Withdrawal = {
 }
 
 export type Transaction = {
-  type: 'DEPOSIT' | 'WITHDRAWAL' | 'TOKEN_DEPOSIT' | 'TOKEN_WITHDRAWAL' | 'TOKEN_SWEEP' | 'GAS_TOPUP'
+  type: 'DEPOSIT' | 'WITHDRAWAL' | 'TOKEN_DEPOSIT' | 'TOKEN_WITHDRAWAL' | 'TOKEN_SWEEP' | 'GAS_TOPUP' | 'BTC_DEPOSIT' | 'BTC_WITHDRAWAL'
   id: number
   user_id: number
   asset: string

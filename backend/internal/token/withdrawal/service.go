@@ -10,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/xiaoqi/mini-custody/backend/internal/amount"
+	"github.com/xiaoqi/mini-custody/backend/internal/chain/evm"
 	"github.com/xiaoqi/mini-custody/backend/internal/store/postgres"
 )
 
@@ -191,14 +192,14 @@ func estimateFee(ctx context.Context, chain FeeChain, contract QuoteContract, fr
 	if gasLimit == 0 {
 		return FeeQuote{}, errors.New("RPC 返回的 Token 提币 Gas Limit 无效")
 	}
-	header, err := chain.HeaderByNumber(ctx, nil)
+	header, err := evm.CachedLatestHeader(ctx, chain.HeaderByNumber)
 	if err != nil {
 		return FeeQuote{}, fmt.Errorf("查询 Token 提币最新区块费用失败：%w", err)
 	}
 	if header == nil || header.BaseFee == nil || header.BaseFee.Sign() < 0 {
 		return FeeQuote{}, errors.New("Token 提币最新区块缺少有效 Base Fee")
 	}
-	tip, err := chain.SuggestGasTipCap(ctx)
+	tip, err := evm.CachedGasTipCap(ctx, chain.SuggestGasTipCap)
 	if err != nil {
 		return FeeQuote{}, fmt.Errorf("查询 Token 提币建议优先费失败：%w", err)
 	}

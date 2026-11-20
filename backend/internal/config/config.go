@@ -95,6 +95,14 @@ type EVMReplacementConfig struct {
 	MaxFeeCapWei     *big.Int
 }
 
+// DBConfig 描述 PostgreSQL 连接池容量和生命周期配置。
+type DBConfig struct {
+	MaxConns        int32
+	MinConns        int32
+	MaxConnLifetime time.Duration
+	MaxConnIdleTime time.Duration
+}
+
 type Config struct {
 	AppEnv                 string
 	HTTPAddr               string
@@ -102,6 +110,7 @@ type Config struct {
 	Auth                   AuthConfig
 	Timezone               *time.Location
 	DatabaseURL            string
+	DB                     DBConfig
 	CustodyKeyStoreFile    string
 	CustodyPassword        string
 	SepoliaRPCURL          string
@@ -231,6 +240,15 @@ func load(requireCustody bool) (Config, error) {
 		erc20RewindBlocks = *erc20RewindPtr
 	}
 
+	dbMaxConns, err := nonNegativeIntOrDefault("DB_MAX_CONNS", 20)
+	if err != nil {
+		return Config{}, err
+	}
+	dbMinConns, err := nonNegativeIntOrDefault("DB_MIN_CONNS", 2)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		AppEnv:   envOrDefault("APP_ENV", "development"),
 		HTTPAddr: envOrDefault("HTTP_ADDR", ":8080"),
@@ -247,8 +265,14 @@ func load(requireCustody bool) (Config, error) {
 			BootstrapPassword:    settings.GetString("ADMIN_BOOTSTRAP_PASSWORD"),
 			BootstrapDisplayName: envOrDefault("ADMIN_BOOTSTRAP_DISPLAY_NAME", "系统管理员"),
 		},
-		Timezone:               timezone,
-		DatabaseURL:            strings.TrimSpace(settings.GetString("DATABASE_URL")),
+		Timezone:    timezone,
+		DatabaseURL: strings.TrimSpace(settings.GetString("DATABASE_URL")),
+		DB: DBConfig{
+			MaxConns:        int32(dbMaxConns),
+			MinConns:        int32(dbMinConns),
+			MaxConnLifetime: durationOrDefault("DB_MAX_CONN_LIFETIME", 30*time.Minute),
+			MaxConnIdleTime: durationOrDefault("DB_MAX_CONN_IDLE_TIME", 5*time.Minute),
+		},
 		CustodyKeyStoreFile:    strings.TrimSpace(settings.GetString("CUSTODY_KEYSTORE_FILE")),
 		CustodyPassword:        settings.GetString("CUSTODY_KEYSTORE_PASSWORD"),
 		SepoliaRPCURL:          strings.TrimSpace(settings.GetString("SEPOLIA_RPC_URL")),
@@ -342,6 +366,10 @@ func (c Config) validate(requireCustody bool) error {
 	}
 	if c.Timezone == nil {
 		return errors.New("必须配置时区")
+	}
+	if c.DB.MaxConns < 0 || c.DB.MinConns < 0 || (c.DB.MaxConns > 0 && c.DB.MinConns > c.DB.MaxConns) ||
+		c.DB.MaxConnLifetime < 0 || c.DB.MaxConnIdleTime < 0 {
+		return errors.New("数据库连接池配置无效")
 	}
 	if c.HTTP.ReadTimeout <= 0 || c.HTTP.WriteTimeout <= 0 || c.HTTP.IdleTimeout <= 0 {
 		return errors.New("HTTP 超时配置无效")

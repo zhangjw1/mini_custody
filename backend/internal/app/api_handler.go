@@ -351,10 +351,14 @@ func (a *App) listTransactions(w http.ResponseWriter, r *http.Request) {
 			a.writeMappingError(r.Context(), w, err)
 			return
 		}
+		explorerURL := a.transactionExplorerURL(item.TxHash)
+		if item.Asset == postgres.AssetBTC || item.Type == "BTC_DEPOSIT" || item.Type == "BTC_WITHDRAWAL" {
+			explorerURL = a.btcTransactionExplorerURL(item.TxHash)
+		}
 		response = append(response, transactionResponse{
 			Type: item.Type, ID: item.ID, UserID: item.UserID, Asset: item.Asset, Decimals: decimals,
 			Amount: formattedAmount, AmountUnits: item.AmountWei.String(),
-			TxHash: item.TxHash, ExplorerURL: a.transactionExplorerURL(item.TxHash),
+			TxHash: item.TxHash, ExplorerURL: explorerURL,
 			AmountWei: item.AmountWei.String(), AmountETH: formattedAmount,
 			BlockNumber: item.BlockNumber, Confirmations: item.Confirmations,
 			Status: item.Status, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
@@ -561,6 +565,18 @@ func (a *App) transactionExplorerURL(hash string) string {
 		return ""
 	}
 	return fmt.Sprintf("%s/tx/%s", a.config.SepoliaExplorerBaseURL, hash)
+}
+
+// btcTransactionExplorerURL 生成 Bitcoin Signet 或 Testnet4 交易浏览器链接。
+func (a *App) btcTransactionExplorerURL(txid string) string {
+	txid = strings.TrimSpace(txid)
+	if txid == "" {
+		return ""
+	}
+	if a.config.Bitcoin.Network == "testnet4" {
+		return fmt.Sprintf("https://mempool.space/testnet4/tx/%s", txid)
+	}
+	return fmt.Sprintf("https://mempool.space/signet/tx/%s", txid)
 }
 
 // blockExplorerURL 生成 Sepolia 区块浏览器链接。

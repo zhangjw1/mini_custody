@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -533,5 +534,83 @@ func TestClientDoesNotDegradeOnNotFoundOrBusinessRevert(t *testing.T) {
 	}
 	if fallback.calls("eth_estimateGas") != 0 {
 		t.Fatalf("fallback should not be called on business revert, got %d", fallback.calls("eth_estimateGas"))
+	}
+}
+
+// TestClientBatchBlocksAndHeaders 验证 BlocksByNumbers 与 HeadersByNumbers 在单次 JSON-RPC Batch 中批量获取区块与区块头。
+func TestClientBatchBlocksAndHeaders(t *testing.T) {
+	var batchPosts int
+	target := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	sampleTx := types.NewTx(&types.DynamicFeeTx{
+		ChainID:   big.NewInt(SepoliaChainID),
+		Nonce:     1,
+		GasTipCap: big.NewInt(1_000_000_000),
+		GasFeeCap: big.NewInt(2_000_000_000),
+		Gas:       21_000,
+		To:        &target,
+		Value:     big.NewInt(500),
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		trimmed := strings.TrimSpace(string(body))
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(trimmed, "[") {
+			batchPosts++
+			var reqs []struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+				Params []any           `json:"params"`
+			}
+			_ = json.Unmarshal([]byte(trimmed), &reqs)
+			resps := make([]map[string]any, len(reqs))
+			for i, req := range reqs {
+				height := big.NewInt(int64(100 + i))
+				header := &types.Header{
+					Number: height, Difficulty: big.NewInt(0), GasLimit: 30_000_000, BaseFee: big.NewInt(1),
+					UncleHash: types.EmptyUncleHash, TxHash: types.EmptyTxsHash,
+				}
+				encodedHeader, _ := json.Marshal(header)
+				var result map[string]any
+				_ = json.Unmarshal(encodedHeader, &result)
+				if len(req.Params) > 1 && req.Params[1] == true {
+					txJSON, _ := sampleTx.MarshalJSON()
+					var txObj map[string]any
+					_ = json.Unmarshal(txJSON, &txObj)
+					result["transactions"] = []any{txObj}
+				}
+				resps[i] = map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result}
+			}
+			_ = json.NewEncoder(w).Encode(resps)
+			return
+		}
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.Unmarshal([]byte(trimmed), &req)
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": mockChainID})
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	defer client.Close()
+
+	nums := []*big.Int{big.NewInt(100), big.NewInt(101), big.NewInt(102)}
+	blocks, err := client.BlocksByNumbers(context.Background(), nums)
+	if err != nil {
+		t.Fatalf("BlocksByNumbers() error = %v (cause=%v)", err, errors.Unwrap(err))
+	}
+	if len(blocks) != 3 || blocks[0].NumberU64() != 100 || blocks[2].NumberU64() != 102 || len(blocks[0].Transactions()) != 1 {
+		t.Fatalf("BlocksByNumbers() unexpected blocks = %+v", blocks)
+	}
+	headers, err := client.HeadersByNumbers(context.Background(), nums)
+	if err != nil {
+		t.Fatalf("HeadersByNumbers() error = %v", err)
+	}
+	if len(headers) != 3 || headers[1].Number.Uint64() != 101 {
+		t.Fatalf("HeadersByNumbers() unexpected headers = %+v", headers)
+	}
+	if batchPosts != 2 {
+		t.Fatalf("batchPosts = %d, want 2 (1 for blocks + 1 for headers)", batchPosts)
 	}
 }

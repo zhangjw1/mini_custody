@@ -112,6 +112,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 // RunOnce 查询全部可恢复提币并逐条推进状态。
 func (w *Worker) RunOnce(ctx context.Context) error {
+	ctx = evm.WithTickCache(ctx)
 	items, err := w.store.ListProcessableWithdrawals(ctx, workerBatchSize)
 	if err != nil {
 		return fmt.Errorf("查询待处理提币失败：%w", err)
@@ -372,7 +373,7 @@ func (w *Worker) confirmReceipt(ctx context.Context, item postgres.Withdrawal, r
 	if receipt == nil || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() || receipt.EffectiveGasPrice == nil {
 		return errors.New("提币 Receipt 内容无效")
 	}
-	latest, err := w.chain.BlockNumber(ctx)
+	latest, err := evm.CachedBlockNumber(ctx, w.chain.BlockNumber)
 	if err != nil {
 		return fmt.Errorf("查询提币确认高度失败：%w", err)
 	}
@@ -598,7 +599,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.Withdrawal,
 	if item.GasLimit != nil && *item.GasLimit > 0 && uint64(*item.GasLimit) > gasLimit {
 		gasLimit = uint64(*item.GasLimit)
 	}
-	header, err := w.chain.HeaderByNumber(ctx, nil)
+	header, err := evm.CachedLatestHeader(ctx, w.chain.HeaderByNumber)
 	if err != nil {
 		return fmt.Errorf("提币加价查询 Base Fee 失败：%w", err)
 	}

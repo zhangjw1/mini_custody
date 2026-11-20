@@ -2040,3 +2040,111 @@ func TestIntegrationEVMDepositReorgRewindUpdateOrphanAndCreditedAlert(t *testing
 		t.Fatalf("token pending after orphan = %q, err = %v", tokenPending, err)
 	}
 }
+
+// TestIntegrationBatchEPerformanceQueriesAndBTCTransactions 验证 Batch E 的统一交易分页（含 BTC）、增量地址加载、批量内部交易过滤与批量充值提交。
+func TestIntegrationBatchEPerformanceQueriesAndBTCTransactions(t *testing.T) {
+	store, cleanup := integrationStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	provider, err := wallet.NewMnemonicKeyProvider(integrationTestMnemonic)
+	if err != nil {
+		t.Fatalf("NewMnemonicKeyProvider() error = %v", err)
+	}
+	user, address := firstDemoWallet(t, store)
+	if err := store.EnsureBitcoinWallets(ctx, provider); err != nil {
+		t.Fatalf("EnsureBitcoinWallets() error = %v", err)
+	}
+
+	// 1. 多区块批量充值与检查点提交。
+	obs1 := depositObservation(user.ID, address.ID, 40, 100)
+	obs2 := depositObservation(user.ID, address.ID, 41, 200)
+	items, created, err := store.RecordDepositsBatchAndCheckpoint(ctx, []DepositObservation{obs1, obs2}, ChainCheckpoint{
+		Network: NetworkSepolia, Scanner: "deposit-scanner", LastScannedBlock: 41, LastScannedHash: obs2.BlockHash,
+	})
+	if err != nil || created != 2 || len(items) != 2 || items[0].Status != DepositConfirming || items[1].Status != DepositConfirming {
+		t.Fatalf("RecordDepositsBatchAndCheckpoint() = %+v, created = %d, err = %v", items, created, err)
+	}
+
+	// 2. 批量内部转账哈希过滤与 JOIN 查询 Gas Station 归集任务。
+	sweep, _, platform := createGasTopupFixture(t, store, provider)
+	sweeps, err := store.ListGasStationSweeps(ctx, 20)
+	if err != nil || len(sweeps) == 0 || sweeps[0].ID != sweep.ID {
+		t.Fatalf("ListGasStationSweeps() = %+v, err = %v", sweeps, err)
+	}
+	transfer, _, err := store.CreateOrGetGasTopup(ctx, GasTopupRequest{
+		SweepID: sweep.ID, PlatformWalletID: platform.ID, FromAddress: platform.Address,
+		ToAddress: address.Address, AmountWei: big.NewInt(1_000_000), ChainPendingNonce: 20,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGetGasTopup() error = %v", err)
+	}
+	internalHash := fmt.Sprintf("0x%064x", 9901)
+	if _, _, err := store.SaveSignedInternalTransfer(ctx, SignedInternalTransfer{
+		TransferID: transfer.ID, GasLimit: 21_000, MaxFeePerGasWei: big.NewInt(20),
+		MaxPriorityFeePerGasWei: big.NewInt(2), RawTx: []byte{1, 2, 3}, TxHash: internalHash,
+	}); err != nil {
+		t.Fatalf("SaveSignedInternalTransfer() error = %v", err)
+	}
+	externalHash := fmt.Sprintf("0x%064x", 9902)
+	matched, err := store.FilterInternalTransferTxs(ctx, []string{internalHash, externalHash, internalHash})
+	if err != nil || !matched[internalHash] || matched[externalHash] || len(matched) != 1 {
+		t.Fatalf("FilterInternalTransferTxs() = %+v, err = %v", matched, err)
+	}
+
+	// 3. 增量地址加载：首次 afterID=0 返回现有地址，游标之后仅返回新增地址。
+	allAddrs, err := store.ListWalletAddressesAfterID(ctx, 0)
+	if err != nil || len(allAddrs) < 2 {
+		t.Fatalf("ListWalletAddressesAfterID(0) = %d, err = %v", len(allAddrs), err)
+	}
+	maxID := allAddrs[len(allAddrs)-1].ID
+	emptyAddrs, err := store.ListWalletAddressesAfterID(ctx, maxID)
+	if err != nil || len(emptyAddrs) != 0 {
+		t.Fatalf("ListWalletAddressesAfterID(maxID) = %d, err = %v", len(emptyAddrs), err)
+	}
+	newUser, _, err := store.CreateManagedUser(ctx, "batch-e-user", "Batch E 用户", "", provider, provider)
+	if err != nil {
+		t.Fatalf("CreateManagedUser() error = %v", err)
+	}
+	newAddrs, err := store.ListWalletAddressesAfterID(ctx, maxID)
+	if err != nil || len(newAddrs) != 1 || newAddrs[0].UserID != newUser.ID {
+		t.Fatalf("incremental ListWalletAddressesAfterID() = %+v, err = %v", newAddrs, err)
+	}
+
+	// 4. 统一流水分页包含 BTC_DEPOSIT 与 BTC_WITHDRAWAL，并支持资产和类型筛选及分页。
+	btcAddr, err := store.BTCAddressByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("BTCAddressByUser() error = %v", err)
+	}
+	btcObs := btc.DepositObservation{
+		UserID: user.ID, AddressID: btcAddr.ID, TxID: strings.Repeat("a", 64), Vout: 0,
+		BlockHash: strings.Repeat("b", 64), BlockHeight: 100, AmountSats: 50_000, ScriptPubKey: btcAddr.ScriptPubKey,
+	}
+	if _, err := store.RecordBTCDepositsAndCheckpoint(ctx, []btc.DepositObservation{btcObs}, btc.Checkpoint{
+		Network: btc.Network, Scanner: "btc-deposit", LastScannedBlock: 100, LastScannedHash: btcObs.BlockHash,
+	}); err != nil {
+		t.Fatalf("RecordBTCDepositsAndCheckpoint() error = %v", err)
+	}
+	var btcDepID int64
+	if err := store.pool.QueryRow(ctx, `SELECT id FROM btc_deposits WHERE txid = $1`, btcObs.TxID).Scan(&btcDepID); err != nil {
+		t.Fatalf("query btc deposit id: %v", err)
+	}
+	if err := store.CreditBTCDeposit(ctx, btcDepID, 3); err != nil {
+		t.Fatalf("CreditBTCDeposit() error = %v", err)
+	}
+	if _, _, err := store.CreateBTCWithdrawal(ctx, user.ID, "batch-e-btc-w", btcAddr.Address, 10_000, 2); err != nil {
+		t.Fatalf("CreateBTCWithdrawal() error = %v", err)
+	}
+
+	btcOnly, err := store.ListTransactionsFilteredPage(ctx, "BTC", "", 10, 0)
+	if err != nil || len(btcOnly) != 2 {
+		t.Fatalf("ListTransactionsFilteredPage(BTC) = %+v, err = %v", btcOnly, err)
+	}
+	btcWithdrawOnly, err := store.ListTransactionsFilteredPage(ctx, "BTC", "BTC_WITHDRAWAL", 10, 0)
+	if err != nil || len(btcWithdrawOnly) != 1 || btcWithdrawOnly[0].Type != "BTC_WITHDRAWAL" || btcWithdrawOnly[0].Decimals != 8 {
+		t.Fatalf("ListTransactionsFilteredPage(BTC_WITHDRAWAL) = %+v, err = %v", btcWithdrawOnly, err)
+	}
+	page2, err := store.ListTransactionsFilteredPage(ctx, "", "", 2, 2)
+	if err != nil || len(page2) != 2 {
+		t.Fatalf("ListTransactionsFilteredPage(limit=2, offset=2) = %+v, err = %v", page2, err)
+	}
+}

@@ -288,6 +288,28 @@ func TestConfigLoadsEVMReplacementSettings(t *testing.T) {
 	}
 }
 
+// TestConfigLoadsDBPoolSettings 验证数据库连接池参数解析及边界校验。
+func TestConfigLoadsDBPoolSettings(t *testing.T) {
+	setRequiredConfigEnvironment(t)
+	t.Setenv("DB_MAX_CONNS", "32")
+	t.Setenv("DB_MIN_CONNS", "4")
+	t.Setenv("DB_MAX_CONN_LIFETIME", "45m")
+	t.Setenv("DB_MAX_CONN_IDLE_TIME", "10m")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DB.MaxConns != 32 || cfg.DB.MinConns != 4 || cfg.DB.MaxConnLifetime != 45*time.Minute || cfg.DB.MaxConnIdleTime != 10*time.Minute {
+		t.Fatalf("DB = %+v", cfg.DB)
+	}
+
+	t.Setenv("DB_MIN_CONNS", "64")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want error when DB_MIN_CONNS > DB_MAX_CONNS")
+	}
+}
+
 // setRequiredConfigEnvironment 设置加载配置所需的最小非敏感测试值。
 func setRequiredConfigEnvironment(t *testing.T) {
 	t.Helper()

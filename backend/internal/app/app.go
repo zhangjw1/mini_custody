@@ -70,7 +70,12 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		return nil, errors.New("必须提供日志记录器")
 	}
 	// 初始化数据库连接池。
-	pool, err := postgres.Open(ctx, cfg.DatabaseURL, cfg.Timezone)
+	pool, err := postgres.OpenWithConfig(ctx, cfg.DatabaseURL, cfg.Timezone, postgres.PoolConfig{
+		MaxConns:        cfg.DB.MaxConns,
+		MinConns:        cfg.DB.MinConns,
+		MaxConnLifetime: cfg.DB.MaxConnLifetime,
+		MaxConnIdleTime: cfg.DB.MaxConnIdleTime,
+	})
 	if err != nil {
 		return nil, err
 	}

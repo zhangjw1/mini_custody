@@ -35,10 +35,12 @@ const TX_TYPE_LABELS: Record<Transaction['type'], string> = {
   TOKEN_WITHDRAWAL: 'Token 提币',
   TOKEN_SWEEP: 'Token 归集',
   GAS_TOPUP: 'Gas 补充',
+  BTC_DEPOSIT: 'BTC 充值',
+  BTC_WITHDRAWAL: 'BTC 提币',
 }
 
 export function transactionToDetail(tx: Transaction): TxDetailData {
-  const isInbound = tx.type === 'DEPOSIT' || tx.type === 'TOKEN_DEPOSIT'
+  const isInbound = tx.type === 'DEPOSIT' || tx.type === 'TOKEN_DEPOSIT' || tx.type === 'BTC_DEPOSIT'
   const sign = isInbound ? '+' : '-'
 
   return {

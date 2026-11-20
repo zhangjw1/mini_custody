@@ -10,8 +10,18 @@ import (
 
 var unsignedDecimal = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 var ethDecimal = regexp.MustCompile(`^(0|[1-9][0-9]*)(?:\.([0-9]{1,18}))?$`)
+var decimalPatterns = buildDecimalPatterns()
 
 var weiPerETH = new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+
+// buildDecimalPatterns 预编译 1 到 18 位精度的十进制金额正则表达式。
+func buildDecimalPatterns() [19]*regexp.Regexp {
+	var patterns [19]*regexp.Regexp
+	for decimals := 1; decimals <= 18; decimals++ {
+		patterns[decimals] = regexp.MustCompile(fmt.Sprintf(`^(0|[1-9][0-9]*)(?:\.([0-9]{1,%d}))?$`, decimals))
+	}
+	return patterns
+}
 
 // ParseDecimal 将指定精度的非负十进制金额精确转换为最小单位整数。
 func ParseDecimal(value string, decimals uint8) (*big.Int, error) {
@@ -19,7 +29,7 @@ func ParseDecimal(value string, decimals uint8) (*big.Int, error) {
 		return nil, errors.New("资产精度必须在 1 到 18 之间")
 	}
 	value = strings.TrimSpace(value)
-	pattern := regexp.MustCompile(fmt.Sprintf(`^(0|[1-9][0-9]*)(?:\.([0-9]{1,%d}))?$`, decimals))
+	pattern := decimalPatterns[decimals]
 	matches := pattern.FindStringSubmatch(value)
 	if matches == nil {
 		return nil, fmt.Errorf("金额必须是最多 %d 位小数的非负十进制数", decimals)

@@ -162,6 +162,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 // RunOnce 刷新平台余额并逐条推进 Gas 补充任务，单条失败不阻塞其他任务。
 func (w *Worker) RunOnce(ctx context.Context) error {
+	ctx = evm.WithTickCache(ctx)
 	var firstErr error
 	if err := w.refreshHealth(ctx); err != nil {
 		firstErr = err
@@ -286,7 +287,9 @@ func (w *Worker) sign(ctx context.Context, transfer postgres.InternalTransfer) e
 	if transfer.Nonce == nil || !transfer.Nonce.IsUint64() {
 		return w.handleSigningFailure(ctx, transfer.SweepID, errors.New("Gas 补充 Nonce 无效"))
 	}
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		return w.handleSigningFailure(ctx, transfer.SweepID, fmt.Errorf("查询平台热钱包失败：%w", err))
 	}
@@ -439,7 +442,7 @@ func (w *Worker) confirmReceipt(ctx context.Context, transfer postgres.InternalT
 	if receipt == nil || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() || receipt.EffectiveGasPrice == nil {
 		return errors.New("Gas 补充 Receipt 内容无效")
 	}
-	latest, err := w.chain.BlockNumber(ctx)
+	latest, err := evm.CachedBlockNumber(ctx, w.chain.BlockNumber)
 	if err != nil {
 		return fmt.Errorf("查询 Gas 补充确认高度失败：%w", err)
 	}
@@ -482,7 +485,9 @@ func (w *Worker) walletsFor(ctx context.Context, sweep postgres.TokenSweep) (pos
 	if address.ID != sweep.AddressID {
 		return postgres.WalletAddress{}, postgres.PlatformWallet{}, errors.New("归集任务与用户充值地址不匹配")
 	}
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		return postgres.WalletAddress{}, postgres.PlatformWallet{}, fmt.Errorf("查询平台热钱包失败：%w", err)
 	}
@@ -503,14 +508,14 @@ func (w *Worker) quoteWithGasLimit(ctx context.Context, gasLimit uint64) (feeQuo
 	if gasLimit == 0 {
 		return feeQuote{}, errors.New("RPC 返回的 Gas Limit 无效")
 	}
-	header, err := w.chain.HeaderByNumber(ctx, nil)
+	header, err := evm.CachedLatestHeader(ctx, w.chain.HeaderByNumber)
 	if err != nil {
 		return feeQuote{}, fmt.Errorf("查询最新区块费用失败：%w", err)
 	}
 	if header == nil || header.BaseFee == nil || header.BaseFee.Sign() < 0 {
 		return feeQuote{}, errors.New("最新区块缺少有效 Base Fee")
 	}
-	tip, err := w.chain.SuggestGasTipCap(ctx)
+	tip, err := evm.CachedGasTipCap(ctx, w.chain.SuggestGasTipCap)
 	if err != nil {
 		return feeQuote{}, fmt.Errorf("查询建议优先费失败：%w", err)
 	}
@@ -527,7 +532,9 @@ func (w *Worker) quoteWithGasLimit(ctx context.Context, gasLimit uint64) (feeQuo
 
 // refreshHealth 查询平台热钱包当前 ETH 余额并更新健康快照。
 func (w *Worker) refreshHealth(ctx context.Context) error {
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		w.updateHealth(postgres.PlatformWallet{}, nil, err)
 		return fmt.Errorf("查询 Gas Station 平台钱包失败：%w", err)
@@ -752,7 +759,9 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, transfer postgres.Interna
 	if prevFeeCap == nil || prevFeeCap.Sign() <= 0 || prevTip == nil || prevTip.Sign() < 0 {
 		return errors.New("待加价 Gas 补充缺少有效历史 Gas 参数")
 	}
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		return fmt.Errorf("Gas 补充加价查询平台热钱包失败：%w", err)
 	}
@@ -769,7 +778,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, transfer postgres.Interna
 	if transfer.GasLimit != nil && *transfer.GasLimit > 0 && uint64(*transfer.GasLimit) > gasLimit {
 		gasLimit = uint64(*transfer.GasLimit)
 	}
-	header, err := w.chain.HeaderByNumber(ctx, nil)
+	header, err := evm.CachedLatestHeader(ctx, w.chain.HeaderByNumber)
 	if err != nil {
 		return fmt.Errorf("Gas 补充加价查询 Base Fee 失败：%w", err)
 	}

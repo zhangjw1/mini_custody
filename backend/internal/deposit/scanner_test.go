@@ -17,12 +17,15 @@ import (
 
 // fakeChain 为扫描器单元测试提供确定性的区块和区块头。
 type fakeChain struct {
-	latest      uint64
-	blocks      map[uint64]*types.Block
-	blockErrors map[uint64]error
-	headers     map[uint64]*types.Header
-	blockCalls  []uint64
-	scanHeights []uint64
+	latest           uint64
+	blocks           map[uint64]*types.Block
+	blockErrors      map[uint64]error
+	headers          map[uint64]*types.Header
+	blockCalls       []uint64
+	batchBlockCalls  [][]uint64
+	headerCalls      []uint64
+	batchHeaderCalls [][]uint64
+	scanHeights      []uint64
 }
 
 // BlockNumber 返回测试配置的最新高度。
@@ -44,13 +47,55 @@ func (f *fakeChain) BlockByNumber(_ context.Context, number *big.Int) (*types.Bl
 	return block, nil
 }
 
-// HeaderByNumber 返回指定高度的测试区块头。
+// BlocksByNumbers 批量返回多个高度的测试区块并记录一次批量调用。
+func (f *fakeChain) BlocksByNumbers(_ context.Context, numbers []*big.Int) ([]*types.Block, error) {
+	batch := make([]uint64, len(numbers))
+	blocks := make([]*types.Block, len(numbers))
+	for i, number := range numbers {
+		height := number.Uint64()
+		batch[i] = height
+		if err := f.blockErrors[height]; err != nil {
+			f.batchBlockCalls = append(f.batchBlockCalls, batch)
+			return nil, err
+		}
+		block, ok := f.blocks[height]
+		if !ok {
+			f.batchBlockCalls = append(f.batchBlockCalls, batch)
+			return nil, errors.New("测试区块不存在")
+		}
+		blocks[i] = block
+	}
+	f.batchBlockCalls = append(f.batchBlockCalls, batch)
+	return blocks, nil
+}
+
+// HeaderByNumber 返回指定高度的测试区块头并记录调用。
 func (f *fakeChain) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
-	header, ok := f.headers[number.Uint64()]
+	height := number.Uint64()
+	f.headerCalls = append(f.headerCalls, height)
+	header, ok := f.headers[height]
 	if !ok {
 		return nil, errors.New("测试区块头不存在")
 	}
 	return header, nil
+}
+
+// HeadersByNumbers 批量返回多个高度的测试区块头并记录一次批量调用。
+func (f *fakeChain) HeadersByNumbers(_ context.Context, numbers []*big.Int) ([]*types.Header, error) {
+	batch := make([]uint64, len(numbers))
+	headers := make([]*types.Header, len(numbers))
+	for i, number := range numbers {
+		height := number.Uint64()
+		batch[i] = height
+		header, ok := f.headers[height]
+		if !ok {
+			f.batchHeaderCalls = append(f.batchHeaderCalls, batch)
+			return nil, errors.New("测试区块头不存在")
+		}
+		headers[i] = header
+	}
+	f.batchHeaderCalls = append(f.batchHeaderCalls, batch)
+	return headers, nil
 }
 
 // SetScanHeight 记录扫描器已完成的高度。
@@ -60,22 +105,37 @@ func (f *fakeChain) SetScanHeight(height uint64) {
 
 // fakeStore 为扫描器单元测试保存内存态检查点和充值记录。
 type fakeStore struct {
-	addresses     []postgres.WalletAddress
-	checkpoint    *postgres.ChainCheckpoint
-	rewinds       []postgres.ChainCheckpoint
-	deposits      []postgres.Deposit
-	observations  []postgres.DepositObservation
-	confirmations map[int64]int64
-	credited      map[int64]int64
-	orphaned      map[int64]bool
-	workerErrors  []postgres.WorkerError
-	internalTxs   map[string]bool
-	nextDepositID int64
+	addresses           []postgres.WalletAddress
+	checkpoint          *postgres.ChainCheckpoint
+	rewinds             []postgres.ChainCheckpoint
+	deposits            []postgres.Deposit
+	observations        []postgres.DepositObservation
+	confirmations       map[int64]int64
+	credited            map[int64]int64
+	orphaned            map[int64]bool
+	workerErrors        []postgres.WorkerError
+	internalTxs         map[string]bool
+	filterInternalCalls int
+	recordCalls         int
+	addressQueries      []int64
+	nextDepositID       int64
 }
 
 // ListWalletAddresses 返回测试托管地址。
-func (f *fakeStore) ListWalletAddresses(context.Context) ([]postgres.WalletAddress, error) {
-	return f.addresses, nil
+func (f *fakeStore) ListWalletAddresses(ctx context.Context) ([]postgres.WalletAddress, error) {
+	return f.ListWalletAddressesAfterID(ctx, 0)
+}
+
+// ListWalletAddressesAfterID 按游标增量返回测试托管地址。
+func (f *fakeStore) ListWalletAddressesAfterID(_ context.Context, afterID int64) ([]postgres.WalletAddress, error) {
+	f.addressQueries = append(f.addressQueries, afterID)
+	result := make([]postgres.WalletAddress, 0, len(f.addresses))
+	for _, item := range f.addresses {
+		if item.ID > afterID {
+			result = append(result, item)
+		}
+	}
+	return result, nil
 }
 
 // Checkpoint 返回内存检查点或未找到错误。
@@ -94,13 +154,26 @@ func (f *fakeStore) RewindCheckpoint(_ context.Context, network, scanner string,
 	return nil
 }
 
-// IsInternalTransferTx 判断测试交易是否属于平台内部转账。
-func (f *fakeStore) IsInternalTransferTx(_ context.Context, txHash string) (bool, error) {
-	return f.internalTxs[txHash], nil
+// FilterInternalTransferTxs 批量判断测试交易哈希是否属于平台内部转账。
+func (f *fakeStore) FilterInternalTransferTxs(_ context.Context, txHashes []string) (map[string]bool, error) {
+	f.filterInternalCalls++
+	matched := make(map[string]bool, len(txHashes))
+	for _, hash := range txHashes {
+		if f.internalTxs[hash] {
+			matched[hash] = true
+		}
+	}
+	return matched, nil
+}
+
+// RecordDepositsBatchAndCheckpoint 批量保存多区块观察结果并推进内存检查点。
+func (f *fakeStore) RecordDepositsBatchAndCheckpoint(ctx context.Context, observations []postgres.DepositObservation, checkpoint postgres.ChainCheckpoint) ([]postgres.Deposit, int, error) {
+	return f.RecordDepositsAndCheckpoint(ctx, observations, checkpoint)
 }
 
 // RecordDepositsAndCheckpoint 保存整区块观察结果并推进内存检查点。
 func (f *fakeStore) RecordDepositsAndCheckpoint(_ context.Context, observations []postgres.DepositObservation, checkpoint postgres.ChainCheckpoint) ([]postgres.Deposit, int, error) {
+	f.recordCalls++
 	f.checkpoint = &checkpoint
 	f.observations = append(f.observations, observations...)
 	items := make([]postgres.Deposit, 0, len(observations))
@@ -471,4 +544,66 @@ func testBlock(height uint64, transactions ...*types.Transaction) *types.Block {
 // testTransaction 构造普通交易或合约创建交易。
 func testTransaction(nonce uint64, to *common.Address, value int64) *types.Transaction {
 	return types.NewTx(&types.LegacyTx{Nonce: nonce, To: to, Value: big.NewInt(value), Gas: 21_000, GasPrice: big.NewInt(1)})
+}
+
+// TestScannerBatchRPCAndIncrementalAddresses 验证批量 RPC 拉块、批量内部交易过滤、单次检查点提交及增量地址加载。
+func TestScannerBatchRPCAndIncrementalAddresses(t *testing.T) {
+	target1 := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	target2 := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	tx1 := testTransaction(1, &target1, 100)
+	txInternal := testTransaction(2, &target1, 200)
+	tx3 := testTransaction(3, &target1, 300)
+
+	b10 := testBlock(10, tx1)
+	b11 := testBlockWithParent(11, b10.Hash(), txInternal)
+	b12 := testBlockWithParent(12, b11.Hash())
+	b13 := testBlockWithParent(13, b12.Hash(), tx3)
+	b14 := testBlockWithParent(14, b13.Hash())
+
+	chain := &fakeChain{
+		latest: 14,
+		blocks: map[uint64]*types.Block{10: b10, 11: b11, 12: b12, 13: b13, 14: b14},
+		headers: map[uint64]*types.Header{
+			10: b10.Header(), 11: b11.Header(), 12: b12.Header(), 13: b13.Header(), 14: b14.Header(),
+		},
+	}
+	store := &fakeStore{
+		addresses:   []postgres.WalletAddress{{ID: 7, UserID: 5, Address: target1.Hex()}},
+		internalTxs: map[string]bool{strings.ToLower(txInternal.Hash().Hex()): true},
+	}
+	start := uint64(10)
+	scanner := newTestScanner(t, chain, store, Config{StartBlock: &start, Confirmations: 3, BatchSize: 5, Interval: time.Second})
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("first RunOnce() error = %v", err)
+	}
+	if len(chain.batchBlockCalls) != 1 || len(chain.batchBlockCalls[0]) != 5 || len(chain.blockCalls) != 0 {
+		t.Fatalf("expected 1 batchBlockCalls of 5 blocks and 0 single blockCalls, got batch=%v single=%v", chain.batchBlockCalls, chain.blockCalls)
+	}
+	if len(chain.headerCalls) != 0 {
+		t.Fatalf("confirmPending should hit cached headers from fetched blocks without extra HeaderByNumber calls, got %v", chain.headerCalls)
+	}
+	if store.filterInternalCalls != 1 || store.recordCalls != 1 {
+		t.Fatalf("filterInternalCalls = %d, recordCalls = %d, want 1 and 1", store.filterInternalCalls, store.recordCalls)
+	}
+	if len(store.observations) != 2 || store.checkpoint.LastScannedBlock != 14 {
+		t.Fatalf("observations = %d, checkpoint = %+v", len(store.observations), store.checkpoint)
+	}
+
+	// 新增地址后，第二轮仅增量查询 id > 7，且只扫描新增区块 15。
+	tx5 := testTransaction(4, &target2, 500)
+	b15 := testBlockWithParent(15, b14.Hash(), tx5)
+	chain.latest = 15
+	chain.blocks[15] = b15
+	chain.headers[15] = b15.Header()
+	store.addresses = append(store.addresses, postgres.WalletAddress{ID: 8, UserID: 6, Address: target2.Hex()})
+
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("second RunOnce() error = %v", err)
+	}
+	if len(store.addressQueries) != 2 || store.addressQueries[0] != 0 || store.addressQueries[1] != 7 {
+		t.Fatalf("addressQueries = %v, want [0 7]", store.addressQueries)
+	}
+	if len(store.observations) != 3 || store.observations[2].UserID != 6 {
+		t.Fatalf("expected incremental address deposit observed, got %+v", store.observations)
+	}
 }

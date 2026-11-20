@@ -133,6 +133,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 // RunOnce 查询全部可恢复 Token 提币并逐条推进，单条失败不阻塞其他任务。
 func (w *Worker) RunOnce(ctx context.Context) error {
+	ctx = evm.WithTickCache(ctx)
 	items, err := w.store.ListProcessableTokenWithdrawals(ctx, workerBatchSize)
 	if err != nil {
 		return fmt.Errorf("查询待处理 Token 提币失败：%w", err)
@@ -371,7 +372,7 @@ func (w *Worker) confirmReceipt(ctx context.Context, item postgres.TokenWithdraw
 	if receipt == nil || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() || receipt.EffectiveGasPrice == nil {
 		return errors.New("Token 提币 Receipt 内容无效")
 	}
-	latest, err := w.chain.BlockNumber(ctx)
+	latest, err := evm.CachedBlockNumber(ctx, w.chain.BlockNumber)
 	if err != nil {
 		return fmt.Errorf("查询 Token 提币确认高度失败：%w", err)
 	}
@@ -447,7 +448,9 @@ func (w *Worker) checkBalancesAndQuote(ctx context.Context, item postgres.TokenW
 
 // platformFor 查询并校验 Token 提币使用的是配置的平台热钱包。
 func (w *Worker) platformFor(ctx context.Context, item postgres.TokenWithdrawal) (postgres.PlatformWallet, error) {
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		return postgres.PlatformWallet{}, fmt.Errorf("查询 Token 提币平台热钱包失败：%w", err)
 	}
@@ -477,7 +480,9 @@ func (w *Worker) validateTransaction(transaction *types.Transaction, item postgr
 
 // hasExpectedTransfer 校验 Receipt 存在平台热钱包到目标地址的精确 Transfer Event。
 func (w *Worker) hasExpectedTransfer(ctx context.Context, item postgres.TokenWithdrawal, logs []*types.Log) (bool, error) {
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		return false, fmt.Errorf("校验 Token 提币 Event 时查询平台热钱包失败：%w", err)
 	}
@@ -682,7 +687,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.TokenWithdr
 	if item.GasLimit != nil && *item.GasLimit > 0 && uint64(*item.GasLimit) > gasLimit {
 		gasLimit = uint64(*item.GasLimit)
 	}
-	header, err := w.chain.HeaderByNumber(ctx, nil)
+	header, err := evm.CachedLatestHeader(ctx, w.chain.HeaderByNumber)
 	if err != nil {
 		return fmt.Errorf("Token 提币加价查询 Base Fee 失败：%w", err)
 	}

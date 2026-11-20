@@ -17,9 +17,11 @@ import (
 )
 
 type fakeChain struct {
-	latest  uint64
-	headers map[uint64]*types.Header
-	err     error
+	latest           uint64
+	headers          map[uint64]*types.Header
+	headerCalls      []uint64
+	batchHeaderCalls [][]uint64
+	err              error
 }
 
 // BlockNumber 返回测试网络高度或错误。
@@ -27,12 +29,30 @@ func (f *fakeChain) BlockNumber(context.Context) (uint64, error) {
 	return f.latest, f.err
 }
 
-// HeaderByNumber 返回测试区块头。
+// HeaderByNumber 返回测试区块头并记录调用。
 func (f *fakeChain) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	f.headerCalls = append(f.headerCalls, number.Uint64())
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.headers[number.Uint64()], nil
+}
+
+// HeadersByNumbers 批量返回测试区块头并记录批量调用。
+func (f *fakeChain) HeadersByNumbers(_ context.Context, numbers []*big.Int) ([]*types.Header, error) {
+	batch := make([]uint64, len(numbers))
+	headers := make([]*types.Header, len(numbers))
+	if f.err != nil {
+		f.batchHeaderCalls = append(f.batchHeaderCalls, batch)
+		return nil, f.err
+	}
+	for i, n := range numbers {
+		h := n.Uint64()
+		batch[i] = h
+		headers[i] = f.headers[h]
+	}
+	f.batchHeaderCalls = append(f.batchHeaderCalls, batch)
+	return headers, nil
 }
 
 type blockRange struct {
@@ -389,4 +409,33 @@ func stringsLower(value string) string {
 		}
 	}
 	return string(result)
+}
+
+// TestScannerCachesHeadersWithinTick 验证同一区块内的多笔 Token 待确认充值复用本轮区块头缓存，不重复发起 RPC 查询。
+func TestScannerCachesHeadersWithinTick(t *testing.T) {
+	headers := headersForRange(10, 14)
+	chain := &fakeChain{latest: 14, headers: headers}
+	store := &fakeStore{
+		checkpoint: &postgres.ChainCheckpoint{
+			Network: postgres.NetworkSepolia, Scanner: "erc20:test",
+			LastScannedBlock: 14, LastScannedHash: stringsLower(headers[14].Hash().Hex()),
+		},
+		confirming: []postgres.TokenDeposit{
+			{ID: 1, BlockNumber: 11, BlockHash: stringsLower(headers[11].Hash().Hex()), Status: postgres.DepositConfirming},
+			{ID: 2, BlockNumber: 11, BlockHash: stringsLower(headers[11].Hash().Hex()), Status: postgres.DepositConfirming},
+			{ID: 3, BlockNumber: 11, BlockHash: stringsLower(headers[11].Hash().Hex()), Status: postgres.DepositConfirming},
+		},
+		updated: make(map[int64]int64), credited: make(map[int64]int),
+	}
+	scanner := newTestScanner(t, chain, &fakeContract{}, store, nil)
+	if err := scanner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	// 仅应校验 checkpoint 14 一次 + confirmPending 对区块 11 一次，而非 3 次重复查询区块 11。
+	if len(chain.headerCalls) != 2 || len(chain.batchHeaderCalls) != 0 {
+		t.Fatalf("headerCalls = %v, batchHeaderCalls = %v, want [14 11] and 0 batches", chain.headerCalls, chain.batchHeaderCalls)
+	}
+	if len(store.credited) != 3 {
+		t.Fatalf("expected all 3 deposits credited, got %v", store.credited)
+	}
 }

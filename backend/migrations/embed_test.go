@@ -207,3 +207,24 @@ func TestReorgOrphanedMigrationContainsConstraintsAndComments(t *testing.T) {
 		}
 	}
 }
+
+// TestPerformanceIndexesMigrationContainsExpectedIndexes 验证 000008 迁移包含性能索引及对齐后的排序索引。
+func TestPerformanceIndexesMigrationContainsExpectedIndexes(t *testing.T) {
+	sqlBytes, err := migrationFiles.ReadFile("000008_performance_indexes.up.sql")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	sql := string(sqlBytes)
+	for _, fragment := range []string{
+		"deposits_user_id_desc_idx",
+		"btc_deposits_user_id_desc_idx",
+		"btc_utxos_network_status_height_id_idx",
+		"btc_utxos_locked_by_idx",
+		"balance_entries_user_id_desc_idx",
+		"token_deposits_user_id_desc_idx",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Errorf("performance indexes migration fragment %q is missing", fragment)
+		}
+	}
+}

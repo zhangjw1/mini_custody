@@ -270,9 +270,17 @@ func (s *Store) WalletAddressByUser(ctx context.Context, userID int64) (WalletAd
 
 // ListWalletAddresses 查询 Sepolia 网络上的全部托管地址，供充值扫描器构建地址索引。
 func (s *Store) ListWalletAddresses(ctx context.Context) ([]WalletAddress, error) {
+	return s.ListWalletAddressesAfterID(ctx, 0)
+}
+
+// ListWalletAddressesAfterID 增量查询主键大于指定游标的 Sepolia 托管地址。
+func (s *Store) ListWalletAddressesAfterID(ctx context.Context, afterID int64) ([]WalletAddress, error) {
+	if afterID < 0 {
+		afterID = 0
+	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT `+walletColumns+` FROM wallet_addresses WHERE network = $1 ORDER BY id`,
-		NetworkSepolia,
+		`SELECT `+walletColumns+` FROM wallet_addresses WHERE network = $1 AND id > $2 ORDER BY id`,
+		NetworkSepolia, afterID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("查询托管钱包地址失败：%w", err)
@@ -454,45 +462,79 @@ func (s *Store) ListTransactionsPage(ctx context.Context, limit, offset int) ([]
 	return s.ListTransactionsFilteredPage(ctx, "", "", limit, offset)
 }
 
-// ListTransactionsFilteredPage 按资产和任务类型筛选统一流水投影。
+// ListTransactionsFilteredPage 按资产和任务类型筛选统一流水投影，先在各子表完成条件过滤和限量排序后再归并分页。
 func (s *Store) ListTransactionsFilteredPage(ctx context.Context, asset, transactionType string, limit, offset int) ([]TransactionRecord, error) {
 	asset = strings.ToUpper(strings.TrimSpace(asset))
 	transactionType = strings.ToUpper(strings.TrimSpace(transactionType))
+	normLimit := normalizedLimit(limit)
+	normOffset := normalizedOffset(offset)
+	branchLimit := normLimit + normOffset
 	rows, err := s.pool.Query(ctx, `
 		SELECT transaction_type, id, user_id, asset, decimals, tx_hash, amount_wei, block_number,
 		       confirmations, status, created_at, updated_at
 		FROM (
-			SELECT 'DEPOSIT'::text AS transaction_type, id, user_id, asset, 18::smallint AS decimals,
-			       tx_hash, amount_wei::text AS amount_wei, block_number, confirmations, status, created_at, updated_at
-			FROM deposits
+			(SELECT 'DEPOSIT'::text AS transaction_type, id, user_id, asset, 18::smallint AS decimals,
+			        tx_hash, amount_wei::text AS amount_wei, block_number, confirmations, status, created_at, updated_at
+			 FROM deposits
+			 WHERE ($1 = '' OR asset = $1) AND ($2 = '' OR $2 = 'DEPOSIT')
+			 ORDER BY created_at DESC, id DESC
+			 LIMIT $5)
 			UNION ALL
-			SELECT 'WITHDRAWAL'::text, id, user_id, 'ETH'::text, 18::smallint,
-			       COALESCE(tx_hash, ''), amount_wei::text, block_number, confirmations, status, created_at, updated_at
-			FROM withdrawals
+			(SELECT 'WITHDRAWAL'::text, id, user_id, 'ETH'::text, 18::smallint,
+			        COALESCE(tx_hash, ''), amount_wei::text, block_number, confirmations, status, created_at, updated_at
+			 FROM withdrawals
+			 WHERE ($1 = '' OR $1 = 'ETH') AND ($2 = '' OR $2 = 'WITHDRAWAL')
+			 ORDER BY created_at DESC, id DESC
+			 LIMIT $5)
 			UNION ALL
-			SELECT 'TOKEN_DEPOSIT'::text, deposit.id, deposit.user_id, asset.symbol, asset.decimals,
-			       deposit.tx_hash, deposit.amount_units::text, deposit.block_number,
-			       deposit.confirmations, deposit.status, deposit.created_at, deposit.updated_at
-			FROM token_deposits deposit JOIN assets asset ON asset.id = deposit.asset_id
+			(SELECT 'TOKEN_DEPOSIT'::text, deposit.id, deposit.user_id, asset.symbol, asset.decimals,
+			        deposit.tx_hash, deposit.amount_units::text, deposit.block_number,
+			        deposit.confirmations, deposit.status, deposit.created_at, deposit.updated_at
+			 FROM token_deposits deposit JOIN assets asset ON asset.id = deposit.asset_id
+			 WHERE ($1 = '' OR asset.symbol = $1) AND ($2 = '' OR $2 = 'TOKEN_DEPOSIT')
+			 ORDER BY deposit.created_at DESC, deposit.id DESC
+			 LIMIT $5)
 			UNION ALL
-			SELECT 'TOKEN_WITHDRAWAL'::text, withdrawal.id, withdrawal.user_id, asset.symbol, asset.decimals,
-			       COALESCE(withdrawal.tx_hash, ''), withdrawal.amount_units::text, withdrawal.block_number,
-			       withdrawal.confirmations, withdrawal.status, withdrawal.created_at, withdrawal.updated_at
-			FROM token_withdrawals withdrawal JOIN assets asset ON asset.id = withdrawal.asset_id
+			(SELECT 'TOKEN_WITHDRAWAL'::text, withdrawal.id, withdrawal.user_id, asset.symbol, asset.decimals,
+			        COALESCE(withdrawal.tx_hash, ''), withdrawal.amount_units::text, withdrawal.block_number,
+			        withdrawal.confirmations, withdrawal.status, withdrawal.created_at, withdrawal.updated_at
+			 FROM token_withdrawals withdrawal JOIN assets asset ON asset.id = withdrawal.asset_id
+			 WHERE ($1 = '' OR asset.symbol = $1) AND ($2 = '' OR $2 = 'TOKEN_WITHDRAWAL')
+			 ORDER BY withdrawal.created_at DESC, withdrawal.id DESC
+			 LIMIT $5)
 			UNION ALL
-			SELECT 'TOKEN_SWEEP'::text, sweep.id, sweep.user_id, asset.symbol, asset.decimals,
-			       COALESCE(sweep.tx_hash, ''), COALESCE(sweep.sweep_amount_units, sweep.recognized_amount_units)::text,
-			       sweep.block_number, sweep.confirmations, sweep.status, sweep.created_at, sweep.updated_at
-			FROM token_sweeps sweep JOIN assets asset ON asset.id = sweep.asset_id
+			(SELECT 'TOKEN_SWEEP'::text, sweep.id, sweep.user_id, asset.symbol, asset.decimals,
+			        COALESCE(sweep.tx_hash, ''), COALESCE(sweep.sweep_amount_units, sweep.recognized_amount_units)::text,
+			        sweep.block_number, sweep.confirmations, sweep.status, sweep.created_at, sweep.updated_at
+			 FROM token_sweeps sweep JOIN assets asset ON asset.id = sweep.asset_id
+			 WHERE ($1 = '' OR asset.symbol = $1) AND ($2 = '' OR $2 = 'TOKEN_SWEEP')
+			 ORDER BY sweep.created_at DESC, sweep.id DESC
+			 LIMIT $5)
 			UNION ALL
-			SELECT 'GAS_TOPUP'::text, transfer.id, sweep.user_id, 'ETH'::text, 18::smallint,
-			       COALESCE(transfer.tx_hash, ''), transfer.amount_wei::text, transfer.block_number,
-			       transfer.confirmations, transfer.status, transfer.created_at, transfer.updated_at
-			FROM internal_transfers transfer JOIN token_sweeps sweep ON sweep.id = transfer.sweep_id
+			(SELECT 'GAS_TOPUP'::text, transfer.id, sweep.user_id, 'ETH'::text, 18::smallint,
+			        COALESCE(transfer.tx_hash, ''), transfer.amount_wei::text, transfer.block_number,
+			        transfer.confirmations, transfer.status, transfer.created_at, transfer.updated_at
+			 FROM internal_transfers transfer JOIN token_sweeps sweep ON sweep.id = transfer.sweep_id
+			 WHERE ($1 = '' OR $1 = 'ETH') AND ($2 = '' OR $2 = 'GAS_TOPUP')
+			 ORDER BY transfer.created_at DESC, transfer.id DESC
+			 LIMIT $5)
+			UNION ALL
+			(SELECT 'BTC_DEPOSIT'::text, id, user_id, 'BTC'::text, 8::smallint,
+			        txid, amount_sats::text, block_height, confirmations, status, created_at, updated_at
+			 FROM btc_deposits
+			 WHERE ($1 = '' OR $1 = 'BTC') AND ($2 = '' OR $2 = 'BTC_DEPOSIT')
+			 ORDER BY created_at DESC, id DESC
+			 LIMIT $5)
+			UNION ALL
+			(SELECT 'BTC_WITHDRAWAL'::text, id, user_id, 'BTC'::text, 8::smallint,
+			        COALESCE(txid, ''), amount_sats::text, block_height, confirmations, status, created_at, updated_at
+			 FROM btc_withdrawals
+			 WHERE ($1 = '' OR $1 = 'BTC') AND ($2 = '' OR $2 = 'BTC_WITHDRAWAL')
+			 ORDER BY created_at DESC, id DESC
+			 LIMIT $5)
 		) transactions
-		WHERE ($1 = '' OR asset = $1) AND ($2 = '' OR transaction_type = $2)
 		ORDER BY created_at DESC, transaction_type, id DESC
-		LIMIT $3 OFFSET $4`, asset, transactionType, normalizedLimit(limit), normalizedOffset(offset),
+		LIMIT $3 OFFSET $4`, asset, transactionType, normLimit, normOffset, branchLimit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("分页查询全局交易失败：%w", err)

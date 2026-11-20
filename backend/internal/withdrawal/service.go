@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/xiaoqi/mini-custody/backend/internal/amount"
+	"github.com/xiaoqi/mini-custody/backend/internal/chain/evm"
 	"github.com/xiaoqi/mini-custody/backend/internal/store/postgres"
 )
 
@@ -187,14 +188,14 @@ func quoteForExisting(ctx context.Context, chain Chain, address postgres.WalletA
 
 // estimateFee 根据最新 Base Fee、建议 Tip 和 Gas 估算计算最大预留费用。
 func estimateFee(ctx context.Context, chain Chain, from, to common.Address, value *big.Int) (FeeQuote, error) {
-	header, err := chain.HeaderByNumber(ctx, nil)
+	header, err := evm.CachedLatestHeader(ctx, chain.HeaderByNumber)
 	if err != nil {
 		return FeeQuote{}, fmt.Errorf("查询最新区块费用失败：%w", err)
 	}
 	if header == nil || header.BaseFee == nil || header.BaseFee.Sign() < 0 {
 		return FeeQuote{}, errors.New("最新区块缺少有效 Base Fee")
 	}
-	tip, err := chain.SuggestGasTipCap(ctx)
+	tip, err := evm.CachedGasTipCap(ctx, chain.SuggestGasTipCap)
 	if err != nil {
 		return FeeQuote{}, fmt.Errorf("查询建议优先费失败：%w", err)
 	}

@@ -156,6 +156,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 // RunOnce 刷新热钱包库存并逐条推进归集，单条失败不阻塞其他任务。
 func (w *Worker) RunOnce(ctx context.Context) error {
+	ctx = evm.WithTickCache(ctx)
 	var firstErr error
 	if err := w.refreshInventory(ctx); err != nil {
 		firstErr = err
@@ -366,7 +367,9 @@ func (w *Worker) broadcast(ctx context.Context, item postgres.TokenSweep) error 
 	if transaction.Hash() != common.HexToHash(item.TxHash) {
 		return errors.New("Token 归集交易哈希与原始交易不一致")
 	}
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		return fmt.Errorf("广播前查询平台热钱包失败：%w", err)
 	}
@@ -445,7 +448,7 @@ func (w *Worker) confirmReceipt(ctx context.Context, item postgres.TokenSweep, r
 	if receipt == nil || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() || receipt.EffectiveGasPrice == nil {
 		return errors.New("Token 归集 Receipt 内容无效")
 	}
-	latest, err := w.chain.BlockNumber(ctx)
+	latest, err := evm.CachedBlockNumber(ctx, w.chain.BlockNumber)
 	if err != nil {
 		return fmt.Errorf("查询 Token 归集确认高度失败：%w", err)
 	}
@@ -532,7 +535,9 @@ func (w *Worker) walletsFor(ctx context.Context, item postgres.TokenSweep) (post
 	if address.ID != item.AddressID {
 		return postgres.WalletAddress{}, postgres.PlatformWallet{}, errors.New("Token 归集与用户充值地址不匹配")
 	}
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		return postgres.WalletAddress{}, postgres.PlatformWallet{}, fmt.Errorf("查询平台热钱包失败：%w", err)
 	}
@@ -544,14 +549,14 @@ func (w *Worker) quoteWithGasLimit(ctx context.Context, gasLimit uint64) (feeQuo
 	if gasLimit == 0 {
 		return feeQuote{}, errors.New("RPC 返回的 Token 归集 Gas Limit 无效")
 	}
-	header, err := w.chain.HeaderByNumber(ctx, nil)
+	header, err := evm.CachedLatestHeader(ctx, w.chain.HeaderByNumber)
 	if err != nil {
 		return feeQuote{}, fmt.Errorf("查询 Token 归集最新区块费用失败：%w", err)
 	}
 	if header == nil || header.BaseFee == nil || header.BaseFee.Sign() < 0 {
 		return feeQuote{}, errors.New("Token 归集最新区块缺少有效 Base Fee")
 	}
-	tip, err := w.chain.SuggestGasTipCap(ctx)
+	tip, err := evm.CachedGasTipCap(ctx, w.chain.SuggestGasTipCap)
 	if err != nil {
 		return feeQuote{}, fmt.Errorf("查询 Token 归集建议优先费失败：%w", err)
 	}
@@ -568,7 +573,9 @@ func (w *Worker) quoteWithGasLimit(ctx context.Context, gasLimit uint64) (feeQuo
 
 // refreshInventory 查询平台热钱包 Token 链上库存并更新健康快照。
 func (w *Worker) refreshInventory(ctx context.Context) error {
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		w.updateHealth(postgres.PlatformWallet{}, nil, err)
 		return fmt.Errorf("查询 Token 库存热钱包失败：%w", err)
@@ -808,7 +815,7 @@ func (w *Worker) bumpAndBroadcast(ctx context.Context, item postgres.TokenSweep,
 	if err != nil {
 		return err
 	}
-	header, err := w.chain.HeaderByNumber(ctx, nil)
+	header, err := evm.CachedLatestHeader(ctx, w.chain.HeaderByNumber)
 	if err != nil {
 		return fmt.Errorf("Token 归集加价查询 Base Fee 失败：%w", err)
 	}
@@ -903,7 +910,9 @@ func (w *Worker) rebroadcast(ctx context.Context, item postgres.TokenSweep) erro
 	if transaction.Hash() != common.HexToHash(item.TxHash) {
 		return errors.New("重播 Token 归集交易哈希与原始交易不一致")
 	}
-	platform, err := w.store.PlatformWalletByRole(ctx, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	platform, err := evm.CachedValue(ctx, postgres.NetworkSepolia+":"+postgres.PlatformRoleHot, func(c context.Context) (postgres.PlatformWallet, error) {
+		return w.store.PlatformWalletByRole(c, postgres.NetworkSepolia, postgres.PlatformRoleHot)
+	})
 	if err != nil {
 		return fmt.Errorf("重播归集前查询平台热钱包失败：%w", err)
 	}

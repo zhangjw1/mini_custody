@@ -47,7 +47,8 @@ type InternalTransferSettlement struct {
 // ListGasStationSweeps 查询尚未准备 Gas 或仍有补气交易需要恢复的归集任务。
 func (s *Store) ListGasStationSweeps(ctx context.Context, limit int) ([]TokenSweep, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT sweep.id FROM token_sweeps sweep
+		SELECT `+prefixedColumns("sweep", tokenSweepColumns)+`
+		FROM token_sweeps sweep
 		LEFT JOIN internal_transfers transfer ON transfer.id = sweep.gas_topup_transfer_id
 		WHERE sweep.status = $1 OR (
 			sweep.status = $2 AND transfer.status IN ($3, $4, $5, $6, $7)
@@ -59,29 +60,25 @@ func (s *Store) ListGasStationSweeps(ctx context.Context, limit int) ([]TokenSwe
 	if err != nil {
 		return nil, fmt.Errorf("查询待处理 Gas 补充任务失败：%w", err)
 	}
-	ids := make([]int64, 0)
+	defer rows.Close()
+	items := make([]TokenSweep, 0)
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("读取 Gas 补充任务 ID 失败：%w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, fmt.Errorf("遍历 Gas 补充任务失败：%w", err)
-	}
-	rows.Close()
-	items := make([]TokenSweep, 0, len(ids))
-	for _, id := range ids {
-		item, err := s.TokenSweepByID(ctx, id)
+		item, err := s.scanTokenSweep(rows)
 		if err != nil {
 			return nil, fmt.Errorf("读取 Gas 补充归集任务失败：%w", err)
 		}
 		items = append(items, item)
 	}
-	return items, nil
+	return items, rows.Err()
+}
+
+// prefixedColumns 为逗号分隔的列名统一加上表别名，避免 JOIN 查询字段歧义。
+func prefixedColumns(alias, columns string) string {
+	parts := strings.Split(columns, ",")
+	for i, part := range parts {
+		parts[i] = alias + "." + strings.TrimSpace(part)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // MarkTokenSweepGasReady 将无需补气的归集任务推进到等待归集状态。
@@ -415,18 +412,50 @@ func (s *Store) FinalizeInternalTransfer(ctx context.Context, settlement Interna
 
 // IsInternalTransferTx 判断交易哈希是否属于已登记的平台内部转账。
 func (s *Store) IsInternalTransferTx(ctx context.Context, txHash string) (bool, error) {
-	txHash = strings.ToLower(strings.TrimSpace(txHash))
-	if !transactionHashPattern.MatchString(txHash) {
-		return false, errors.New("内部转账查询哈希无效")
+	matched, err := s.FilterInternalTransferTxs(ctx, []string{txHash})
+	if err != nil {
+		return false, err
 	}
-	var exists bool
-	if err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM internal_transfers WHERE tx_hash = $1
+	return matched[strings.ToLower(strings.TrimSpace(txHash))], nil
+}
+
+// FilterInternalTransferTxs 批量判断一组交易哈希中哪些属于已登记的平台内部转账或替换尝试。
+func (s *Store) FilterInternalTransferTxs(ctx context.Context, txHashes []string) (map[string]bool, error) {
+	if len(txHashes) == 0 {
+		return map[string]bool{}, nil
+	}
+	normalized := make([]string, 0, len(txHashes))
+	seen := make(map[string]struct{}, len(txHashes))
+	for _, raw := range txHashes {
+		hash := strings.ToLower(strings.TrimSpace(raw))
+		if !transactionHashPattern.MatchString(hash) {
+			return nil, errors.New("内部转账查询哈希无效")
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		normalized = append(normalized, hash)
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tx_hash
+		FROM (
+			SELECT tx_hash FROM internal_transfers WHERE tx_hash = ANY($1::text[])
 			UNION ALL
-			SELECT 1 FROM evm_tx_attempts WHERE business_type = $2 AND tx_hash = $1
-		)`, txHash, EVMBusinessInternalTransfer).Scan(&exists); err != nil {
-		return false, fmt.Errorf("查询内部转账哈希失败：%w", err)
+			SELECT tx_hash FROM evm_tx_attempts WHERE business_type = $2 AND tx_hash = ANY($1::text[])
+		) matched`, normalized, EVMBusinessInternalTransfer,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("批量查询内部转账哈希失败：%w", err)
 	}
-	return exists, nil
+	defer rows.Close()
+	result := make(map[string]bool, len(normalized))
+	for rows.Next() {
+		var txHash string
+		if err := rows.Scan(&txHash); err != nil {
+			return nil, fmt.Errorf("读取内部转账哈希失败：%w", err)
+		}
+		result[strings.ToLower(strings.TrimSpace(txHash))] = true
+	}
+	return result, rows.Err()
 }

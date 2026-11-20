@@ -81,17 +81,38 @@ func (p *MnemonicKeyProvider) SignBitcoinInput(_ context.Context, path string, t
 	return encoded.Bytes(), nil
 }
 
-// bitcoinKey 按严格 BIP-84 Signet 路径派生扩展密钥。
+// deriveBitcoinAccountKey 从助记词种子预先派生 Signet 主密钥与 BIP-84 m/84'/1'/0' 账户扩展密钥。
+func deriveBitcoinAccountKey(seed []byte) (*hdkeychain.ExtendedKey, *hdkeychain.ExtendedKey, error) {
+	master, err := hdkeychain.NewMaster(seed, &chaincfg.SigNetParams)
+	if err != nil {
+		return nil, nil, errors.New("创建 Bitcoin HD 根密钥失败")
+	}
+	const hardened = uint32(hdkeychain.HardenedKeyStart)
+	account := master
+	for _, index := range []uint32{84 + hardened, 1 + hardened, 0 + hardened} {
+		account, err = account.Derive(index)
+		if err != nil {
+			return nil, nil, errors.New("派生 Bitcoin 账户密钥失败")
+		}
+	}
+	return master, account, nil
+}
+
+// bitcoinKey 按严格 BIP-84 Signet 路径派生扩展密钥，复用已缓存的主账户密钥减少重复派生。
 func (p *MnemonicKeyProvider) bitcoinKey(path string) (*hdkeychain.ExtendedKey, error) {
 	indices, err := parseBitcoinPath(path)
 	if err != nil {
 		return nil, err
 	}
-	key, err := hdkeychain.NewMaster(p.seed, &chaincfg.SigNetParams)
-	if err != nil {
-		return nil, errors.New("创建 Bitcoin HD 根密钥失败")
+	account := p.btcAccountKey
+	if account == nil {
+		_, account, err = deriveBitcoinAccountKey(p.seed)
+		if err != nil {
+			return nil, err
+		}
 	}
-	for _, index := range indices {
+	key := account
+	for _, index := range indices[3:] {
 		key, err = key.Derive(index)
 		if err != nil {
 			return nil, errors.New("派生 Bitcoin 子密钥失败")

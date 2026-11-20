@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"strings"
 
+	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	hdwallet "github.com/miguelmota/go-ethereum-hdwallet"
@@ -25,8 +26,10 @@ type KeyProvider interface {
 }
 
 type MnemonicKeyProvider struct {
-	wallet *hdwallet.Wallet
-	seed   []byte
+	wallet        *hdwallet.Wallet
+	seed          []byte
+	btcMasterKey  *hdkeychain.ExtendedKey
+	btcAccountKey *hdkeychain.ExtendedKey
 }
 
 // NewMnemonicKeyProvider 使用 BIP-39 助记词创建密钥提供器。
@@ -39,7 +42,17 @@ func NewMnemonicKeyProvider(mnemonic string) (*MnemonicKeyProvider, error) {
 	if err != nil {
 		return nil, errors.New("初始化 HD 钱包失败")
 	}
-	return &MnemonicKeyProvider{wallet: hdWallet, seed: bip39.NewSeed(mnemonic, "")}, nil
+	seed := bip39.NewSeed(mnemonic, "")
+	btcMaster, btcAccount, err := deriveBitcoinAccountKey(seed)
+	if err != nil {
+		return nil, err
+	}
+	return &MnemonicKeyProvider{
+		wallet:        hdWallet,
+		seed:          seed,
+		btcMasterKey:  btcMaster,
+		btcAccountKey: btcAccount,
+	}, nil
 }
 
 // UserPath 根据用户索引生成 Ethereum BIP-44 派生路径。
