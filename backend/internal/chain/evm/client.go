@@ -742,7 +742,7 @@ func isBusinessError(err error) bool {
 	}
 	var rpcErr rpc.Error
 	if errors.As(err, &rpcErr) {
-		if rpcErr.ErrorCode() == -32002 || rpcErr.ErrorCode() == -32005 {
+		if rpcErr.ErrorCode() == rpcErrCodeRateLimitOrTimeout || rpcErr.ErrorCode() == rpcErrCodeLimitExceeded {
 			return false
 		}
 		msg := strings.ToLower(rpcErr.Error())
@@ -776,7 +776,7 @@ func retryableOnSameEndpoint(err error) bool {
 	}
 	var rpcErr rpc.Error
 	if errors.As(err, &rpcErr) {
-		return rpcErr.ErrorCode() == -32002
+		return rpcErr.ErrorCode() == rpcErrCodeRateLimitOrTimeout
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
@@ -821,7 +821,7 @@ func isLogRangeTooLarge(err error) bool {
 		return false
 	}
 	message := strings.ToLower(rpcErr.Error())
-	if rpcErr.ErrorCode() == -32005 {
+	if rpcErr.ErrorCode() == rpcErrCodeLimitExceeded {
 		return true
 	}
 	for _, fragment := range []string{

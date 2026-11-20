@@ -209,7 +209,7 @@ func estimateFee(ctx context.Context, chain Chain, from, to common.Address, valu
 	if gasLimit == 0 {
 		return FeeQuote{}, errors.New("RPC 返回的 Gas Limit 无效")
 	}
-	maxFee := new(big.Int).Add(new(big.Int).Mul(header.BaseFee, big.NewInt(2)), tip)
+	maxFee := new(big.Int).Add(new(big.Int).Mul(header.BaseFee, big.NewInt(evm.BaseFeeMultiplier)), tip)
 	reserved := new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), maxFee)
 	return FeeQuote{
 		GasLimit:                gasLimit,

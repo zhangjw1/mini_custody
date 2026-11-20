@@ -19,7 +19,7 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/token/erc20"
 )
 
-const confirmBatchSize = 200
+const confirmBatchSize = evm.DefaultConfirmBatchSize
 
 var (
 	ErrStartBlockRequired = errors.New("数据库中没有 Token 扫描检查点，必须配置 ERC20_SCAN_START_BLOCK")

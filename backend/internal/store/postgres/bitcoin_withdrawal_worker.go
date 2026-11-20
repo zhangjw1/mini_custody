@@ -17,6 +17,8 @@ import (
 	"github.com/xiaoqi/mini-custody/backend/internal/btc"
 )
 
+const btcUTXOLockInterval = "10 minutes"
+
 // ListProcessableBTCWithdrawals 查询可恢复 BTC 提币任务。
 func (s *Store) ListProcessableBTCWithdrawals(ctx context.Context, limit int) ([]btc.Withdrawal, error) {
 	rows, err := s.pool.Query(ctx, `
@@ -156,8 +158,8 @@ func (s *Store) LockWithdrawalInputs(ctx context.Context, id, amount int64, lock
 		})
 		command, execErr := tx.Exec(ctx, `
 			UPDATE btc_utxos
-			SET status = 'LOCKED', locked_by = $2, locked_until = CURRENT_TIMESTAMP + INTERVAL '10 minutes', updated_at = CURRENT_TIMESTAMP
-			WHERE id = $1 AND status = 'UNSPENT'`, u.ID, locker)
+			SET status = $3, locked_by = $2, locked_until = CURRENT_TIMESTAMP + $4::interval, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 AND status = $5`, u.ID, locker, btc.UTXOStatusLocked, btcUTXOLockInterval, btc.UTXOStatusUnspent)
 		if execErr != nil {
 			return nil, nil, nil, nil, execErr
 		}

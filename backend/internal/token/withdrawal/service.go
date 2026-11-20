@@ -206,7 +206,7 @@ func estimateFee(ctx context.Context, chain FeeChain, contract QuoteContract, fr
 	if tip == nil || tip.Sign() < 0 {
 		return FeeQuote{}, errors.New("RPC 返回的 Token 提币建议优先费无效")
 	}
-	maxFee := new(big.Int).Add(new(big.Int).Mul(header.BaseFee, big.NewInt(2)), tip)
+	maxFee := new(big.Int).Add(new(big.Int).Mul(header.BaseFee, big.NewInt(evm.BaseFeeMultiplier)), tip)
 	reserved := new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), maxFee)
 	return FeeQuote{GasLimit: gasLimit, MaxFeePerGasWei: maxFee,
 		MaxPriorityFeePerGasWei: new(big.Int).Set(tip), ReservedFeeWei: reserved}, nil

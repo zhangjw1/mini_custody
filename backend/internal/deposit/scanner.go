@@ -12,12 +12,13 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/xiaoqi/mini-custody/backend/internal/chain/evm"
 	"github.com/xiaoqi/mini-custody/backend/internal/store/postgres"
 )
 
 const (
 	defaultScannerName = "eth-deposit"
-	confirmBatchSize   = 200
+	confirmBatchSize   = evm.DefaultConfirmBatchSize
 )
 
 var (

@@ -436,8 +436,8 @@ func TestWorkerSettlesFailedReceiptAndRefundsTransfer(t *testing.T) {
 // TestAlreadyKnownInspectsWrappedErrors 验证重复广播错误在包装后仍按成功处理。
 func TestAlreadyKnownInspectsWrappedErrors(t *testing.T) {
 	err := &evm.RPCError{Alias: "primary", Class: evm.FailureRPC, Err: errors.New("节点返回 already known")}
-	if !alreadyKnown(err) {
-		t.Fatal("alreadyKnown() = false, want true")
+	if !evm.AlreadyKnown(err) {
+		t.Fatal("evm.AlreadyKnown() = false, want true")
 	}
 }
 
