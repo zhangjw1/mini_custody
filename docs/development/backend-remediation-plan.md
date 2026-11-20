@@ -496,3 +496,68 @@ I3 的 BTC 部分和 I4 要等批次 G 合并后再做：开始前用 git log �
 J1 的锁定状态放内存还是落库，先在第 9 节写明，再实现。
 修改登录接口的错误码时同步更新 docs/api.md，并列出前端受影响的位置，但不要修改前端代码。
 ```
+
+---
+
+## 10. 第三轮修复（2026-11-20 复核 `28207d6` 遗留）
+
+> 复核结论：G1–G6、H1/H3–H6、I4–I6、J2–J6 已修复。下面是剩余问题，其中 R1–R3 为高危，必须修复。
+> 新迁移从 `000010` 开始。测试要求与第 9 节「第二轮通用提示词补充」相同。
+
+### 高危
+
+- **R1 MANUAL_REVIEW 必须继续跟踪链上结果**
+  - 问题：`chain/evm/worker_helpers.go:478` 在加价受阻 30 分钟后，会把已广播的交易转成 MANUAL_REVIEW，而 `repository.go:580` 等 `ListProcessable*` 不查这个状态。交易之后上链也不会被结算，用户的 pending 余额一直冻结。BTC 侧同理：`btc/withdrawal_worker.go:111`、`sweep_worker.go:160` 遇到 -5 只返回 err。
+  - 方案：
+    - 有 tx_hash 或 txid 的 MANUAL_REVIEW 记录继续做 receipt（或链上交易）核对，命中就照常结算，只停止自动加价和重播；
+    - 加价碰到费率上限属于正常情况，不应转人工，改为只重播；
+    - BTC 已广播交易持续返回 -5 超过阈值后，重播已落库的 raw，仍失败就转 MANUAL_REVIEW，并且只告警一次。
+  - 验收：集成测试中，MANUAL_REVIEW 记录的交易上链后状态变为 COMPLETED，余额和流水正确。
+- **R2 转人工的签名记录不能留下 nonce 空洞**
+  - 问题：`store/postgres/evm_tx_attempt.go:813-838` 在签名失败超限后，SIGNING 直接转 MANUAL_REVIEW，nonce 保留不动。热钱包（Token 提币和 Gas Station 共用）之后的交易会全部卡住。
+  - 方案（二选一，在本节写明选择）：
+    - (a) 转人工时，用同一 nonce 签发一笔 0 值自转账补位，并记入 evm_tx_attempts，按普通交易跟踪确认；
+    - (b) `Allocate*` 发现同一钱包存在"已分配 nonce 但未签名"的 MANUAL_REVIEW 记录时，拒绝继续分配并告警，由人工处理后放行。
+  - 另外：升级前已经处于 SIGNING、但没有 gas 参数的记录，允许重新报价一次（同一 nonce），不计入失败次数。
+- **R3 Token 扫描末块复核**
+  - 问题：`token/deposit/scanner.go:517-534、579-589` 在 getLogs 之后重新获取 toBlock，但没有和 getLogs 之前的哈希比对，区间扫描时也没有在 getLogs 之后复核 fromBlock 的父哈希。如果 getLogs 期间发生重组，新链上的转账会永久漏扫。`scanner_test.go:552-585` 把这种错误行为写成了预期。
+  - 方案：
+    - getLogs 之前记录 fromBlock 的父哈希和 toBlock 的哈希，getLogs 之后重新获取并比对，不一致就按重组处理，本批不提交；
+    - 修正这条测试。
+
+### 中危
+
+- **R4 归集加价余量**（`token/sweep/worker.go:216、581`）：prepare 阶段要求 `ethBalance ≥ fee×(1+bump%)^k`（k 为配置的最大加价次数），或者按余额倒推 maxFee 的上限；补气金额同步计入这部分余量。
+- **R5 BTC 扫描隔离**（`btc/scanner_worker.go:93-104、192-201`）：回退失败只记录错误；confirm 阶段单笔失败不能中断整批入账。
+- **R6 登录限流状态有界**（`app/auth_handler.go:372-395`）：
+  - 用户名长度限制为 64；
+  - 增加按纯 IP 的限流桶；
+  - map 设容量上限（LRU），改为后台定时清理；
+  - 文档注明只支持单实例；
+  - 如果将来上反向代理，要配置受信任的代理列表再读取 X-Forwarded-For。
+- **R7 BTC 启动校验 txindex**：启动时调用 `getindexinfo`，没开启 txindex 就拒绝启动。
+
+### 低危
+
+- **R8 新地址历史补扫**（`deposit/scanner.go:241-243`、`token/deposit/scanner.go:265-267`）：首次载入的地址，如果 created_at 早于检查点时间，就从它的创建块高开始补扫该地址。
+- **R9** `bitcoin.go:414`：REORG_RECHECK 行仍然占用唯一索引，导致新链上重新打包的同一笔 UTXO 无法入库。新迁移 000010 把它从唯一索引条件中排除，或者在插入时显式处理。
+- **R10** `bitcoin.go:167`：归集消耗 UTXO 时补上 `locked_by` 条件；`bitcoin_withdrawal_worker.go:118` 候选不足持续超过阈值后转 MANUAL_REVIEW。
+- **R11 补测试**：
+  - Gas Station 加价受阻；
+  - Token 提币、归集、Gas Station 三条链路签名失败转人工；
+  - nonce too low 的三条非 ETH 链路；
+  - 000009 回填其余三张表的断言；
+  - 改密后 token 失效；
+  - G7-1 增加一个 PLATFORM_CHANGE UTXO，断言不会选中充值 UTXO；
+  - 端点切换测试改用 HTTP 错误体，验证修复前确实会失败。
+
+### 第三轮提示词
+
+```text
+<第 1 节前缀> + <第 9 节第二轮补充>
+你负责第三轮修复，详见 docs/development/backend-remediation-plan.md 第 10 节。
+先完成 R1、R2、R3 这三条高危问题，每条单独提交，再做 R4–R11。新迁移从 000010 开始。
+R2 选 (a) 还是 (b)，先在第 10 节写明选择和理由，然后再实现。
+R1、R2 必须覆盖 ETH 提币、Token 提币、Token 归集、Gas Station 四条链路，BTC 提币和归集也要覆盖。
+每条高危问题都要有一个真实 PostgreSQL 集成测试，证明修复前会出现资金冻结、nonce 卡死或漏账。
+```
