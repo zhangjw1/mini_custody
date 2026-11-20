@@ -556,14 +556,28 @@ func (s *Store) RecordBTCDepositsAndCheckpoint(ctx context.Context, observations
 		if err != nil {
 			return 0, fmt.Errorf("写入 BTC 充值失败：%w", err)
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO btc_utxos (deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'UNCONFIRMED') ON CONFLICT (network,txid,vout) WHERE status <> 'UNKNOWN' DO NOTHING`, id, item.AddressID, NetworkBitcoinSignet, strings.ToLower(item.TxID), item.Vout, item.AmountSats, fmt.Sprintf("%x", item.ScriptPubKey), item.BlockHeight); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO btc_utxos (deposit_id,address_id,network,txid,vout,value_sats,script_pub_key,block_height,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (network,txid,vout) WHERE status <> 'UNKNOWN' DO NOTHING`, id, item.AddressID, NetworkBitcoinSignet, strings.ToLower(item.TxID), item.Vout, item.AmountSats, fmt.Sprintf("%x", item.ScriptPubKey), item.BlockHeight, btc.UTXOStatusUnconfirmed); err != nil {
 			return 0, fmt.Errorf("写入 BTC UTXO 失败：%w", err)
 		}
-		if _, err = tx.Exec(ctx, `UPDATE asset_balances SET pending_deposit_wei=pending_deposit_wei+$3,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE user_id=$1 AND asset_id=$2`, item.UserID, assetID, item.AmountSats); err != nil {
-			return 0, fmt.Errorf("增加 BTC 待确认余额失败：%w", err)
+		amt := big.NewInt(item.AmountSats)
+		if err = adjustBalance(ctx, tx, balanceDelta{
+			UserID:              item.UserID,
+			AssetID:             &assetID,
+			Asset:               AssetBTC,
+			PendingDepositDelta: amt,
+		}, "增加 BTC 待确认余额"); err != nil {
+			return 0, err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO balance_entries(user_id,asset_id,asset,entry_type,amount_wei,reference_type,reference_id) VALUES($1,$2,'BTC','DEPOSIT_PENDING',$3,'BTC_DEPOSIT',$4)`, item.UserID, assetID, item.AmountSats, id); err != nil {
-			return 0, fmt.Errorf("写入 BTC 待确认流水失败：%w", err)
+		if err = insertBalanceEntry(ctx, tx, balanceEntryInput{
+			UserID:        item.UserID,
+			AssetID:       &assetID,
+			Asset:         AssetBTC,
+			EntryType:     EntryDepositPending,
+			Amount:        amt,
+			ReferenceType: RefBTCDeposit,
+			ReferenceID:   id,
+		}, "写入 BTC 待确认流水"); err != nil {
+			return 0, err
 		}
 		created++
 	}
@@ -657,9 +671,9 @@ func lockDepositUTXOAndCreateSweepInTx(ctx context.Context, tx pgx.Tx, depositID
 func (s *Store) ReleaseExpiredBTCUTXOLocks(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE btc_utxos
-		SET status='UNSPENT', locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP
-		WHERE status='LOCKED' AND locked_until<CURRENT_TIMESTAMP AND locked_by<>$1 AND locked_by LIKE $2`,
-		btc.SweepLockBy, btc.WithdrawalLockPrefix+"%")
+		SET status=$3, locked_by=NULL, locked_until=NULL, updated_at=CURRENT_TIMESTAMP
+		WHERE status=$4 AND locked_until<CURRENT_TIMESTAMP AND locked_by<>$1 AND locked_by LIKE $2`,
+		btc.SweepLockBy, btc.WithdrawalLockPrefix+"%", btc.UTXOStatusUnspent, btc.UTXOStatusLocked)
 	return err
 }
 
@@ -696,13 +710,28 @@ func (s *Store) CreateBTCWithdrawal(ctx context.Context, userID int64, key, addr
 	if !ok || parsed.Cmp(big.NewInt(amountSats)) < 0 {
 		return btc.Withdrawal{}, false, ErrInsufficientBalance
 	}
-	if _, err = tx.Exec(ctx, `UPDATE asset_balances SET available_wei=available_wei-$2,pending_withdrawal_wei=pending_withdrawal_wei+$2,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=$1`, balanceID, amountSats); err != nil {
+	amt := big.NewInt(amountSats)
+	if err = adjustBalance(ctx, tx, balanceDelta{
+		UserID:                 userID,
+		AssetID:                &assetID,
+		Asset:                  AssetBTC,
+		AvailableDelta:         new(big.Int).Neg(amt),
+		PendingWithdrawalDelta: amt,
+	}, "占用 BTC 提币余额"); err != nil {
 		return btc.Withdrawal{}, false, err
 	}
-	if err = scan(tx.QueryRow(ctx, `INSERT INTO btc_withdrawals(user_id,idempotency_key,to_address,amount_sats,fee_rate_sat_vb,selected_inputs_json,outputs_json,status) VALUES($1,$2,$3,$4,$5,'[]'::jsonb,'[]'::jsonb,'CREATED') RETURNING id,user_id,idempotency_key,to_address,amount_sats,fee_rate_sat_vb,status`, userID, key, address, amountSats, feeRate), &item); err != nil {
+	if err = scan(tx.QueryRow(ctx, `INSERT INTO btc_withdrawals(user_id,idempotency_key,to_address,amount_sats,fee_rate_sat_vb,selected_inputs_json,outputs_json,status) VALUES($1,$2,$3,$4,$5,'[]'::jsonb,'[]'::jsonb,$6) RETURNING id,user_id,idempotency_key,to_address,amount_sats,fee_rate_sat_vb,status`, userID, key, address, amountSats, feeRate, btc.WithdrawalCreated), &item); err != nil {
 		return btc.Withdrawal{}, false, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO balance_entries(user_id,asset_id,asset,entry_type,amount_wei,reference_type,reference_id) VALUES($1,$2,'BTC','WITHDRAW_RESERVE',$3,'BTC_WITHDRAWAL',$4)`, userID, assetID, -amountSats, item.ID); err != nil {
+	if err = insertBalanceEntry(ctx, tx, balanceEntryInput{
+		UserID:        userID,
+		AssetID:       &assetID,
+		Asset:         AssetBTC,
+		EntryType:     EntryWithdrawReserve,
+		Amount:        new(big.Int).Neg(amt),
+		ReferenceType: RefBTCWithdrawal,
+		ReferenceID:   item.ID,
+	}, "写入 BTC 提币占用流水"); err != nil {
 		return btc.Withdrawal{}, false, err
 	}
 	if err = tx.Commit(ctx); err != nil {

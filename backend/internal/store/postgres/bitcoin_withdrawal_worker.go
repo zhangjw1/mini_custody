@@ -351,22 +351,31 @@ func (s *Store) CompleteBTCWithdrawal(ctx context.Context, id, confirmations, he
 		return ErrPendingBalance
 	}
 
-	if _, err = tx.Exec(ctx, `
-		UPDATE asset_balances
-		SET pending_withdrawal_wei = pending_withdrawal_wei - $3, version = version + 1, updated_at = CURRENT_TIMESTAMP
-		WHERE user_id = $1 AND asset_id = $2`, userID, assetID, amount); err != nil {
+	amt := big.NewInt(amount)
+	if err = adjustBalance(ctx, tx, balanceDelta{
+		UserID:                 userID,
+		AssetID:                &assetID,
+		Asset:                  AssetBTC,
+		PendingWithdrawalDelta: new(big.Int).Neg(amt),
+	}, "扣减 BTC 待结算提币余额"); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `
-		INSERT INTO balance_entries (user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id)
-		VALUES ($1, $2, 'BTC', 'WITHDRAW_FINALIZE', $3, 'BTC_WITHDRAWAL', $4)
-		ON CONFLICT (entry_type, reference_type, reference_id) DO NOTHING`, userID, assetID, -amount, id); err != nil {
+	if err = insertBalanceEntry(ctx, tx, balanceEntryInput{
+		UserID:         userID,
+		AssetID:        &assetID,
+		Asset:          AssetBTC,
+		EntryType:      EntryWithdrawFinalize,
+		Amount:         new(big.Int).Neg(amt),
+		ReferenceType:  RefBTCWithdrawal,
+		ReferenceID:    id,
+		ConflictPolicy: entryConflictDoNothing,
+	}, "写入 BTC 提币结算流水"); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `
 		UPDATE btc_utxos
-		SET status = 'SPENT', spend_txid = $2, locked_by = NULL, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
-		WHERE status = 'LOCKED' AND locked_by = $1`, btc.WithdrawalLocker(id), strings.ToLower(txid)); err != nil {
+		SET status = $3, spend_txid = $2, locked_by = NULL, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
+		WHERE status = $4 AND locked_by = $1`, btc.WithdrawalLocker(id), strings.ToLower(txid), btc.UTXOStatusSpent, btc.UTXOStatusLocked); err != nil {
 		return err
 	}
 
@@ -408,9 +417,10 @@ func (s *Store) FailBTCWithdrawal(ctx context.Context, id int64, code, message s
 	var userID, amount int64
 	if err = tx.QueryRow(ctx, `
 		UPDATE btc_withdrawals
-		SET status = 'FAILED', error_code = $2, error_message = $3, updated_at = CURRENT_TIMESTAMP
-		WHERE id = $1 AND status IN ('CREATED', 'INPUTS_LOCKED')
-		RETURNING user_id, amount_sats`, id, strings.TrimSpace(code), strings.TrimSpace(message)).Scan(&userID, &amount); err != nil {
+		SET status = $4, error_code = $2, error_message = $3, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 AND status IN ($5, $6)
+		RETURNING user_id, amount_sats`, id, strings.TrimSpace(code), strings.TrimSpace(message),
+		btc.WithdrawalFailed, btc.WithdrawalCreated, btc.WithdrawalInputsLocked).Scan(&userID, &amount); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			var exists bool
 			if checkErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM btc_withdrawals WHERE id = $1)`, id).Scan(&exists); checkErr == nil && exists {
@@ -425,22 +435,32 @@ func (s *Store) FailBTCWithdrawal(ctx context.Context, id int64, code, message s
 	if err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `
-		UPDATE asset_balances
-		SET available_wei = available_wei + $3, pending_withdrawal_wei = pending_withdrawal_wei - $3, version = version + 1, updated_at = CURRENT_TIMESTAMP
-		WHERE user_id = $1 AND asset_id = $2`, userID, assetID, amount); err != nil {
+	amt := big.NewInt(amount)
+	if err = adjustBalance(ctx, tx, balanceDelta{
+		UserID:                 userID,
+		AssetID:                &assetID,
+		Asset:                  AssetBTC,
+		AvailableDelta:         amt,
+		PendingWithdrawalDelta: new(big.Int).Neg(amt),
+	}, "释放 BTC 提币占用余额"); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `
-		INSERT INTO balance_entries (user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id)
-		VALUES ($1, $2, 'BTC', 'WITHDRAW_RELEASE', $3, 'BTC_WITHDRAWAL', $4)
-		ON CONFLICT (entry_type, reference_type, reference_id) DO NOTHING`, userID, assetID, amount, id); err != nil {
+	if err = insertBalanceEntry(ctx, tx, balanceEntryInput{
+		UserID:         userID,
+		AssetID:        &assetID,
+		Asset:          AssetBTC,
+		EntryType:      EntryWithdrawRelease,
+		Amount:         amt,
+		ReferenceType:  RefBTCWithdrawal,
+		ReferenceID:    id,
+		ConflictPolicy: entryConflictDoNothing,
+	}, "写入 BTC 提币释放流水"); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `
 		UPDATE btc_utxos
-		SET status = 'UNSPENT', locked_by = NULL, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
-		WHERE status = 'LOCKED' AND locked_by = $1`, btc.WithdrawalLocker(id)); err != nil {
+		SET status = $2, locked_by = NULL, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
+		WHERE status = $3 AND locked_by = $1`, btc.WithdrawalLocker(id), btc.UTXOStatusUnspent, btc.UTXOStatusLocked); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

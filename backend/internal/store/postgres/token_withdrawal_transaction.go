@@ -117,23 +117,26 @@ func (s *Store) ReserveTokenWithdrawal(ctx context.Context, request TokenWithdra
 	if balance.AvailableWei.Cmp(request.AmountUnits) < 0 {
 		return TokenWithdrawal{}, false, ErrInsufficientBalance
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE asset_balances SET
-			available_wei = available_wei - $3::numeric,
-			pending_withdrawal_wei = pending_withdrawal_wei + $3::numeric,
-			version = version + 1, updated_at = CURRENT_TIMESTAMP
-		WHERE user_id = $1 AND asset_id = $2`, request.UserID, request.AssetID, request.AmountUnits.String(),
-	); err != nil {
-		return TokenWithdrawal{}, false, fmt.Errorf("占用 Token 提币余额失败：%w", err)
+	if err := adjustBalance(ctx, tx, balanceDelta{
+		UserID:                 request.UserID,
+		AssetID:                &request.AssetID,
+		Asset:                  balance.Asset,
+		AvailableDelta:         new(big.Int).Neg(request.AmountUnits),
+		PendingWithdrawalDelta: request.AmountUnits,
+	}, "占用 Token 提币余额"); err != nil {
+		return TokenWithdrawal{}, false, err
 	}
 	entryAmount := new(big.Int).Neg(new(big.Int).Set(request.AmountUnits))
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO balance_entries (
-			user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
-		) VALUES ($1, $2, $3, 'WITHDRAW_RESERVE', $4::numeric, 'TOKEN_WITHDRAWAL', $5)`,
-		request.UserID, request.AssetID, balance.Asset, entryAmount.String(), withdrawalID,
-	); err != nil {
-		return TokenWithdrawal{}, false, fmt.Errorf("写入 Token 提币占用流水失败：%w", err)
+	if err := insertBalanceEntry(ctx, tx, balanceEntryInput{
+		UserID:        request.UserID,
+		AssetID:       &request.AssetID,
+		Asset:         balance.Asset,
+		EntryType:     EntryWithdrawReserve,
+		Amount:        entryAmount,
+		ReferenceType: RefTokenWithdrawal,
+		ReferenceID:   withdrawalID,
+	}, "写入 Token 提币占用流水"); err != nil {
+		return TokenWithdrawal{}, false, err
 	}
 	item, err := s.scanTokenWithdrawal(tx.QueryRow(ctx, `SELECT `+tokenWithdrawalColumns+` FROM token_withdrawals WHERE id = $1`, withdrawalID))
 	if err != nil {
@@ -374,14 +377,14 @@ func (s *Store) FinalizeTokenWithdrawal(ctx context.Context, settlement TokenWit
 		return TokenWithdrawal{}, false, ErrPendingBalance
 	}
 	status := WithdrawalCompleted
-	entryType := "WITHDRAW_FINALIZE"
+	entryType := EntryWithdrawFinalize
 	entryAmount := new(big.Int).Neg(new(big.Int).Set(item.AmountUnits))
 	availableIncrease := new(big.Int)
 	errorCode := strings.TrimSpace(settlement.ErrorCode)
 	errorMessage := strings.TrimSpace(settlement.ErrorMessage)
 	if !settlement.Success {
 		status = WithdrawalFailed
-		entryType = "WITHDRAW_RELEASE"
+		entryType = EntryWithdrawRelease
 		entryAmount.Set(item.AmountUnits)
 		availableIncrease.Set(item.AmountUnits)
 		if errorCode == "" {
@@ -391,22 +394,25 @@ func (s *Store) FinalizeTokenWithdrawal(ctx context.Context, settlement TokenWit
 			errorMessage = "Token 提币交易链上执行失败"
 		}
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE asset_balances SET available_wei = available_wei + $3::numeric,
-			pending_withdrawal_wei = pending_withdrawal_wei - $4::numeric,
-			version = version + 1, updated_at = CURRENT_TIMESTAMP
-		WHERE user_id = $1 AND asset_id = $2`, item.UserID, item.AssetID,
-		availableIncrease.String(), item.AmountUnits.String(),
-	); err != nil {
-		return TokenWithdrawal{}, false, fmt.Errorf("结算 Token 提币余额失败：%w", err)
+	if err := adjustBalance(ctx, tx, balanceDelta{
+		UserID:                 item.UserID,
+		AssetID:                &item.AssetID,
+		Asset:                  balance.Asset,
+		AvailableDelta:         availableIncrease,
+		PendingWithdrawalDelta: new(big.Int).Neg(item.AmountUnits),
+	}, "结算 Token 提币余额"); err != nil {
+		return TokenWithdrawal{}, false, err
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO balance_entries (
-			user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
-		) VALUES ($1, $2, $3, $4, $5::numeric, 'TOKEN_WITHDRAWAL', $6)`,
-		item.UserID, item.AssetID, balance.Asset, entryType, entryAmount.String(), item.ID,
-	); err != nil {
-		return TokenWithdrawal{}, false, fmt.Errorf("写入 Token 提币结算流水失败：%w", err)
+	if err := insertBalanceEntry(ctx, tx, balanceEntryInput{
+		UserID:        item.UserID,
+		AssetID:       &item.AssetID,
+		Asset:         balance.Asset,
+		EntryType:     entryType,
+		Amount:        entryAmount,
+		ReferenceType: RefTokenWithdrawal,
+		ReferenceID:   item.ID,
+	}, "写入 Token 提币结算流水"); err != nil {
+		return TokenWithdrawal{}, false, err
 	}
 	matchedTxHash := strings.ToLower(strings.TrimSpace(settlement.TxHash))
 	item, err = s.scanTokenWithdrawal(tx.QueryRow(ctx, `

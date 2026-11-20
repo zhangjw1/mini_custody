@@ -81,26 +81,25 @@ func (s *Store) ReplaceWithdrawalTx(ctx context.Context, replacement SignedWithd
 		if balance.AvailableWei.Cmp(difference) < 0 {
 			return Withdrawal{}, false, ErrInsufficientBalance
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE asset_balances SET
-				available_wei = available_wei - $2::numeric,
-				pending_withdrawal_wei = pending_withdrawal_wei + $2::numeric,
-				version = version + 1,
-				updated_at = CURRENT_TIMESTAMP
-			WHERE user_id = $1 AND asset = $3`, item.UserID, difference.String(), AssetETH,
-		); err != nil {
-			return Withdrawal{}, false, fmt.Errorf("追加提币替换费用占用失败：%w", err)
+		if err := adjustBalance(ctx, tx, balanceDelta{
+			UserID:                 item.UserID,
+			Asset:                  AssetETH,
+			AvailableDelta:         new(big.Int).Neg(difference),
+			PendingWithdrawalDelta: difference,
+		}, "追加提币替换费用占用"); err != nil {
+			return Withdrawal{}, false, err
 		}
 		entryAmount := new(big.Int).Neg(new(big.Int).Set(difference))
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO balance_entries (
-				user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
-			) VALUES ($1, (SELECT id FROM assets WHERE symbol = $2), $2, 'FEE_ADJUST', $3::numeric, 'WITHDRAWAL', $4)
-			ON CONFLICT (entry_type, reference_type, reference_id) DO UPDATE SET
-				amount_wei = balance_entries.amount_wei + EXCLUDED.amount_wei`,
-			item.UserID, AssetETH, entryAmount.String(), item.ID,
-		); err != nil {
-			return Withdrawal{}, false, fmt.Errorf("写入提币替换费用调整流水失败：%w", err)
+		if err := insertBalanceEntry(ctx, tx, balanceEntryInput{
+			UserID:         item.UserID,
+			Asset:          AssetETH,
+			EntryType:      EntryFeeAdjust,
+			Amount:         entryAmount,
+			ReferenceType:  RefWithdrawal,
+			ReferenceID:    item.ID,
+			ConflictPolicy: entryConflictAddAmount,
+		}, "写入提币替换费用调整流水"); err != nil {
+			return Withdrawal{}, false, err
 		}
 	} else {
 		newReservedFeeWei = new(big.Int).Set(item.ReservedFeeWei)

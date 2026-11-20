@@ -106,22 +106,24 @@ func (s *Store) recordTokenDepositInTx(ctx context.Context, tx pgx.Tx, observati
 		if err != nil {
 			return TokenDeposit{}, false, err
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE asset_balances SET
-				pending_deposit_wei = pending_deposit_wei + $3::numeric,
-				version = version + 1, updated_at = CURRENT_TIMESTAMP
-			WHERE user_id = $1 AND asset_id = $2`,
-			observation.UserID, observation.AssetID, observation.AmountUnits.String(),
-		); err != nil {
-			return TokenDeposit{}, false, fmt.Errorf("增加 Token 待确认余额失败：%w", err)
+		if err := adjustBalance(ctx, tx, balanceDelta{
+			UserID:              observation.UserID,
+			AssetID:             &observation.AssetID,
+			Asset:               balance.Asset,
+			PendingDepositDelta: observation.AmountUnits,
+		}, "增加 Token 待确认余额"); err != nil {
+			return TokenDeposit{}, false, err
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO balance_entries (
-				user_id, asset_id, asset, entry_type, amount_wei, reference_type, reference_id
-			) VALUES ($1, $2, $3, $4, $5::numeric, 'TOKEN_DEPOSIT', $6)`,
-			observation.UserID, observation.AssetID, balance.Asset, EntryDepositPending, observation.AmountUnits.String(), item.ID,
-		); err != nil {
-			return TokenDeposit{}, false, fmt.Errorf("写入 Token 待确认流水失败：%w", err)
+		if err := insertBalanceEntry(ctx, tx, balanceEntryInput{
+			UserID:        observation.UserID,
+			AssetID:       &observation.AssetID,
+			Asset:         balance.Asset,
+			EntryType:     EntryDepositPending,
+			Amount:        observation.AmountUnits,
+			ReferenceType: RefTokenDeposit,
+			ReferenceID:   item.ID,
+		}, "写入 Token 待确认流水"); err != nil {
+			return TokenDeposit{}, false, err
 		}
 		return item, true, nil
 	}

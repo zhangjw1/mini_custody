@@ -35,9 +35,22 @@ const (
 )
 
 const (
-	EntryDepositPending  = "DEPOSIT_PENDING"
-	EntryDepositCredit   = "DEPOSIT_CREDIT"
-	EntryDepositReversal = "DEPOSIT_REVERSAL"
+	EntryDepositPending   = "DEPOSIT_PENDING"
+	EntryDepositCredit    = "DEPOSIT_CREDIT"
+	EntryDepositReversal  = "DEPOSIT_REVERSAL"
+	EntryWithdrawReserve  = "WITHDRAW_RESERVE"
+	EntryWithdrawFinalize = "WITHDRAW_FINALIZE"
+	EntryWithdrawRelease  = "WITHDRAW_RELEASE"
+	EntryFeeAdjust        = "FEE_ADJUST"
+)
+
+const (
+	RefDeposit         = "DEPOSIT"
+	RefWithdrawal      = "WITHDRAWAL"
+	RefTokenDeposit    = "TOKEN_DEPOSIT"
+	RefTokenWithdrawal = "TOKEN_WITHDRAWAL"
+	RefBTCDeposit      = "BTC_DEPOSIT"
+	RefBTCWithdrawal   = "BTC_WITHDRAWAL"
 )
 
 const (
